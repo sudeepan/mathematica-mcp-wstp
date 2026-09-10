@@ -47,6 +47,10 @@ work across several calls costs nothing.
 
 ## What you can ask for
 
+You ask in plain language. The agent chooses the tool and makes the call. Each
+example below shows the request in bold and the call it turns into, so you can
+see what the server is actually being asked to do.
+
 **"Integrate that, and stop if it takes more than ten seconds."**
 
 ```text
@@ -97,7 +101,7 @@ to build: the transport binds directly to the WSTP library your installation
 already ships.
 
 ```bash
-git clone <your-remote> mathematica-mcp-wstp
+git clone https://github.com/sudeepan/mathematica-mcp-wstp.git
 cd mathematica-mcp-wstp
 uv venv --python 3.12 .venv
 uv pip install --python .venv/bin/python -e .
