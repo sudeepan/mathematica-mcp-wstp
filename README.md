@@ -1,11 +1,9 @@
 # Mathematica MCP over WSTP
 
-**A Mathematica MCP server that can interrupt a running computation instead of abandoning it.**
-
-Your AI agent can write Wolfram Language. This server runs it in a persistent
-kernel and lets the agent stop work that has gone wrong, keep every definition,
-and carry on. Notebooks on disk replay cell by cell. A headless front end
-supplies typeset images with no display attached.
+The agent can work with full notebooks, even in a headless environment. You can prompt it to 
+work cell(group)-by-cell(group) or Chapters/Sections/Subsections, ask it to send images of the run 
+inputs and their outputs (cells/Prints/warnings etc), which is nice to have since you cannot
+just open a notebook when everything is headless.
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![Mathematica 14+](https://img.shields.io/badge/Mathematica-14+-red.svg)](https://www.wolfram.com/mathematica/)
@@ -13,11 +11,10 @@ supplies typeset images with no display attached.
 
 ---
 
-## Why this exists
+## Some problems it solves
 
-A Mathematica session driven by an agent fails in ways an interactive session
-does not. A simplification that will never finish looks exactly like one that
-needs another minute. A kernel that has crashed looks exactly like a kernel that
+A bad harness for the agent may make it misinterpret a simplification step that will never finish 
+as something that just needs another minute. A kernel that has crashed looks exactly like a kernel that
 is busy. A parallel job torn down carelessly leaves subkernels behind, several
 hundred megabytes each, until the machine runs out of memory.
 
@@ -47,7 +44,7 @@ work across several calls costs nothing.
 
 ## What you can ask for
 
-You ask in plain language. The agent chooses the tool and makes the call. Each
+You can ask in plain language. The agent chooses the tool and makes the call. Each
 example below shows the request in bold and the call it turns into, so you can
 see what the server is actually being asked to do.
 
@@ -97,8 +94,7 @@ verify_derivation(steps=["(a+b)^3", "a^3 + 3 a^2 b + 3 a b^2 + b^3"])
 
 **Prerequisites:** Mathematica 14 or newer (15 recommended) and
 [uv](https://docs.astral.sh/uv/). There is no compiler step and no Wolfram SDK
-to build: the transport binds directly to the WSTP library your installation
-already ships.
+to build. The transport binds directly to the WSTP library your installation already provides.
 
 ```bash
 git clone https://github.com/sudeepan/mathematica-mcp-wstp.git
@@ -130,8 +126,7 @@ Override with `MATHEMATICA_WSTP_KERNEL`, `MATHEMATICA_WSTP_INSTALL` or
 
 ## Tools
 
-Fourteen consolidated tools rather than a wide flat surface, because a client
-pays for every tool description in its context on every call.
+There are fourteen consolidated tools:
 
 | Tool | Purpose |
 |------|---------|
@@ -150,13 +145,13 @@ pays for every tool description in its context on every call.
 | `read_notebook_file` | Read a `.nb` without opening a session |
 | `guide` | Usage notes by topic |
 
-### Notebooks are files, evaluated faithfully
+### Notebook evaluation mechanism
 
 A notebook here is a `.nb` on disk. Cells are evaluated from their original
 stored boxes and located by position in the notebook expression. They are never
-rebuilt, and never retyped from a rendered preview: retyping is a transcription
+rebuilt, and never retyped from a rendered preview, since retyping is a transcription
 step whose failure mode is silent non-evaluation, and round-tripping through a
-box-to-text converter is what corrupts `\[Gamma]` and its relatives.
+box-to-text converter is what corrupts expressions like `\[Gamma]`.
 
 Only `Input` and `Code` cells run. Prose and stored output are reported as
 skipped and counted separately, so a replay's success figure means what it says.
@@ -186,7 +181,7 @@ abort and liveness both hold.
 
 ---
 
-## How it works
+## Architecture
 
 Two paths carry information, and keeping them apart is the whole design.
 
@@ -224,7 +219,7 @@ result back. The dotted arrow beside it is WSTP's out-of-band message channel,
 which stays writable while the evaluation channel is blocked. Everything this
 server does that a request/reply socket cannot comes from that second arrow.
 
-### A real trace
+### Typical workflow
 
 Replaying a notebook in which one cell never terminates:
 
