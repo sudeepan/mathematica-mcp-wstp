@@ -324,3 +324,7 @@ python3 tests/test_kernel.py                # transport and supervision, no depe
 
 Point `MATHEMATICA_WSTP_TEST_NOTEBOOK` at any `.nb` to exercise the notebook
 tools against a real document. Those checks are skipped when it is unset.
+
+## License
+
+## [![WTFPL](https://www.wtfpl.net/wp-content/uploads/2012/12/wtfpl.svg)](https://www.wtfpl.net/)
