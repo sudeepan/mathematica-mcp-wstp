@@ -74,7 +74,7 @@ evaluate_cells(from_=0, to=200)
    messages: [{index: 88, name: "Part::partw", text: "Part 5 of {1, 2} does not exist."}]
 ```
 
-**"Show me what the output from Cell 39 verbatim."**
+**"Show me the output from Cell 39 verbatim."**
 
 ```text
 render(action="cell", index=39)
