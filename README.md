@@ -57,7 +57,7 @@ evaluate("Integrate[Sqrt[1 + x^4], x]", timeout=10)
    next_step: "Retry with a smaller input. Earlier variables are still defined."
 ```
 
-**"That has gone off the rails. Stop it."**
+**"It is taking too long. Please stop the evaluation."**
 
 ```text
 abort()
@@ -65,7 +65,7 @@ abort()
    "Evaluation interrupted; kernel state is intact."
 ```
 
-**"Replay this notebook and tell me what broke."**
+**"Replay this notebook in a live kernel and check if you can reproduce the recorded outputs in it."**
 
 ```text
 notebooks(action="open", path="/path/to/analysis.nb")   => 994 cells, 276 code cells
@@ -74,14 +74,14 @@ evaluate_cells(from_=0, to=200)
    messages: [{index: 88, name: "Part::partw", text: "Part 5 of {1, 2} does not exist."}]
 ```
 
-**"Show me what cell 39 actually looks like."**
+**"Show me what the output from Cell 39 verbatim."**
 
 ```text
 render(action="cell", index=39)
 => [typeset PNG from a headless front end, no display required]
 ```
 
-**"Check this derivation."**
+**"Please check this derivation."**
 
 ```text
 verify_derivation(steps=["(a+b)^3", "a^3 + 3 a^2 b + 3 a b^2 + b^3"])
