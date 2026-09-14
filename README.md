@@ -1,9 +1,11 @@
 # Mathematica MCP over WSTP
 
-The agent can work with full notebooks, even in a headless environment. You can prompt it to 
-work cell(group)-by-cell(group) or Chapters/Sections/Subsections, ask it to send images of the run 
-inputs and their outputs (cells/Prints/warnings etc), which is nice to have since you cannot
-just open a notebook when everything is headless.
+**A Mathematica MCP server that can interrupt a running computation instead of abandoning it.**
+
+Your AI agent can write Wolfram Language. This server runs it in a persistent
+kernel and lets the agent stop work that has gone wrong, keep every definition,
+and carry on. Notebooks on disk replay cell by cell. A headless front end
+supplies typeset images with no display attached.
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![Mathematica 14+](https://img.shields.io/badge/Mathematica-14+-red.svg)](https://www.wolfram.com/mathematica/)
@@ -11,10 +13,21 @@ just open a notebook when everything is headless.
 
 ---
 
-## Some problems it solves
+## Documentation
 
-A bad harness for the agent may make it misinterpret a simplification step that will never finish 
-as something that just needs another minute. A kernel that has crashed looks exactly like a kernel that
+- [`docs/agent-guide.md`](docs/agent-guide.md) — how to drive this server well:
+  session shape, notebooks, long runs, interrupting, parallel work, comparing a
+  headless replay against an interactive one.
+- [`docs/pitfalls.md`](docs/pitfalls.md) — six ways to get a wrong answer with
+  no error, each one observed on real work.
+- `guide(topic=...)` in the server itself carries the short form:
+  `workflow · abort · errors · notebooks · state · parallel · performance`.
+
+## Why this exists
+
+A Mathematica session driven by an agent fails in ways an interactive session
+does not. A simplification that will never finish looks exactly like one that
+needs another minute. A kernel that has crashed looks exactly like a kernel that
 is busy. A parallel job torn down carelessly leaves subkernels behind, several
 hundred megabytes each, until the machine runs out of memory.
 
@@ -44,7 +57,7 @@ work across several calls costs nothing.
 
 ## What you can ask for
 
-You can ask in plain language. The agent chooses the tool and makes the call. Each
+You ask in plain language. The agent chooses the tool and makes the call. Each
 example below shows the request in bold and the call it turns into, so you can
 see what the server is actually being asked to do.
 
@@ -57,7 +70,7 @@ evaluate("Integrate[Sqrt[1 + x^4], x]", timeout=10)
    next_step: "Retry with a smaller input. Earlier variables are still defined."
 ```
 
-**"It is taking too long. Please stop the evaluation."**
+**"That has gone off the rails. Stop it."**
 
 ```text
 abort()
@@ -65,7 +78,7 @@ abort()
    "Evaluation interrupted; kernel state is intact."
 ```
 
-**"Replay this notebook in a live kernel and check if you can reproduce the recorded outputs in it."**
+**"Replay this notebook and tell me what broke."**
 
 ```text
 notebooks(action="open", path="/path/to/analysis.nb")   => 994 cells, 276 code cells
@@ -74,14 +87,14 @@ evaluate_cells(from_=0, to=200)
    messages: [{index: 88, name: "Part::partw", text: "Part 5 of {1, 2} does not exist."}]
 ```
 
-**"Show me the output from Cell 39 verbatim."**
+**"Show me what cell 39 actually looks like."**
 
 ```text
 render(action="cell", index=39)
 => [typeset PNG from a headless front end, no display required]
 ```
 
-**"Please check this derivation."**
+**"Check this derivation."**
 
 ```text
 verify_derivation(steps=["(a+b)^3", "a^3 + 3 a^2 b + 3 a b^2 + b^3"])
@@ -94,7 +107,8 @@ verify_derivation(steps=["(a+b)^3", "a^3 + 3 a^2 b + 3 a b^2 + b^3"])
 
 **Prerequisites:** Mathematica 14 or newer (15 recommended) and
 [uv](https://docs.astral.sh/uv/). There is no compiler step and no Wolfram SDK
-to build. The transport binds directly to the WSTP library your installation already provides.
+to build: the transport binds directly to the WSTP library your installation
+already ships.
 
 ```bash
 git clone https://github.com/sudeepan/mathematica-mcp-wstp.git
@@ -126,7 +140,8 @@ Override with `MATHEMATICA_WSTP_KERNEL`, `MATHEMATICA_WSTP_INSTALL` or
 
 ## Tools
 
-There are fourteen consolidated tools:
+Fourteen consolidated tools rather than a wide flat surface, because a client
+pays for every tool description in its context on every call.
 
 | Tool | Purpose |
 |------|---------|
@@ -145,13 +160,13 @@ There are fourteen consolidated tools:
 | `read_notebook_file` | Read a `.nb` without opening a session |
 | `guide` | Usage notes by topic |
 
-### Notebook evaluation mechanism
+### Notebooks are files, evaluated faithfully
 
 A notebook here is a `.nb` on disk. Cells are evaluated from their original
 stored boxes and located by position in the notebook expression. They are never
-rebuilt, and never retyped from a rendered preview, since retyping is a transcription
+rebuilt, and never retyped from a rendered preview: retyping is a transcription
 step whose failure mode is silent non-evaluation, and round-tripping through a
-box-to-text converter is what corrupts expressions like `\[Gamma]`.
+box-to-text converter is what corrupts `\[Gamma]` and its relatives.
 
 Only `Input` and `Code` cells run. Prose and stored output are reported as
 skipped and counted separately, so a replay's success figure means what it says.
@@ -181,7 +196,7 @@ abort and liveness both hold.
 
 ---
 
-## Architecture
+## How it works
 
 Two paths carry information, and keeping them apart is the whole design.
 
@@ -219,7 +234,7 @@ result back. The dotted arrow beside it is WSTP's out-of-band message channel,
 which stays writable while the evaluation channel is blocked. Everything this
 server does that a request/reply socket cannot comes from that second arrow.
 
-### Typical workflow
+### A real trace
 
 Replaying a notebook in which one cell never terminates:
 
@@ -319,7 +334,3 @@ python3 tests/test_kernel.py                # transport and supervision, no depe
 
 Point `MATHEMATICA_WSTP_TEST_NOTEBOOK` at any `.nb` to exercise the notebook
 tools against a real document. Those checks are skipped when it is unset.
-
-## License
-
-## [![WTFPL](https://www.wtfpl.net/wp-content/uploads/2012/12/wtfpl.svg)](https://www.wtfpl.net/)
