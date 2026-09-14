@@ -19,9 +19,11 @@ than surfacing an error the caller cannot act on.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
+import tempfile
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -86,11 +88,28 @@ class HeadlessNotebooks:
         # carry. The helper returns bytes rather than a string so that notebook
         # content -- \[Gamma] and every other non-ASCII character a physics
         # notebook is full of -- survives the trip intact.
+        # The reply MUST be a ByteArray. If the helper returns anything else --
+        # $Aborted from an abort inside a cell, $Failed, an unevaluated symbol --
+        # then Normal[] of it is not a byte list, WSGetInteger8List fails with
+        # "WSGet out of sequence", and the link is left in an error state that
+        # made the whole session unusable. Measured: a setup cell whose package
+        # refuses to load twice aborted in 0.3s and cost an entire replay. So
+        # catch the abort and coerce anything unexpected into a JSON error that
+        # the transport CAN carry.
         code = (
-            "Normal[Module[{},"
-            f"  If[!TrueQ[$MCPHeadlessNotebookLoaded],"
-            f"    If[Get[{helper}] =!= $Failed, $MCPHeadlessNotebookLoaded = True]];"
-            f"  MCPHeadlessNotebook`{function}[{arglist}]"
+            "Normal[Module[{mcpRes},"
+            "  mcpRes = CheckAbort[Module[{},"
+            f"    If[!TrueQ[$MCPHeadlessNotebookLoaded],"
+            f"      If[Get[{helper}] =!= $Failed, $MCPHeadlessNotebookLoaded = True]];"
+            f"    MCPHeadlessNotebook`{function}[{arglist}]"
+            "  ], $Aborted];"
+            "  If[Head[mcpRes] === ByteArray, mcpRes,"
+            "    ExportByteArray[<|\"success\" -> False,"
+            "      \"error\" -> \"the helper returned \" <> ToString[Head[mcpRes]]"
+            "        <> \", not an encoded reply\","
+            "      \"aborted\" -> TrueQ[mcpRes === $Aborted],"
+            "      \"raw\" -> StringTake[ToString[Short[mcpRes, 3]], UpTo[300]]|>,"
+            "      \"RawJSON\", \"Compact\" -> True]]"
             "]]"
         )
         result = evaluate_wl_bytes(code, timeout=timeout)
@@ -177,6 +196,16 @@ class HeadlessNotebooks:
             return None
 
     # -- operations -------------------------------------------------------
+
+    def is_open(self, path: str) -> bool:
+        """True when this path already has a session somebody is holding.
+
+        Callers that open a file only to read it need this: ``open``
+        de-duplicates by path, so a path already open comes back as the
+        existing session's id rather than a fresh one, and closing it
+        afterwards would destroy a session its owner still holds.
+        """
+        return self._resolve(os.path.abspath(os.path.expanduser(path))) is not None
 
     def open(self, path: str) -> dict[str, Any]:
         abs_path = os.path.abspath(os.path.expanduser(path))
@@ -309,6 +338,15 @@ class HeadlessNotebooks:
             "MCPEvaluateCell", notebook_id, int(index), int(timeout), timeout=timeout + 15
         )
 
+    def verify_against(self, reference: str, notebook: str | None = None,
+                       timeout: int = 300) -> dict[str, Any]:
+        """Compare the replayed document against the notebook it came from."""
+        notebook_id = self._resolve(notebook)
+        if notebook_id is None:
+            return self._no_session(notebook)
+        return self._call_with_session(
+            "MCPVerifyAgainst", notebook_id, str(reference), timeout=timeout)
+
     def evaluate_range(
         self,
         start: int = 0,
@@ -316,6 +354,7 @@ class HeadlessNotebooks:
         notebook: str | None = None,
         timeout: int = 60,
         stop_on_error: bool = True,
+        write_outputs: bool = False,
     ) -> dict[str, Any]:
         notebook_id = self._resolve(notebook)
         if notebook_id is None:
@@ -323,15 +362,47 @@ class HeadlessNotebooks:
         # The per-cell timeout bounds each cell; the transport has to outlast the
         # whole span, so give it room for every cell in the range to use its budget.
         span = max(1, (end - start + 1) if end >= 0 else 64)
-        return self._call_with_session(
-            "MCPEvaluateRange",
-            notebook_id,
-            int(start),
-            int(end),
-            int(timeout),
-            bool(stop_on_error),
-            timeout=timeout * span + 30,
-        )
+        # A file, because there is no other channel: while the span runs, the
+        # kernel is inside one evaluation and nothing can be evaluated in it to
+        # set a flag. abort_current touches this path, and the loop reads it
+        # between cells to tell a user abort from a cell's own Abort[].
+        from . import session as _session
+
+        sentinel = os.path.join(tempfile.gettempdir(),
+                                f"mcp-wstp-abort-{os.getpid()}-{notebook_id}")
+        with contextlib.suppress(OSError):
+            os.unlink(sentinel)
+        _session.set_abort_sentinel(sentinel)
+        try:
+            return self._call_with_session(
+                "MCPEvaluateRange",
+                notebook_id,
+                int(start),
+                int(end),
+                int(timeout),
+                bool(stop_on_error),
+                bool(write_outputs),
+                sentinel,
+                timeout=timeout * span + 30,
+            )
+        finally:
+            _session.set_abort_sentinel(None)
+            with contextlib.suppress(OSError):
+                os.unlink(sentinel)
+
+    def verify_self(self, notebook: str | None = None) -> dict[str, Any]:
+        """Check the open document's own cell labels, with no reference needed."""
+        notebook_id = self._resolve(notebook)
+        if notebook_id is None:
+            return self._no_session(notebook)
+        return self._call_with_session("MCPVerifySelf", notebook_id, timeout=120)
+
+    def find_defining(self, symbol: str, notebook: str | None = None) -> dict[str, Any]:
+        """Find the cells of the open document that assign ``symbol``."""
+        notebook_id = self._resolve(notebook)
+        if notebook_id is None:
+            return self._no_session(notebook)
+        return self._call_with_session("MCPFindDefining", notebook_id, symbol, timeout=60)
 
     def write_cell(
         self,
