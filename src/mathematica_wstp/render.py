@@ -125,7 +125,10 @@ _EXPORT_NOTE = (
 
 
 def export_notebook(path: str, notebook: str | None = None,
-                    open_groups: bool = False,
+                    open_groups: bool = True,
+                    tex_math: bool = False,
+                    paper: tuple[int, int] | None = None,   # None -> A4 portrait
+                    fit_width: bool = False,
                     timeout: float = 300.0) -> dict[str, Any]:
     """Export the open notebook through the front end.
 
@@ -135,9 +138,24 @@ def export_notebook(path: str, notebook: str | None = None,
     nb_id = _resolve(notebook)
     if nb_id is None:
         return {"success": False, "error": "no open notebook; call notebooks(action='open') first"}
+    if path.lower().endswith((".md", ".markdown")):
+        # Not Export[..., "Markdown"]: that rasterises every Output cell into a
+        # sibling img/ directory, takes no options to stop it, and emits its own
+        # unevaluated internals when no front end is attached. Our generator
+        # keeps the results as text in one self-contained file.
+        tex = "True" if tex_math else "False"
+        out = _helper_call(
+            "MCPExportMarkdown", f"{_wl_str(nb_id)}, {_wl_str(path)}, {tex}", timeout)
+        return out if isinstance(out, dict) else {"success": True, "path": path}
     flag = "True" if open_groups else "False"
+    # A4 portrait unless told otherwise: a defined page is what makes clipping
+    # detectable at all. With no paper size the front end picks one and the
+    # server has nothing to measure "too wide" against.
+    w, h = (paper or (595, 842))
     out = _helper_call(
-        "MCPExportNotebook", f"{_wl_str(nb_id)}, {_wl_str(path)}, {flag}", timeout)
+        "MCPExportNotebook",
+        f"{_wl_str(nb_id)}, {_wl_str(path)}, {flag}, {int(w)}, {int(h)}, "
+        f"{'True' if fit_width else 'False'}", timeout)
     if isinstance(out, bytes):
         return {"success": False, "error": "unexpected binary reply from export"}
     if isinstance(out, dict) and out.get("success"):
