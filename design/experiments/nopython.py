@@ -1,0 +1,23 @@
+import os, sys, time
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "src"))
+from wstp_client import K
+k=K()
+E = '{1, 2.5, "abc", Sin[x], <|"k" -> {1,2,3}|>, 1/3}'
+print("1. ToString[expr, InputForm] straight off the link:")
+print("   ", k.ev(f'ToString[{E}, InputForm]'))
+print("\n2. does it round-trip? (parse it back, compare):")
+print("   ", k.ev(f'ToExpression[ToString[{E}, InputForm]] === {E}'))
+print("\n3. machine-real precision through ToString:")
+print("   InputForm: ", k.ev('ToString[N[Pi,17], InputForm]'))
+print("   exact?     ", k.ev('ToExpression[ToString[N[Pi,17], InputForm]] == N[Pi,17]'))
+print("   OutputForm:", k.ev('ToString[N[Pi,17]]'), " <- lossy, do not use")
+print("\n4. structured control envelope, kernel-side JSON:")
+print("   ", k.ev('ExportString[<|"ok"->True,"aborted"->False,"cells"->994,"msgs"->{}|>, "RawJSON", "Compact"->True]'))
+print("\n5. THE exception - 200k machine reals:")
+print("   ToString length:", k.ev('StringLength[ToString[N[Range[200000]/7], InputForm]]', timeout=300))
+print("   WXF bytes:      ", k.ev('Length[Normal[BinarySerialize[N[Range[200000]/7]]]]', timeout=300))
+t0=time.time(); k.ev('StringLength[ToString[N[Range[200000]/7], InputForm]]', timeout=300)
+print(f"   ToString time:   {time.time()-t0:.2f}s")
+t0=time.time(); k.ev('Length[Normal[BinarySerialize[N[Range[200000]/7]]]]', timeout=300)
+print(f"   WXF time:        {time.time()-t0:.2f}s")
+k.close()
