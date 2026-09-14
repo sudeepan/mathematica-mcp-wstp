@@ -55,7 +55,12 @@ class KernelError(RuntimeError):
 
 
 class EvaluationAborted(RuntimeError):
-    """The evaluation was interrupted. The kernel is alive and state is intact."""
+    """The evaluation was interrupted.
+
+    Raised only when $Aborted came back over the link, so the kernel was
+    answering at that point. That is evidence, not a guarantee about now --
+    session.abort_current() probes before making any claim about survival.
+    """
 
 
 class EvaluationTimeout(RuntimeError):
@@ -471,11 +476,16 @@ class Kernel:
             recovered = self.abort(wait=min(10.0, max(2.0, timeout * 0.1)))
             raise EvaluationTimeout(
                 f"evaluation exceeded {timeout}s; aborted "
-                f"({'kernel state intact' if recovered else 'kernel did not confirm the abort'})",
+                f"({'the evaluation stopped; kernel not probed' if recovered else 'kernel did not confirm the abort'})",
                 elapsed, recovered,
             ) from None
         if self._abort_requested.is_set() and reply.value.strip() == "$Aborted":
-            raise EvaluationAborted("evaluation aborted on request; kernel state is intact")
+            # Unlike the timeout path above, this is evidenced: $Aborted came back
+            # over the link, so the kernel was answering when it sent it.
+            raise EvaluationAborted(
+                "evaluation aborted on request; the kernel returned $Aborted, so it "
+                "was answering at that point"
+            )
         return reply
 
     def evaluate_json(self, code: str, timeout: float = DEFAULT_TIMEOUT):

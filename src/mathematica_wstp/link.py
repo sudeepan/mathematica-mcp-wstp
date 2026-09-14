@@ -350,11 +350,26 @@ class Link:
         return out.value
 
     def get_bytes(self) -> bytes:
-        """Pull a byte list (e.g. Normal[BinarySerialize[...]] or raw image data)."""
+        """Pull a byte list (e.g. Normal[BinarySerialize[...]] or raw image data).
+
+        If what arrived is not a byte list -- the evaluation returned $Failed, or
+        an unevaluated expression, or anything else -- WSGetInteger8List fails
+        and sets the link's error state. WSTP keeps that state set until it is
+        cleared, so leaving it makes every later call on this link fail too:
+        one wrong reply turns into a dead kernel and a silently replaced
+        session. Clear it here so the caller gets a diagnosable error on a link
+        that still works.
+        """
         arr = ctypes.POINTER(ctypes.c_ubyte)()
         count = ctypes.c_int(0)
         if not self._lib.WSGetInteger8List(self._link, ctypes.byref(arr), ctypes.byref(count)):
-            raise WSTPError(f"WSGetInteger8List failed: {self.error_message()}", self.error())
+            code, msg = self.error(), self.error_message()
+            self.clear_error()
+            raise WSTPError(
+                f"WSGetInteger8List failed: {msg} -- the reply was not a byte list. "
+                "The link error has been cleared; the kernel should still be usable.",
+                code,
+            )
         try:
             return bytes(bytearray(arr[i] & 0xFF for i in range(count.value)))
         finally:
