@@ -16,6 +16,7 @@ so RAM is the resource that actually runs out (measurements §11).
 
 from __future__ import annotations
 
+import contextlib
 import os
 import signal
 import sys
@@ -181,8 +182,19 @@ def test_abort_interrupts_an_external_process():
         seen: dict[str, list[str]] = {}
 
         def watcher() -> None:
-            time.sleep(2.0)
-            seen["during"] = sleepers()
+            # Wait for the child to actually exist rather than sampling at a
+            # fixed instant: the kernel needs ~2.5s to spawn it here, so a
+            # 2.0s sample aborts before there is anything to interrupt and
+            # the test can only report itself vacuous. Deadline stays under
+            # the 20s the elapsed-time assertion below allows.
+            deadline = time.monotonic() + 12
+            while time.monotonic() < deadline:
+                found = sleepers()
+                if found:
+                    seen["during"] = found
+                    break
+                time.sleep(0.2)
+            seen.setdefault("during", [])
             time.sleep(1.0)
             k.abort(wait=15)
 
@@ -292,6 +304,187 @@ def test_registry_refuses_to_signal_a_recycled_pid():
              "subkernels": []}
     assert not registry.is_still_ours(entry)
     assert registry.terminate_tree(entry) == [], "would have signalled the test process"
+
+
+def test_unverified_abort_becomes_a_sticky_fault_then_resolves():
+    """An unverified abort must outlive the reply that reported it.
+
+    Liveness is measured at an instant. A caller who reads "unverified" once and
+    carries on is the failure the probe exists to prevent, so the fault is held
+    on the session, shows up in status(), and a watchdog drives it to a definite
+    answer rather than leaving a warning nobody acts on.
+    """
+    from mathematica_wstp import session as sess
+
+    sess.get_kernel()
+    original = sess._verify_after_abort
+    sess._verify_after_abort = lambda kernel, timeout: ("unverified", "probe timed out")
+    try:
+        res = sess.abort_current(wait=2.0)
+        assert res["kernel"] == "unverified", res
+        assert sess._abort_uncertain is not None, "fault was not held on the session"
+
+        st = sess.kernel_status()
+        assert st["link_health"] == "uncertain", st
+        assert st["lifecycle"] == "faulted", st
+
+        # A real round trip is the cheapest reconciliation there is.
+        sess._verify_after_abort = original
+        assert sess.evaluate_wl("1+1", timeout=30).success
+        assert sess._abort_uncertain is None, "a completed evaluation did not clear the fault"
+        assert sess.kernel_status()["link_health"] == "connected"
+
+        events = [e["event"] for e in sess.abort_journal()]
+        assert "abort-uncertain" in events, events
+        assert "abort-reconciled" in events, events
+    finally:
+        sess._verify_after_abort = original
+        sess._abort_uncertain = None
+        with contextlib.suppress(Exception):
+            sess.close_kernel()
+
+
+def test_abort_on_an_already_dead_kernel_uses_the_same_vocabulary():
+    """Two shapes for "your kernel is gone" means callers check one and miss the other."""
+    from mathematica_wstp import session as sess
+
+    k = sess.get_kernel()
+    pid = k.pid
+    os.kill(pid, signal.SIGKILL)
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and registry.pid_alive(pid):
+        time.sleep(0.05)
+    try:
+        res = sess.abort_current(wait=1.0)
+        assert res["success"] is False, res
+        assert res["kernel"] == "dead", res
+        assert res["state"] == "lost", res
+    finally:
+        with contextlib.suppress(Exception):
+            sess.close_kernel()
+
+
+def test_opening_groups_reaches_nested_ones():
+    """ReplaceAll does not descend into what it just replaced.
+
+    A notebook nests groups -- chapters inside a title -- so rewriting the outer
+    one with /. carries every inner group through untouched. Measured on a real
+    document: 2 of 158 closed groups opened, and the export was a 1-page PDF of
+    a 68-page notebook, silently missing everything past the first group.
+    """
+    from mathematica_wstp import session as sess
+
+    nested = ('Notebook[{Cell[CellGroupData[{'
+              'Cell["Title", "Title"],'
+              'Cell[CellGroupData[{Cell["Chapter", "Section"],'
+              '  Cell[CellGroupData[{Cell["Sub", "Subsection"],'
+              '    Cell[BoxData["1+1"], "Input"]}, Closed]]}, Closed]]}, Closed]]}]')
+    k = sess.get_kernel()
+    try:
+        k.evaluate(f"nbTest = {nested};", timeout=60)
+        bad = k.evaluate(
+            'Length[Cases[nbTest /. CellGroupData[c_, _] :> CellGroupData[c, Open],'
+            ' CellGroupData[_, Closed], Infinity]]', timeout=60).strip()
+        good = k.evaluate(
+            'Length[Cases[nbTest //. CellGroupData[c_, st_] /; st =!= Open :>'
+            ' CellGroupData[c, Open], CellGroupData[_, Closed], Infinity]]', timeout=60).strip()
+        assert bad != "0", "expected ReplaceAll to leave nested groups closed"
+        assert good == "0", f"ReplaceRepeated left {good} groups closed"
+    finally:
+        with contextlib.suppress(Exception):
+            sess.close_kernel()
+
+
+def test_probe_reports_dead_when_the_kernel_is_gone():
+    """A killed kernel must fail the probe, not pass it quietly."""
+    from mathematica_wstp import session as sess
+
+    k = Kernel().start()
+    try:
+        assert k.evaluate("1+1", timeout=30).strip() == "2"
+        os.kill(k.pid, signal.SIGKILL)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and registry.pid_alive(k.pid):
+            time.sleep(0.05)
+        verdict, detail = sess._verify_after_abort(k, 5.0)
+        assert verdict == "dead", f"a killed kernel probed as {verdict!r} ({detail})"
+    finally:
+        with contextlib.suppress(Exception):
+            k.close()
+
+
+def test_probe_reports_alive_on_a_healthy_kernel():
+    from mathematica_wstp import session as sess
+
+    with Kernel() as k:
+        verdict, detail = sess._verify_after_abort(k, 15.0)
+        assert verdict == "alive", f"healthy kernel probed as {verdict!r} ({detail})"
+
+
+def test_abort_says_state_is_lost_when_the_probe_fails():
+    """The defect, pinned.
+
+    ``Kernel.abort`` returning True means only that the evaluation released the
+    eval lock. A reader that died on a protocol error releases it exactly as a
+    clean abort does, so the flag cannot distinguish them -- and the tool used
+    to answer "kernel state is intact" on the strength of it. That is not a
+    cosmetic wording problem: a caller was told nothing was lost, repeated it to
+    their user, and found out 23 seconds later that an hour of accumulated
+    results had died with the kernel.
+
+    The probe is stubbed rather than provoked because the real trigger is a
+    Wolfram-side crash nobody has reproduced on demand; what must be guaranteed
+    is that a failed probe is never reported as an intact session.
+    """
+    from mathematica_wstp import session as sess
+
+    sess.get_kernel()
+    original = sess._verify_after_abort
+    sess._verify_after_abort = lambda kernel, timeout: ("dead", "WSTP error 3: WSGet out of sequence")
+    try:
+        res = sess.abort_current(wait=2.0)
+    finally:
+        sess._verify_after_abort = original
+        with contextlib.suppress(Exception):
+            sess.close_kernel()
+
+    assert res["success"] is False, res
+    assert res["kernel"] == "dead", res
+    assert res["state"] == "lost", res
+    assert "intact" not in res["note"], f"still claiming intactness: {res['note']}"
+    assert "lost" in res["note"].lower(), res["note"]
+
+
+def test_abort_confirms_intact_only_after_a_real_round_trip():
+    """The healthy path must still report intact -- and be right about it."""
+    from mathematica_wstp import session as sess
+
+    k = sess.get_kernel()
+    try:
+        k.evaluate("keepme = 4242", timeout=60)
+
+        results: list[dict] = []
+
+        def fire() -> None:
+            time.sleep(1.5)
+            results.append(sess.abort_current(wait=10.0))
+
+        t = threading.Thread(target=fire, daemon=True)
+        t.start()
+        with contextlib.suppress(Exception):
+            k.evaluate('Do[qq = i, {i, 1, 10^12}]; "NEVER"', timeout=30)
+        t.join(30)
+
+        assert k.evaluate("keepme", timeout=30).strip() == "4242"
+        assert results, "the abort produced no result to check"
+        res = results[0]
+        assert res["confirmed"] is True, res
+        assert res["kernel"] == "alive", res
+        assert res.get("state") == "intact", res
+        assert "generation" in res, res
+    finally:
+        with contextlib.suppress(Exception):
+            sess.close_kernel()
 
 
 def test_proc_census_ignores_the_front_end():
