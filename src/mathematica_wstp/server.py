@@ -33,6 +33,9 @@ from .notebooks import get_headless_notebooks
 logger = logging.getLogger("mathematica_wstp.server")
 
 MAX_OUTPUT_CHARS = int(os.environ.get("MATHEMATICA_WSTP_MAX_CHARS", "20000"))
+# Above this, vars(action="get") reports a symbol's shape instead of its value.
+# A replay result of a few hundred KB is already unreadable; megabytes are common.
+_VALUE_PRINT_LIMIT = int(os.environ.get("MATHEMATICA_WSTP_MAX_VALUE_BYTES", "200000"))
 
 server = MCPServer(
     name="mathematica-wstp",
@@ -40,7 +43,9 @@ server = MCPServer(
         "A live Wolfram kernel over WSTP. Unlike the older socket/ZMQ servers, a "
         "running evaluation can be interrupted with abort(), a dead kernel is "
         "reported rather than hanging, and a timeout aborts the evaluation "
-        "WITHOUT losing kernel state.\n\n"
+        "rather than discarding the session, so state normally survives both. "
+        "Normally, not always: abort() probes the kernel afterwards and reports "
+        "what it found, so read its 'kernel' field instead of assuming.\n\n"
         "Routing:\n"
         "- compute/solve/simplify -> evaluate(code)\n"
         "- a runaway or too-slow evaluation -> abort()\n"
@@ -82,6 +87,7 @@ def _fail(error: str, **extra: Any) -> str:
 )
 def evaluate(code: str, timeout: float = 60.0) -> str:
     result = session.evaluate_wl(code, timeout=timeout)
+    notice = session.take_kernel_change_notice()
     if not result.success:
         payload: dict[str, Any] = {
             "success": False,
@@ -89,12 +95,20 @@ def evaluate(code: str, timeout: float = 60.0) -> str:
             "timed_out": result.timed_out,
             "aborted": result.aborted,
         }
+        if notice:
+            payload["kernel_replaced"] = True
+            payload["kernel_notice"] = notice
         if result.timed_out:
-            payload["kernel_state"] = (
-                "intact -- the evaluation was aborted, not the kernel"
-                if result.extra.get("aborted_cleanly")
-                else "uncertain -- the kernel did not confirm the abort"
-            )
+            # Ask the kernel rather than inferring from aborted_cleanly, which
+            # only ever meant "the evaluation released the lock".
+            verdict, detail = session.verify_current_kernel()
+            payload["kernel"] = verdict
+            payload["kernel_state"] = {
+                "alive": "intact -- the kernel answered a probe after the abort",
+                "dead": f"LOST -- the kernel did not survive ({detail}); every definition is gone",
+                "unverified": f"unverified -- no answer to a probe ({detail}); do not assume it survived",
+                "none": "no kernel is running",
+            }[verdict]
             payload["next_step"] = (
                 "Retry with a smaller input, a larger timeout, or wrap the slow part "
                 "in TimeConstrained. Variables from earlier calls are still defined."
@@ -108,6 +122,12 @@ def evaluate(code: str, timeout: float = 60.0) -> str:
 
     text, truncated = _truncate(result.text)
     payload: dict[str, Any] = {"success": True, "output": text}
+    if notice:
+        # The case that matters: a SUCCESSFUL call against a kernel that was
+        # silently swapped underneath it. Without this the reply is
+        # indistinguishable from one against the session you thought you had.
+        payload["kernel_replaced"] = True
+        payload["kernel_notice"] = notice
     if truncated:
         payload["truncated"] = True
         payload["note"] = "Full value is still in the kernel; ask for a part of it."
@@ -123,26 +143,38 @@ def evaluate(code: str, timeout: float = 60.0) -> str:
 
 @server.tool(
     description=(
-        "Interrupt the evaluation the kernel is running right now. The kernel "
-        "survives with all state intact. Use this instead of kernel(action='restart') "
-        "for a runaway computation -- restart destroys every definition."
+        "Interrupt the evaluation the kernel is running right now, and verify "
+        "afterwards what survived. Normally the kernel lives and every definition "
+        "with it; read the 'kernel' field rather than assuming -- alive means a "
+        "probe round-tripped, dead means the session is gone, unverified means "
+        "it could not be checked. Use this instead of kernel(action='restart') "
+        "for a runaway computation -- restart destroys every definition. If "
+        "subkernels are live the reply reports parallel_state='unverified': an "
+        "interrupted parallel evaluation may leave them holding a partial set of "
+        "definitions, which no probe can detect. Pass rebuild_parallel_kernels=True "
+        "to close and relaunch them as part of the abort."
     )
 )
-def abort() -> str:
-    return _reply(session.abort_current())
+def abort(rebuild_parallel_kernels: bool = False) -> str:
+    return _reply(session.abort_current(rebuild_parallel_kernels=rebuild_parallel_kernels))
 
 
 # --- kernel administration -------------------------------------------------
 
 @server.tool(
     description=(
-        "Kernel administration. actions: state | restart | abort | subkernels | reap. "
+        "Kernel administration. actions: state | restart | abort | subkernels | "
+        "close_subkernels | reap. "
         "'restart' clears ALL definitions and closes subkernels properly; prefer "
-        "abort() for a merely slow evaluation."
+        "abort() for a merely slow evaluation. "
+        "'close_subkernels' releases the parallel pool WITHOUT touching the master "
+        "kernel or any definition in it -- an idle 20-way pool costs gigabytes, so "
+        "offer it to the user once a parallel computation is finished."
     )
 )
 def kernel(
-    action: Literal["state", "restart", "abort", "subkernels", "reap"] = "state",
+    action: Literal["state", "restart", "abort", "subkernels",
+                    "close_subkernels", "reap"] = "state",
 ) -> str:
     if action == "state":
         return _reply({"success": True, **session.kernel_status()})
@@ -155,6 +187,8 @@ def kernel(
             return _reply({"success": True, "subkernels": [], "note": "no kernel running"})
         pids = session.get_kernel().subkernel_pids()
         return _reply({"success": True, "subkernels": pids, "count": len(pids)})
+    if action == "close_subkernels":
+        return _reply(session.close_parallel_kernels())
     if action == "reap":
         reaped = registry.reap_orphans()
         return _reply({
@@ -188,7 +222,7 @@ def status() -> str:
     )
 )
 def notebooks(
-    action: Literal["open", "create", "list", "info", "save", "close"] = "list",
+    action: Literal["open", "create", "list", "info", "save", "close", "verify"] = "list",
     path: str | None = None,
     title: str = "Untitled",
     notebook: str | None = None,
@@ -198,6 +232,13 @@ def notebooks(
         if not path:
             return _fail("open requires a path")
         return _reply(nb.open(path))
+    if action == "verify":
+        # No reference is not an error: a document built from scratch has none,
+        # and that is exactly when the record has to stand on its own. Without a
+        # path this checks the document against itself.
+        if not path:
+            return _reply(nb.verify_self(notebook=notebook))
+        return _reply(nb.verify_against(path, notebook=notebook))
     if action == "create":
         return _reply(nb.create(title=title, path=path))
     if action == "list":
@@ -214,7 +255,9 @@ def notebooks(
 @server.tool(
     description=(
         "List or read cells of an open notebook. Use style to filter (e.g. 'Input'). "
-        "Cell indices are positions in the document and are what evaluate_cells takes."
+        "Cell indices are positions in the document and are what evaluate_cells takes. "
+        "Pass defines='SymbolName' to find which cells assign a symbol (accepts an "
+        "indexed form like 'Amp[2]') instead of paging through previews by hand."
     )
 )
 def cells(
@@ -223,11 +266,44 @@ def cells(
     include_content: bool = True,
     style: str = "",
     notebook: str | None = None,
+    defines: str | None = None,
 ) -> str:
-    return _reply(get_headless_notebooks().cells(
+    if defines:
+        # Where a symbol came from is a question about the document, not the
+        # kernel: the kernel holds the value but nothing about the cell that
+        # produced it. Answer it here rather than making the caller page
+        # through previews by hand.
+        return _reply(get_headless_notebooks().find_defining(defines, notebook=notebook))
+    payload = get_headless_notebooks().cells(
         offset=offset, limit=limit, include_content=include_content,
         style=style, notebook=notebook,
-    ))
+    )
+    reply = _reply(payload)
+    if len(reply) <= MAX_REPLY_CHARS:
+        return reply
+    # evaluate_cells degrades to a summary when a range is too big; this used to
+    # blow the caller's token limit with a raw error instead, so asking "what is
+    # in this notebook?" the obvious way returned nothing at all. Drop content
+    # first -- it is the bulk -- and only then narrow the window.
+    if include_content:
+        trimmed = get_headless_notebooks().cells(
+            offset=offset, limit=limit, include_content=False,
+            style=style, notebook=notebook,
+        )
+        trimmed["content_omitted"] = True
+        trimmed["note"] = (f"Content dropped: the full reply was {len(reply)} chars. "
+                           "Ask for a narrower range to see content.")
+        reply = _reply(trimmed)
+        if len(reply) <= MAX_REPLY_CHARS:
+            return reply
+        payload = trimmed
+    kept = payload.get("cells") or []
+    room = max(1, len(kept) * MAX_REPLY_CHARS // max(len(reply), 1) - 1)
+    payload["cells"] = kept[:room]
+    payload["truncated"] = True
+    payload["note"] = (f"Showing {room} of {len(kept)} cells; the rest did not fit. "
+                       f"Page with offset={offset + room}.")
+    return _reply(payload)
 
 
 MAX_REPLY_CHARS = int(os.environ.get("MATHEMATICA_WSTP_MAX_REPLY", "12000"))
@@ -264,10 +340,22 @@ def _condense_range(payload: dict[str, Any]) -> dict[str, Any]:
             aborted += 1
             problems.append({"index": idx, "style": cell.get("style"),
                              "outcome": "aborted (hit the per-cell timeout)"})
+        elif cell.get("aborted"):
+            # An interrupted cell is not a failed one. Without this branch it fell
+            # through below and was reported as "failed" with the error text
+            # "None" -- str(None) -- which reads as a real failure whose message
+            # went missing, and gives a caller no way to tell an abort they asked
+            # for from a cell that genuinely broke.
+            aborted += 1
+            problems.append({"index": idx, "style": cell.get("style"),
+                             "outcome": "aborted (interrupted, not a failure)"})
         elif cell.get("success") is False:
             failed += 1
+            err = cell.get("error")
             problems.append({"index": idx, "style": cell.get("style"),
-                             "outcome": "failed", "error": str(cell.get("error"))[:300]})
+                             "outcome": "failed",
+                             "error": str(err)[:300] if err
+                                      else "no message was reported; see this cell's own output"})
         else:
             executed += 1
             slowest.append((cell.get("timing_ms") or 0, idx))
@@ -299,6 +387,17 @@ def _condense_range(payload: dict[str, Any]) -> dict[str, Any]:
         out["printed"] = printed[:20]
     if slowest:
         out["slowest_ms"] = [{"index": i, "ms": ms} for ms, i in slowest[:8]]
+    # Carry everything that is not per-cell detail. This summary is built from
+    # scratch, so any field not copied here disappears -- and that is how
+    # indices_shifted went missing exactly when it mattered most, summarising
+    # being triggered by the large ranges most likely to insert cells. An
+    # allowlist of field names only moves the problem: the next field added
+    # upstream vanishes in the same silent way, which happened once already.
+    # Copying by exclusion means a new field is carried by default.
+    detail_only = {"results"}
+    for key, value in payload.items():
+        if key not in detail_only and key not in out:
+            out[key] = value
     return out
 
 
@@ -308,7 +407,18 @@ def _condense_range(payload: dict[str, Any]) -> dict[str, Any]:
         "state carrying between them. Give either index, or from_+to for a range. "
         "A long replay can be interrupted with abort(). Large ranges come back "
         "summarised (counts, failures, messages, slowest cells); set detail='full' "
-        "to force per-cell output, or 'summary' to force the compact form."
+        "to force per-cell output, or 'summary' to force the compact form. "
+        "Indices in results are all PRE-shift: edits are applied after the range "
+        "finishes, so every reported index refers to the document as it was when the "
+        "call started. indices_shifted warns you about your NEXT call, not this "
+        "reply. outputs_written:0 means nothing needed writing (cells ending in ';' "
+        "have no result), not that a write failed -- a real failure appears as "
+        "success:false on a cell.\n"
+        "write_outputs=True also writes each result back into the open session as an "
+        "Output cell, so notebooks(action='save') or render(action='export') then "
+        "records what YOU computed instead of what was stored in the file. It replaces "
+        "an existing Output cell where there is one; where it must insert, later cell "
+        "indices shift and the reply says so."
     )
 )
 def evaluate_cells(
@@ -318,16 +428,26 @@ def evaluate_cells(
     timeout: float = 300.0,
     stop_on_error: bool = True,
     detail: Literal["auto", "full", "summary"] = "auto",
+    write_outputs: bool = False,
     notebook: str | None = None,
 ) -> str:
     nb = get_headless_notebooks()
     if index is not None:
-        return _reply(nb.evaluate_cell(index, notebook=notebook, timeout=int(timeout)))
+        if write_outputs:
+            # index=N used to route to a separate single-cell path that never
+            # received write_outputs: the cell evaluated, the reply said success,
+            # and nothing was written back. A caller fixing one cell got a silent
+            # no-op while believing the record had been corrected. Treat it as the
+            # one-cell range it is, so both call forms behave identically.
+            from_, to = index, index
+        else:
+            return _reply(nb.evaluate_cell(index, notebook=notebook, timeout=int(timeout)))
     if from_ is None or to is None:
         return _fail("give either index, or both from_ and to")
 
     payload = nb.evaluate_range(from_, to, notebook=notebook,
-                                timeout=int(timeout), stop_on_error=stop_on_error)
+                                timeout=int(timeout), stop_on_error=stop_on_error,
+                                write_outputs=write_outputs)
     if detail == "summary":
         return _reply(_condense_range(payload))
     full = _reply(payload)
@@ -368,7 +488,15 @@ def edit_cells(
         "actions: expression(code) | cell(index) | export(path) | available. "
         "This RENDERS only -- it never evaluates through the front end; use "
         "evaluate() for that. Export renders what is visible, so collapsed cell "
-        "groups export collapsed; pass open_groups=True for the whole document."
+        "groups are OPENED by default, because a notebook saved collapsed would "
+        "otherwise export with most of its content missing; pass open_groups=False "
+        "for the collapsed view. Paper is A4 portrait (595 x 842 pt) by default. "
+        "Content wider than the page is CLIPPED, not scaled: the reply says so and "
+        "sets action_required=ASK THE USER -- put the choice to them (fit_width=True "
+        "widens the page so nothing is lost, recommended; or keep A4 and lose the "
+        "overflow, not recommended) rather than deciding yourself. A .md path is "
+        "written as all-text Markdown by this server rather than by Export, so no "
+        "output is rasterised; tex_math=True renders outputs as $$...$$."
     )
 )
 def render(
@@ -377,7 +505,11 @@ def render(
     index: int | None = None,
     path: str = "",
     dpi: int = 96,
-    open_groups: bool = False,
+    open_groups: bool = True,
+    tex_math: bool = False,
+    paper_width: int = 595,
+    paper_height: int = 842,
+    fit_width: bool = False,
     notebook: str | None = None,
 ) -> Any:
     if action == "available":
@@ -386,8 +518,10 @@ def render(
     if action == "export":
         if not path:
             return _fail("export requires a path (extension picks the format)")
+        paper = (paper_width, paper_height) if paper_width and paper_height else (595, 842)
         return _reply(render_mod.export_notebook(
-            path, notebook=notebook, open_groups=open_groups))
+            path, notebook=notebook, open_groups=open_groups,
+            tex_math=tex_math, paper=paper, fit_width=fit_width))
 
     if action == "expression":
         if not code:
@@ -417,7 +551,10 @@ def render(
     description=(
         "Inspect or change the kernel's Global` symbols. actions: list | get(name) | "
         "set(name,value) | clear(name) | clear_all. Use this to see what a notebook "
-        "replay actually defined, or to clear one symbol without restarting."
+        "replay actually defined, or to clear one symbol without restarting. "
+        "get measures a symbol before printing it and returns size and shape instead "
+        "of the value when it is large -- a replay result can be megabytes. "
+        "Pass full=True only when you genuinely need the expression itself."
     )
 )
 def vars(
@@ -426,6 +563,7 @@ def vars(
     value: str | None = None,
     pattern: str | None = None,
     include_system: bool = False,
+    full: bool = False,
 ) -> str:
     if action == "list":
         ctx = '"Global`*"' if not include_system else '"System`*"'
@@ -445,11 +583,37 @@ def vars(
     if action == "get":
         if not name:
             return _fail("get requires a name")
+        # Measure before printing. Pulling a multi-megabyte result across the link
+        # just to truncate it here wastes the transfer and floods the caller with
+        # an expression it cannot read anyway -- a replay's accumulated result is
+        # routinely millions of leaves. Size and shape answer the real question
+        # ("did this get defined, and is it the right magnitude?") without that.
+        probe = session.evaluate_wl_json(
+            "Module[{v = " + name + "}, <|"
+            "\"bytes\" -> ByteCount[v], \"leaves\" -> LeafCount[v], "
+            "\"head\" -> ToString[Head[v]], "
+            "\"length\" -> If[AtomQ[v], 0, Length[v]]|>]",
+            timeout=60)
+        measured = probe if isinstance(probe, dict) else {}
+        size = measured.get("bytes")
+        if not full and isinstance(size, int) and size > _VALUE_PRINT_LIMIT:
+            return _reply({
+                "success": True, "name": name, "value_omitted": True,
+                "bytes": size, "leaves": measured.get("leaves"),
+                "head": measured.get("head"), "length": measured.get("length"),
+                "note": (
+                    f"{name} is {size} bytes, too large to print, so its shape is "
+                    "reported instead. Ask for a measurement of what you actually "
+                    f"need (Length[{name}], a Part of it, a Count); pass full=True "
+                    "only if you really need the whole expression."),
+            })
         out = session.evaluate_wl(f"{name}", timeout=60)
         if not out.success:
             return _fail(out.error)
         text, truncated = _truncate(out.text)
-        return _reply({"success": True, "name": name, "value": text, "truncated": truncated})
+        return _reply({"success": True, "name": name, "value": text,
+                       "truncated": truncated, "bytes": size,
+                       "leaves": measured.get("leaves")})
 
     if action == "set":
         if not name or value is None:
@@ -531,6 +695,11 @@ def read_notebook_file(
     offset: int = 0,
 ) -> str:
     nb = get_headless_notebooks()
+    # open() de-duplicates by path, so a file the caller already has open comes
+    # back as THEIR session id, not a scratch one. Closing that in the finally
+    # below silently destroys a session they are still using -- every later call
+    # then fails with "No headless notebook matches ...". Only close what we made.
+    borrowed = nb.is_open(path)
     opened = nb.open(path)
     if not opened.get("success"):
         return _reply(opened)
@@ -572,10 +741,14 @@ def read_notebook_file(
             body, truncated = _truncate("\n\n".join(lines))
             payload = {"success": True, "path": path, "mode": mode,
                        "text": body, "truncated": truncated}
-        payload["note"] = "Read-only view; no session was left open."
+        payload["note"] = (
+            f"Read-only view; the session already open on this file ({scratch_id}) "
+            "was left untouched." if borrowed
+            else "Read-only view; no session was left open.")
         return _reply(payload)
     finally:
-        nb.close(scratch_id)
+        if not borrowed:
+            nb.close(scratch_id)
 
 
 # --- derivation checking ---------------------------------------------------
@@ -641,12 +814,19 @@ _GUIDE: dict[str, str] = {
         "evaluate_cells(from_=, to=) to run. Cells run from their stored boxes."
     ),
     "abort": (
-        "abort() interrupts the running evaluation and KEEPS the kernel and every "
-        "definition. It is the right response to a runaway computation.\n"
+        "abort() interrupts the running evaluation and then PROBES the kernel, so "
+        "read the 'kernel' field instead of assuming: alive means a round trip "
+        "succeeded and your definitions are there, dead means the session is gone, "
+        "unverified means it could not be checked. It is still the right response "
+        "to a runaway computation -- it just does not promise survival.\n"
+        "Aborting a large parallel evaluation has been seen to kill a kernel "
+        "outright (once, unreproduced, Wolfram-side). Checkpoint expensive results "
+        "to disk BEFORE interrupting anything long.\n"
         "kernel(action='restart') destroys all state -- use it only for a wedged "
         "kernel, not a slow one.\n"
-        "A timeout on evaluate() already aborts for you and keeps state; the reply "
-        "says whether the kernel confirmed.\n"
+        "A timeout on evaluate() aborts for you and then probes the same way; its "
+        "reply carries the same 'kernel' field. State usually survives a timeout, "
+        "but read the field rather than assuming it.\n"
         "Abort may not land while the kernel is inside an external process or a "
         "long library call; the reply says 'did not confirm' when that happens."
     ),
@@ -654,8 +834,18 @@ _GUIDE: dict[str, str] = {
         "evaluate() returns 'messages' (Part::partw and friends) and 'printed' "
         "alongside 'output'. A plausible-looking answer with a message attached is "
         "usually the message's fault -- read it.\n"
-        "timed_out=true with kernel_state 'intact' means the evaluation was "
-        "aborted, not the kernel: your earlier definitions are still there.\n"
+        "timed_out=true carries a 'kernel' field from a real probe: alive means "
+        "your earlier definitions are still there, dead means they are not, "
+        "unverified means nobody knows yet.\n"
+        "success:true means no exception was raised and no timeout fired. It does "
+        "NOT mean the cell did its work: a cell that shells out to an external tool "
+        "still succeeds when that tool fails, and a cell that Get[]s a stored result "
+        "looks identical to one that computed it. Check an artifact -- a length, a "
+        "byte count, a file mtime -- not a status.\n"
+        "A cell can also end itself with Abort[]: that returns aborted:true with a "
+        "reason, is distinct from timed_out, and does not stop the rest of a range. "
+        "Packages that refuse to load twice abort, so re-running a setup cell shows "
+        "a benign abort -- read the reason before concluding anything.\n"
         "'kernel died' means the link dropped; the next call builds a fresh kernel "
         "and all state is gone."
     ),
@@ -665,16 +855,69 @@ _GUIDE: dict[str, str] = {
         "Only Input/Code cells run; Text, Output and Print cells come back "
         "'skipped'. Roughly a quarter of a real notebook's cells run code, so judge "
         "a replay by 'executed', not by 'seen'.\n"
-        "Large ranges return a summary; pass detail='full' for per-cell output.\n"
+        "Large ranges return a summary; pass detail='full' for per-cell output. "
+        "cells() degrades the same way rather than failing: it drops content first, "
+        "then narrows the window, and says which.\n"
+        "The first tool call starts the kernel, so status() before that reports "
+        "running:false, generation:0 -- 'not started', not 'broken'. The orphans "
+        "list is a machine-wide census that includes other sessions' live kernels; "
+        "check owner_alive before calling anything abandoned.\n"
         "read_notebook_file() reads a .nb without opening a session."
+    ),
+    "state": (
+        "The kernel is persistent and shared: everything you define stays until the "
+        "kernel dies or is restarted. That cuts both ways.\n"
+        "A notebook that depends on a symbol only YOU defined will replay perfectly "
+        "here and return silent zeros in a fresh kernel. Before calling a notebook "
+        "reproducible, replay it in a kernel that has run nothing else.\n"
+        "Checkpoint expensive results by exporting NAMED VALUES: "
+        "Export[\"stage.wl\", value]. Do NOT DumpSave a whole context: restoring a "
+        "Global` dump creates empty Global` symbols that shadow the same-named "
+        "symbols of any loaded package, so calls into it return unevaluated and "
+        "raise nothing -- 33 symbols affected in one observed case. After any "
+        "restore check Context /@ {\"SomeSymbol\"} names the package, not Global`.\n"
+        "Stored .wl files may be older than the code that reads them; agreement "
+        "with one proves reproducibility, not correctness."
+    ),
+    "parallel": (
+        "LaunchKernels[] subkernels are tracked, listed by status(), and closed with "
+        "the kernel. They also self-terminate within a few seconds if the master "
+        "dies, so they do not accumulate.\n"
+        "Interrupting parallel work is the risky case: an abort landing while large "
+        "expressions are in flight to subkernels can leave the session subtly wrong "
+        "even when the kernel survives and answers a probe. A probe verifies the "
+        "transport, never the algebra. abort() reports parallel_state='unverified' "
+        "when subkernels are live; rebuild_parallel_kernels=True closes and "
+        "relaunches them. Offered, not automatic -- and the risk is reasoned rather "
+        "than measured, so treat it as a cheap precaution, not a known fault.\n"
+        "An expensive operation applied to a whole collection at once is the usual "
+        "bottleneck: cost is rarely spread evenly, so a few elements hold the rest "
+        "hostage with no partial result. Map it per element under TimeConstrained. "
+        "Measured: a canonicalisation received all 21 elements as one argument, of "
+        "which 18 finished in seconds and 3 were the entire bottleneck."
     ),
     "performance": (
         "Round trip floor is ~0.3ms, so extra calls are cheap; huge results are "
         "not. Ask for Length/Short/Part rather than printing a large expression.\n"
         "LaunchKernels[] subkernels are tracked and closed with the kernel; "
         "status() lists them.\n"
-        "render() drives a headless front end for typeset images -- rasterise a "
-        "cell rather than dumping boxes when you want to SEE something."
+        "Exporting a notebook: paper is A4 portrait by default and cell groups are "
+        "opened, so a collapsed document still exports in full. If the reply comes "
+        "back with action_required='ASK THE USER', content is wider than the page "
+        "and has been silently cut off -- do NOT quietly re-export with fit_width, "
+        "and do NOT leave it clipped. Put both options to the user: widen the page "
+        "so nothing is lost (recommended, non-standard page size), or keep A4 and "
+        "accept the missing content (not recommended). It is their document.\n"
+        "render() drives a headless front end for typeset images. It RENDERS STORED "
+        "CONTENT: rasterising a cell shows what is in the file, not what you just "
+        "computed -- evaluating cells never writes results back into the document. "
+        "For a fresh result use render(action='expression') on the live value.\n"
+        "{Length, LeafCount} is a cheap fingerprint for spotting divergence between "
+        "runs, with two traps: a value that has been through a serialise/deserialise "
+        "round trip (Export/Import, Compress, a package's external form) counts "
+        "differently from the same value computed in memory, so a replay that loads "
+        "and one that recomputes disagree meaninglessly; and it is {0,1} for any "
+        "head that hides its contents, such as Dispatch[] -- use ByteCount there."
     ),
 }
 
@@ -683,7 +926,7 @@ _GUIDE: dict[str, str] = {
     description=("Usage notes for this server. topics: workflow | abort | errors | "
                  "notebooks | performance.")
 )
-def guide(topic: Literal["workflow", "abort", "errors", "notebooks",
+def guide(topic: Literal["workflow", "abort", "errors", "notebooks", "state", "parallel",
                          "performance"] = "workflow") -> str:
     return _reply({"success": True, "topic": topic,
                    "guidance": _GUIDE.get(topic, _GUIDE["workflow"]),
