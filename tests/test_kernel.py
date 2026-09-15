@@ -161,6 +161,152 @@ def test_abort_interrupts_and_keeps_state():
         assert k.evaluate("marker").strip() == "424242", "state lost"
 
 
+def test_a_kernel_that_cannot_be_armed_is_not_advertised():
+    """Connected is not ready. If arming fails, start() must fail closed.
+
+    The arming round trip exists to guarantee the kernel can be interrupted.
+    Returning a kernel whose arming failed would hand back exactly the
+    condition the step was added to rule out -- one with unknown abort
+    semantics -- and a caller has no way to tell the difference.
+
+    A kernel that cannot evaluate `1` is not a usable kernel missing one
+    feature; it is a kernel that failed its first evaluation.
+    """
+    from mathematica_wstp.kernel import Kernel, KernelError
+
+    k = Kernel()
+    original = Kernel._raw_eval
+    Kernel._raw_eval = lambda self, code, timeout: (_ for _ in ()).throw(
+        RuntimeError("simulated arming failure"))
+    try:
+        with contextlib.suppress(Exception):
+            k.start()
+            raise AssertionError("start() returned a kernel that could not be armed")
+        try:
+            k.start()
+        except KernelError as exc:
+            assert "arming" in str(exc), exc
+        except Exception as exc:
+            raise AssertionError(f"expected KernelError, got {type(exc).__name__}: {exc}")
+        else:
+            raise AssertionError("start() did not raise on arming failure")
+    finally:
+        Kernel._raw_eval = original
+        with contextlib.suppress(Exception):
+            k.close()
+
+
+def test_arming_the_kernel_is_not_observable():
+    """The startup round trip must not appear in the kernel's own bookkeeping.
+
+    start() evaluates once to arm the interrupt handler. This project cares
+    about In[]/Out[] fidelity to the point of having a pitfall about it, so a
+    hidden infrastructure evaluation that advanced $Line or populated history
+    would corrupt the very thing the notebook layer works to get right.
+
+    Measured with and without the warm-up: identical. Evaluations sent as
+    EvaluatePacket over WSTP do not touch $Line or In/Out in either case.
+    """
+    from mathematica_wstp import session as sess
+
+    sess.close_kernel()
+    sess.get_kernel()
+    try:
+        assert sess.evaluate_wl("$Line", timeout=30).text.strip() == "1"
+        hist = sess.evaluate_wl(
+            "{Length[DownValues[Out]], Length[DownValues[In]]}", timeout=30).text
+        assert hist.strip() == "{0, 0}", f"arming left history behind: {hist}"
+    finally:
+        sess.close_kernel()
+
+
+def test_aborting_an_idle_kernel_is_refused_and_harmless():
+    """An abort with nothing running must not be sent to the kernel.
+
+    Measured before the guard: one bare abort against an idle (armed) kernel
+    left the interrupt pending and wedged it -- two successive 1+1 evaluations
+    each timed out at 10s. Repeated here, including repeated stale aborts,
+    because a client retrying an uncertain abort is the realistic way to
+    produce several in a row.
+    """
+    from mathematica_wstp.kernel import Kernel
+
+    k = Kernel()
+    k.start()
+    try:
+        for _ in range(3):
+            assert k.abort(wait=0.5) is False, "an idle abort reported success"
+        for i in (1, 2, 3):
+            assert k.evaluate("1+1", timeout=8).strip() == "2", (
+                f"evaluation {i} broke after idle aborts -- the interrupt was sent anyway")
+    finally:
+        k.close()
+
+
+def test_abort_works_on_the_first_evaluation_after_a_restart():
+    """restart() produces a fresh kernel, so it must arm it too."""
+    from mathematica_wstp import session as sess
+
+    sess.get_kernel()
+    sess.restart_kernel()
+    out: dict = {}
+
+    def run() -> None:
+        out["r"] = sess.evaluate_wl('Pause[20]; "NEVER"', timeout=60)
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    time.sleep(0.3)
+    res = sess.abort_current(wait=10)
+    t.join(25)
+    assert res.get("confirmed") is True, f"abort not confirmed after restart: {res}"
+    reply = out.get("r")
+    assert reply is not None and (not reply.success or "NEVER" not in (reply.text or "")), (
+        "the evaluation survived the abort on a restarted kernel")
+    sess.close_kernel()
+
+
+def test_abort_works_on_a_kernel_first_evaluation():
+    """A fresh kernel must be abortable immediately, not after it warms up.
+
+    Answering the WSTP handshake does not arm the interrupt handler. Measured
+    before the fix: on a kernel whose first evaluation was the one being
+    stopped, the abort had NO EFFECT -- `Pause[20]; "NEVER"` returned "NEVER",
+    and confirmed=False came back 23s later. The identical abort against a
+    kernel that had already evaluated `1+1` was confirmed in 0.0s.
+
+    That is the worst shape of bug this server can have: abort is the property
+    the transport exists to provide, and it silently did nothing on the first
+    evaluation of every kernel -- including every fresh session and every
+    kernel(action="restart").
+    """
+    from mathematica_wstp import session as sess
+
+    sess.close_kernel()
+    sess.get_kernel()                      # fresh: no evaluation but the warm-up
+    out: dict = {}
+
+    def run() -> None:
+        out["r"] = sess.evaluate_wl('Pause[20]; "NEVER"', timeout=60)
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    time.sleep(0.3)
+    started = time.monotonic()
+    res = sess.abort_current(wait=10)
+    elapsed = time.monotonic() - started
+    t.join(25)
+
+    assert res.get("confirmed") is True, f"abort not confirmed on a fresh kernel: {res}"
+    assert elapsed < 5, f"abort took {elapsed:.1f}s on a fresh kernel"
+    reply = out.get("r")
+    assert reply is not None, "the evaluation never returned"
+    assert not reply.success or "NEVER" not in (reply.text or ""), (
+        "the evaluation ran to completion despite the abort -- the interrupt "
+        f"handler was not armed: {reply.text!r}")
+    sess.close_kernel()
+
+
 def test_abort_interrupts_an_external_process():
     """Abort must reach a kernel blocked in RunProcess, and not strand the child.
 
@@ -183,10 +329,14 @@ def test_abort_interrupts_an_external_process():
 
         def watcher() -> None:
             # Wait for the child to actually exist rather than sampling at a
-            # fixed instant: the kernel needs ~2.5s to spawn it here, so a
-            # 2.0s sample aborts before there is anything to interrupt and
-            # the test can only report itself vacuous. Deadline stays under
-            # the 20s the elapsed-time assertion below allows.
+            # fixed instant, so the test cannot pass vacuously.
+            #
+            # The ~2.5s this originally needed was NOT the kernel being slow to
+            # spawn the child. It was a fresh kernel being unable to service an
+            # abort at all until it had completed an evaluation -- see
+            # test_abort_works_on_a_kernel_first_evaluation. start() now arms the
+            # kernel, so the wait is short; polling stays because asserting the
+            # precondition is right regardless of why it was failing.
             deadline = time.monotonic() + 12
             while time.monotonic() < deadline:
                 found = sleepers()

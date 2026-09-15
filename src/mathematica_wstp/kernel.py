@@ -182,6 +182,39 @@ class Kernel:
 
         self.link = link
         registry.record(self.pid, self.pgid or self.pid, self.kernel_path)
+
+        # One throwaway evaluation before reporting ready, because a kernel that
+        # has answered the handshake is not yet ABORTABLE. Connected is not
+        # ready: ready means connected AND armed.
+        #
+        # Measured: on a kernel whose first evaluation is the one you want to
+        # stop, an out-of-band abort does not merely go unconfirmed -- it has no
+        # effect at all. `Pause[20]; "NEVER"` returned "NEVER" after the abort,
+        # with confirmed=False reported 23s later. The same abort against the
+        # same expression on a kernel that had already evaluated `1+1` was
+        # confirmed in 0.0s and returned $Aborted.
+        #
+        # So the interrupt handler is not armed by the link handshake. Arming it
+        # costs one trivial round trip at startup; not arming it means abort --
+        # the property this whole transport exists to provide -- silently does
+        # nothing on the first evaluation of every fresh kernel.
+        # Failing this is fatal, not a warning. A kernel that cannot evaluate `1`
+        # is not a usable kernel missing one feature -- it is a kernel that
+        # failed its first evaluation. Advertising it would hand back something
+        # whose abort semantics are unknown, which is the exact condition the
+        # arming step exists to rule out.
+        try:
+            self._raw_eval("1", timeout=min(30.0, timeout))
+        except Exception as exc:
+            self.link = None
+            link.close()
+            self._kill_now()
+            raise KernelError(
+                f"kernel {self.pid} connected but failed its arming evaluation "
+                f"({exc}); refusing to report it ready, because a kernel that has "
+                "not completed a round trip cannot be interrupted"
+            ) from exc
+
         logger.info("kernel up: pid=%s pgid=%s link=%s", self.pid, self.pgid, linkname)
         return self
 
@@ -473,7 +506,8 @@ class Kernel:
                 raise EvaluationTimeout(
                     f"evaluation exceeded {timeout}s and was left running", elapsed, False
                 ) from None
-            recovered = self.abort(wait=min(10.0, max(2.0, timeout * 0.1)))
+            recovered = self.abort(wait=min(10.0, max(2.0, timeout * 0.1)),
+                                   expect_reply=True)
             raise EvaluationTimeout(
                 f"evaluation exceeded {timeout}s; aborted "
                 f"({'the evaluation stopped; kernel not probed' if recovered else 'kernel did not confirm the abort'})",
@@ -506,16 +540,32 @@ class Kernel:
                 f"expected JSON from the kernel, got {raw[:200]!r}"
             ) from exc
 
-    def abort(self, wait: float = 5.0) -> bool:
+    def abort(self, wait: float = 5.0, expect_reply: bool = False) -> bool:
         """Interrupt whatever is running. Returns True if the kernel confirmed.
 
         Safe to call from another thread while :meth:`evaluate` is blocked --
         the WSTP message channel is out of band, which is exactly what the
         front end's Abort Evaluation uses.
+
+        Does nothing when no evaluation is in flight. Sending an abort to an
+        idle kernel is not harmless: the interrupt stays pending and wedges the
+        kernel. Measured -- after one bare abort against an idle kernel, two
+        successive ``1+1`` evaluations each timed out at 10s. This was invisible
+        until start() began arming the interrupt handler, because before that an
+        abort to a fresh kernel did nothing at all.
+
+        ``expect_reply`` is the timeout path, which has already released the
+        lock but IS owed a ``$Aborted`` and must still drain it.
         """
         link = self.link
         if link is None:
             return False
+        if not expect_reply:
+            free = self._eval_lock.acquire(blocking=False)
+            if free:
+                self._eval_lock.release()
+                logger.debug("abort ignored: no evaluation in flight")
+                return False
         self._abort_requested.set()
         link.abort()
 
