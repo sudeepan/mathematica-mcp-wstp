@@ -131,6 +131,9 @@ class WLResult:
     prints: list[str] = field(default_factory=list)
     error: str = ""
     timed_out: bool = False
+    #: An abort was requested while this evaluation was running, yet it still
+    #: returned a value. See ``evaluate_wl``.
+    abort_requested_during: bool = False
     aborted: bool = False
     execution_method: str = "wstp"
     extra: dict[str, Any] = field(default_factory=dict)
@@ -398,6 +401,15 @@ def _mark_user_abort() -> None:
         logger.warning("could not write the abort sentinel %s", path)
 
 
+# Counts abort requests, so an evaluation can tell whether one landed while it
+# was running. Never reset: callers compare a before/after reading, not a total.
+_abort_requests = 0
+
+
+def abort_request_count() -> int:
+    return _abort_requests
+
+
 def abort_current(wait: float = 5.0, probe: float = ABORT_PROBE_TIMEOUT,
                   rebuild_parallel_kernels: bool = False) -> dict[str, Any]:
     """Interrupt whatever the kernel is doing. Deliberately does not take the lock.
@@ -417,6 +429,8 @@ def abort_current(wait: float = 5.0, probe: float = ABORT_PROBE_TIMEOUT,
         return {"success": False, "error": "no kernel is running", "kernel": "none",
                 "generation": _generation}
     # Before the signal, not after: the kernel may act on the abort immediately.
+    global _abort_requests
+    _abort_requests += 1
     _mark_user_abort()
     if not kernel.is_alive():
         # Same verdict vocabulary as the post-probe answer below. Two different
@@ -537,13 +551,28 @@ def _run(fn, *, timeout: float) -> WLResult:
 
 
 def evaluate_wl(code: str, timeout: float = DEFAULT_TIMEOUT) -> WLResult:
-    """Evaluate Wolfram source, returning InputForm text."""
+    """Evaluate Wolfram source, returning InputForm text.
+
+    An evaluation that returns a value after an abort was asked for is marked.
+    Whether an out-of-band abort unwinds the whole expression or only the
+    innermost one is version-dependent: on 15.0.1 ``Do[...]; "NEVER"`` aborts
+    entirely, while on 14.0.0 the Do is interrupted and the CompoundExpression
+    carries on and returns "NEVER" -- a partial execution reported as a clean
+    result. Rather than detect the version, notice the situation: an abort was
+    requested, and a value came back anyway.
+    """
+    before = abort_request_count()
+
     def go() -> WLResult:
         kernel = get_kernel()
         reply = kernel.evaluate_detailed(code, timeout=timeout)
         return WLResult(success=True, text=reply.value,
                         messages=reply.messages, prints=reply.prints)
-    return _run(go, timeout=timeout)
+
+    result = _run(go, timeout=timeout)
+    if result.success and abort_request_count() != before:
+        result.abort_requested_during = True
+    return result
 
 
 def evaluate_wl_bytes(code: str, timeout: float = DEFAULT_TIMEOUT) -> WLResult:

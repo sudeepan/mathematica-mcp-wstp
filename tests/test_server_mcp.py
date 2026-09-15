@@ -85,11 +85,42 @@ async def run_checks() -> list[tuple[str, bool, str]]:
 
             check("abort confirmed", abort_res.get("confirmed") is True, str(abort_res))
             check("aborted evaluation returned promptly", elapsed < 30, f"{elapsed:.1f}s")
-            check("evaluation reports the abort",
-                  eval_res.get("aborted") or "abort" in str(eval_res).lower(), str(eval_res))
+            # Two correct outcomes, decided by the kernel version. On 15.0.1 the
+            # out-of-band abort unwinds the whole expression and the evaluation
+            # reports the abort. On 14.0.0 it interrupts only the innermost
+            # expression, so `Do[...]; "NEVER"` returns "NEVER" -- a partial
+            # execution. What must never happen is that returning silently: the
+            # reply has to say the result may be partial. Measured on both; the
+            # Do alone is ~17 hours, so "NEVER" can only mean a partial run.
+            reported_abort = bool(eval_res.get("aborted")) or "abort" in str(eval_res).lower()
+            check("evaluation reports the abort, or flags the result as partial",
+                  reported_abort, str(eval_res))
+            if not eval_res.get("aborted") and eval_res.get("output", "").strip('"') == "NEVER":
+                check("a partial result is not passed off as a clean one",
+                      eval_res.get("result_may_be_partial") is True, str(eval_res))
 
             r = _payload(await sess.call_tool("evaluate", {"code": "marker"}))
             check("state SURVIVES the abort", r.get("output", "").strip() == "424242", str(r))
+
+            # The guard, forced deterministically on any kernel version. CheckAbort
+            # absorbs the abort, so the expression continues and returns a value
+            # while an abort was outstanding -- the same shape as 14.0.0's partial
+            # unwinding, which is otherwise only reproducible on that version.
+            # A value that arrives after you asked for an abort must never look
+            # like an ordinary result.
+            swallow = asyncio.create_task(sess.call_tool(
+                "evaluate", {"code": 'CheckAbort[Pause[8], "caught"]; "DONE"', "timeout": 60}))
+            await asyncio.sleep(2)
+            await sess.call_tool("abort", {})
+            swallowed = _payload(await swallow)
+            check("a value returned despite an abort is flagged as possibly partial",
+                  swallowed.get("success") is True
+                  and swallowed.get("result_may_be_partial") is True, str(swallowed)[:220])
+            check("and the reply explains why rather than just flagging it",
+                  "partly executed" in str(swallowed.get("note", "")), str(swallowed)[:220])
+            r = _payload(await sess.call_tool("evaluate", {"code": "1+1"}))
+            check("an ordinary result afterwards carries no such flag",
+                  r.get("result_may_be_partial") is None, str(r)[:160])
 
             r = _payload(await sess.call_tool("evaluate",
                                               {"code": 'Do[z=i,{i,1,10^12}]', "timeout": 2}))

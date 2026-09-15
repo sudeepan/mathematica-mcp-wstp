@@ -122,6 +122,23 @@ def evaluate(code: str, timeout: float = 60.0) -> str:
 
     text, truncated = _truncate(result.text)
     payload: dict[str, Any] = {"success": True, "output": text}
+    if result.abort_requested_during:
+        # An abort was asked for and a value came back regardless. Whether an
+        # out-of-band abort unwinds the whole expression or only the innermost
+        # one is version-dependent -- measured, 15.0.1 unwinds and 14.0.0 leaves
+        # the enclosing CompoundExpression to continue -- so this result may be
+        # the tail of a computation whose earlier part was cut off. Saying so is
+        # the whole point: a partial execution reported as a clean success is
+        # indistinguishable from a real answer.
+        payload["abort_requested_during"] = True
+        payload["result_may_be_partial"] = True
+        payload["note"] = (
+            "You aborted while this was running and it returned a value anyway. "
+            "On some kernel versions an abort interrupts only the innermost "
+            "expression, so statements after the interrupted one still run: this "
+            "output may be the tail of a partly executed computation. Re-run it "
+            "if the value matters, and check any state it assigned."
+        )
     if notice:
         # The case that matters: a SUCCESSFUL call against a kernel that was
         # silently swapped underneath it. Without this the reply is
