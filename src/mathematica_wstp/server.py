@@ -828,7 +828,13 @@ _GUIDE: dict[str, str] = {
         "when the expression is parsed, so loading and using in one call binds the "
         "symbol to Global` and silently returns the wrong thing.\n"
         "Notebooks: notebooks(action='open', path=...) then cells() to look, "
-        "evaluate_cells(from_=, to=) to run. Cells run from their stored boxes."
+        "evaluate_cells(from_=, to=) to run. Cells run from their stored boxes.\n"
+        "Documentation for the LANGUAGE is not here. This server runs your kernel; "
+        "it carries no reference material. When Wolfram's own MCP server is "
+        "available, use its WolframLanguageContext for what a built-in does and "
+        "what its options mean -- do not reason from memory about edge cases. Note "
+        "it runs a SEPARATE kernel: it cannot see symbols defined in this session, "
+        "and its SymbolDefinition reports on its kernel, not yours."
     ),
     "abort": (
         "abort() interrupts the running evaluation and then PROBES the kernel, so "

@@ -136,6 +136,39 @@ executable cells between two headings as one unit of work.
 timing table costs you nothing and tells you immediately when a "fast" chapter
 was fast because it loaded a stored result instead of computing one.
 
+## Looking up the language
+
+This server holds no documentation. It runs a kernel; asking it what a built-in
+does gets you whatever that kernel happens to return, which for a built-in is
+its attributes and nothing about behaviour:
+
+```wl
+CheckAbort // Attributes = {HoldAll, Protected}
+CheckAbort[___] := "<kernel function>"
+```
+
+When Wolfram's own MCP server is available, **use `WolframLanguageContext` for
+anything about the language**. It is a semantic search over the real reference
+pages and returns the details table and worked examples. Do not reason from
+memory about a function's edge cases — options like `PropagateAborts`,
+`Method`, or what a head does when its argument is unevaluated are exactly where
+a confident guess is wrong, and the pages settle it in one call.
+
+Two boundaries matter, both verified:
+
+- **It is a different kernel.** It cannot see a symbol defined in this session,
+  and this session cannot see one defined there. Its per-session sandboxing puts
+  symbols in a `Sessions`<id>`` context, so even `Global`x` will not resolve to
+  your `x`. Anything about *your* state — what a replay defined, what a variable
+  holds now — is a question for this server: `vars`, `evaluate`, `cells`.
+- **Its `SymbolDefinition` is not a documentation tool.** It reads back
+  definitions in its own kernel. Useful for inspecting something you defined
+  there; useless for a built-in.
+
+So: **the language → Wolfram's MCP; your kernel and your document → here.**
+Neither substitutes for the other, and mixing them up wastes a call and can
+produce a confidently wrong answer about a symbol that was never in scope.
+
 ## Long computations
 
 Calls over ~120 s are moved to a background task by the client. This is normal;

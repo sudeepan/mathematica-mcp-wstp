@@ -18,10 +18,35 @@ supplies typeset images with no display attached.
 - [`docs/agent-guide.md`](docs/agent-guide.md) — how to drive this server well:
   session shape, notebooks, long runs, interrupting, parallel work, comparing a
   headless replay against an interactive one.
-- [`docs/pitfalls.md`](docs/pitfalls.md) — six ways to get a wrong answer with
-  no error, each one observed on real work.
+- [`docs/pitfalls.md`](docs/pitfalls.md) — sixteen ways to get a wrong answer
+  with no error, each one observed on real work.
 - `guide(topic=...)` in the server itself carries the short form:
   `workflow · abort · errors · notebooks · state · parallel · performance`.
+
+### For the language itself, use Wolfram's own MCP server
+
+This server drives **your kernel**: your session, your notebook, your results.
+It carries no reference material, and it is not the place to ask what a built-in
+does.
+
+For that, run Wolfram's MCP server alongside it and use
+`WolframLanguageContext` — a semantic search over the actual Wolfram reference
+pages that comes back with the options table and worked examples. It settled a
+question here that guesswork had got wrong: whether `CheckAbort` propagates an
+abort outward, and what `PropagateAborts` changes.
+
+Two things to know before relying on it:
+
+- **It runs its own kernel.** It cannot see anything defined in *this* server's
+  session, and its `SymbolDefinition` tool reports on symbols in its kernel, not
+  yours. A symbol you just assigned here comes back as "does not exist" there.
+- **`SymbolDefinition` is not documentation.** On a built-in it returns the
+  attributes and `f[___] := "<kernel function>"`, which tells you nothing about
+  behaviour. Use `WolframLanguageContext` for that; `SymbolDefinition` is for
+  reading back definitions you made in its own session.
+
+Rule of thumb: **what the language does → Wolfram's MCP. What your session and
+your document contain → this server.**
 
 ## Why this exists
 
