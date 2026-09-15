@@ -834,7 +834,11 @@ _GUIDE: dict[str, str] = {
         "available, use its WolframLanguageContext for what a built-in does and "
         "what its options mean -- do not reason from memory about edge cases. Note "
         "it runs a SEPARATE kernel: it cannot see symbols defined in this session, "
-        "and its SymbolDefinition reports on its kernel, not yours."
+        "and its SymbolDefinition reports on its kernel, not yours.\n"
+        "Long-running external tools: use StartProcess, not Run[\"cmd &\"]. A "
+        "shell-detached child SURVIVES the death of the kernel and of this server "
+        "(measured), is not a Wolfram kernel so the orphan reaper never sees it, "
+        "and after setsid cannot be reached by process-group signalling either."
     ),
     "abort": (
         "abort() interrupts the running evaluation and then PROBES the kernel, so "

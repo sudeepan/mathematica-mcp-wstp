@@ -315,3 +315,33 @@ cell that already consumed its result computed from an unevaluated symbol, so
 re-run the whole dependent stretch. Check a value you can recognise afterwards.
 A page of zeros is what this failure looks like, and zeros are hard to
 distinguish from a legitimate result.
+
+## 17. Launching a long-lived external process through the shell
+
+A kernel's descendants do not all share its fate. Measured by starting a tree,
+`SIGKILL`ing the process that owns the link, and watching `/proc` for 60 s:
+
+| descendant | survives the owner's death? |
+|---|---|
+| the master kernel itself | no — gone in ~1–3 s |
+| `LaunchKernels[4]` workers | no — gone in ~2 s |
+| `StartProcess[{"sleep", "..."}]` | no — gone in ~3 s |
+| `Run["sleep ... &"]` | **yes — still alive at 60 s** |
+| `Run["setsid sh -c '...' &"]` | **yes — still alive at 60 s** |
+
+The boundary is not "Wolfram process versus external program". It is **managed
+versus shell-detached**. Anything the kernel owns as a process object follows it
+down; anything handed to a shell with `&`, or moved into its own session with
+`setsid`, outlives the whole tree and is reparented to init.
+
+That matters for a long solver run — a reduction, an integral table, anything
+started for its side effects and left going. Start it with `Run["... &"]` and a
+crash leaves it burning CPU with nothing tracking it: it is not a Wolfram
+kernel, so the orphan reaper does not know about it, and once `setsid` has moved
+it out of the process group it cannot be reached by group signalling either.
+
+**Prefer `StartProcess`.** It returns a `ProcessObject`, the kernel owns the
+lifecycle, and cleanup is free. Use `Run["... &"]` only for something short
+enough that you would not mind it finishing unattended — and if a detached
+process must outlive its caller, record its pid, start time and command
+somewhere durable first, because nothing in this server will do it for you.

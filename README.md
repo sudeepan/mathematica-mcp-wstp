@@ -18,7 +18,7 @@ supplies typeset images with no display attached.
 - [`docs/agent-guide.md`](docs/agent-guide.md) — how to drive this server well:
   session shape, notebooks, long runs, interrupting, parallel work, comparing a
   headless replay against an interactive one.
-- [`docs/pitfalls.md`](docs/pitfalls.md) — sixteen ways to get a wrong answer
+- [`docs/pitfalls.md`](docs/pitfalls.md) — seventeen ways to get a wrong answer
   with no error, each one observed on real work.
 - `guide(topic=...)` in the server itself carries the short form:
   `workflow · abort · errors · notebooks · state · parallel · performance`.
