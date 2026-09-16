@@ -80,7 +80,7 @@ class HeadlessNotebooks:
         The helper is loaded behind an in-kernel sentinel, so a restarted kernel
         reloads it on the next call instead of failing with an undefined symbol.
         """
-        from .session import evaluate_wl_bytes
+        from .evaluator import get_evaluator
 
         helper = _wl_string(self._helper_path())
         arglist = ", ".join(_wl_arg(a) for a in args)
@@ -97,7 +97,7 @@ class HeadlessNotebooks:
         # catch the abort and coerce anything unexpected into a JSON error that
         # the transport CAN carry.
         code = (
-            "Normal[Module[{mcpRes},"
+            "Module[{mcpRes},"
             "  mcpRes = CheckAbort[Module[{},"
             f"    If[!TrueQ[$MCPHeadlessNotebookLoaded],"
             f"      If[Get[{helper}] =!= $Failed, $MCPHeadlessNotebookLoaded = True]];"
@@ -110,17 +110,20 @@ class HeadlessNotebooks:
             "      \"aborted\" -> TrueQ[mcpRes === $Aborted],"
             "      \"raw\" -> StringTake[ToString[Short[mcpRes, 3]], UpTo[300]]|>,"
             "      \"RawJSON\", \"Compact\" -> True]]"
-            "]]"
+            "]"
         )
-        result = evaluate_wl_bytes(code, timeout=timeout)
+        # One evaluation, one handle. The backend decides how bytes cross the
+        # link; this layer only needs the bytes and, later, the identity of the
+        # execution that produced them.
+        result = get_evaluator().submit_bytes(code, timeout=timeout).wait(timeout + 30)
         if not result.success:
             return {
                 "success": False,
-                "error": result.error or "kernel evaluation failed",
+                "error": result.detail or "kernel evaluation failed",
                 "timed_out": result.timed_out,
                 "headless": True,
             }
-        text = (result.text or "").strip()
+        text = (result.data or b"").decode("utf-8", errors="replace").strip()
         try:
             parsed = json.loads(text)
         except json.JSONDecodeError:
@@ -132,7 +135,7 @@ class HeadlessNotebooks:
             }
         if isinstance(parsed, dict):
             parsed.setdefault("headless", True)
-            parsed.setdefault("execution_method", result.execution_method)
+            parsed.setdefault("execution_method", result.backend)
             return parsed
         return {"success": False, "error": "Unexpected reply shape", "raw": text[:2000], "headless": True}
 

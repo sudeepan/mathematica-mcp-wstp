@@ -326,6 +326,67 @@ def test_the_interval_closes_when_the_return_packet_arrives():
                 "a pending interrupt survived")
 
 
+def test_direct_evaluator_returns_exact_bytes():
+    """The evaluator's contract is bytes in, bytes out -- not text that usually
+    happens to encode bytes.
+
+    The payloads are the ones that break a text path: a Wolfram named character,
+    a byte sequence that is not valid UTF-8, and an embedded null. If any of
+    these round-trips through a str, this test fails and the notebook layer's
+    reason for using the byte path is gone.
+    """
+    from mathematica_wstp.evaluator import DirectSessionEvaluator
+
+    ev = DirectSessionEvaluator()
+    cases = [
+        ('ByteArray[{}]', b""),
+        ('StringToByteArray["\\[Gamma] = 2"]', "\u03b3 = 2".encode()),
+        ('ByteArray[{255, 254, 65, 0, 66}]', bytes([255, 254, 65, 0, 66])),
+        ('StringToByteArray["a\\\\b\\"c"]', b'a\\b"c'),
+    ]
+    try:
+        for code, expected in cases:
+            result = ev.submit_bytes(code, timeout=60).wait(120)
+            assert result.success, f"{code}: {result.outcome} {result.detail}"
+            assert result.data == expected, f"{code}: {result.data!r} != {expected!r}"
+            assert result.backend == "direct"
+            assert result.authenticated is False, "local ids must not claim to be authenticated"
+    finally:
+        from mathematica_wstp import session
+        session.close_kernel()
+
+
+def test_direct_evaluator_control_is_scoped_to_the_handle():
+    """Abort belongs to an execution, not to the evaluator.
+
+    The direct backend has only one evaluation at a time and could get away with
+    "abort whatever is running". The interface does not let it, and a handle
+    whose execution has already finished refuses rather than interrupting
+    whatever came next.
+    """
+    from mathematica_wstp import session
+    from mathematica_wstp.evaluator import DirectSessionEvaluator
+
+    ev = DirectSessionEvaluator()
+    try:
+        slow = ev.submit_bytes('(Pause[20]; StringToByteArray["never"])', timeout=60)
+        deadline = time.time() + 10
+        while slow.status() != "RUNNING" and time.time() < deadline:
+            time.sleep(0.05)
+        assert slow.status() == "RUNNING"
+
+        assert "ABORT_ISSUED" in slow.abort()
+        result = slow.wait(60)
+        assert result.outcome in ("ABORTED", "FAILED"), result.outcome
+        assert result.data is None
+
+        finished = ev.submit_bytes('StringToByteArray["done"]', timeout=60)
+        assert finished.wait(60).data == b"done"
+        assert "REFUSED" in finished.abort(), "a finished handle must not abort anything"
+    finally:
+        session.close_kernel()
+
+
 def test_reply_events_keep_prints_and_messages_in_packet_order():
     """The interleaving is the part that cannot be recovered later.
 
