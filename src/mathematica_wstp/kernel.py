@@ -86,11 +86,29 @@ class Reply:
     packet holding the rendered text. A reader that keeps only the return packet
     silently discards all of it -- which is how a warning that explains a wrong
     answer disappears before anyone sees it.
+
+    ``events`` is the source of truth and is in packet order, so the interleaving
+    of prints and messages survives:
+
+        Print["one"]; 1/0; Print["two"]  ->  print one, message Power::infy, print two
+
+    ``prints`` and ``messages`` are filtered views of it. They were separate
+    lists until a supervisor needed to render a cell's output back into a
+    document and found the relative order had been discarded at this layer --
+    once two lists have been built, no later code can recover which came first.
     """
 
     value: str = ""
-    messages: list[dict] = field(default_factory=list)
-    prints: list[str] = field(default_factory=list)
+    events: list[dict] = field(default_factory=list)
+
+    @property
+    def messages(self) -> list[dict]:
+        return [{k: v for k, v in e.items() if k != "kind"}
+                for e in self.events if e["kind"] == "message"]
+
+    @property
+    def prints(self) -> list[str]:
+        return [e["text"] for e in self.events if e["kind"] == "print"]
 
 
 def _tidy_message(text: str, name: str) -> str:
@@ -462,9 +480,9 @@ class Kernel:
                         tag = link.get_string()
                     elif link.get_type() in SYMBOL_TOKENS:
                         tag = link.get_symbol()
-                    pending = {"symbol": symbol, "tag": tag,
+                    pending = {"kind": "message", "symbol": symbol, "tag": tag,
                                "name": f"{symbol}::{tag}" if tag else symbol, "text": ""}
-                    reply.messages.append(pending)
+                    reply.events.append(pending)
                 except (WSTPError, LinkDead):
                     pending = None
                 finally:
@@ -477,7 +495,7 @@ class Kernel:
                     if pending is not None:
                         pending["text"] = _tidy_message(text, pending["name"])
                     else:
-                        reply.prints.append(text.rstrip("\n"))
+                        reply.events.append({"kind": "print", "text": text.rstrip("\n")})
                 except (WSTPError, LinkDead):
                     pass
                 finally:

@@ -220,6 +220,30 @@ def test_arming_the_kernel_is_not_observable():
         sess.close_kernel()
 
 
+def test_reply_events_keep_prints_and_messages_in_packet_order():
+    """The interleaving is the part that cannot be recovered later.
+
+    Two separate lists preserve the order within each stream and discard the
+    order between them, which is exactly what a caller rendering a cell's output
+    back into a document needs. The ordered event list is therefore the source
+    of truth, and prints/messages are views of it.
+    """
+    with Kernel() as k:
+        reply = k.evaluate_detailed(
+            '(Print["one"]; 1/0; Print["two"]; Part[{1, 2}, 5]; Print["three"]; 42)',
+            timeout=30)
+        assert reply.value.strip() == "42", reply.value
+
+        shape = [e["kind"] if e["kind"] == "print" else e["name"] for e in reply.events]
+        assert shape == ["print", "Power::infy", "print", "Part::partw", "print"], shape
+
+        # The views still answer the old questions.
+        assert reply.prints == ["one", "two", "three"], reply.prints
+        assert [m["name"] for m in reply.messages] == ["Power::infy", "Part::partw"]
+        assert "kind" not in reply.messages[0], "the view leaks the event tag"
+        assert "Infinite expression" in reply.messages[0]["text"], reply.messages[0]
+
+
 def test_evaluation_in_flight_answers_about_the_transport():
     """The witness a caller needs when its own bookkeeping is in doubt.
 
