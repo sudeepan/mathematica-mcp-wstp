@@ -220,6 +220,45 @@ def test_arming_the_kernel_is_not_observable():
         sess.close_kernel()
 
 
+def test_evaluation_in_flight_answers_about_the_transport():
+    """The witness a caller needs when its own bookkeeping is in doubt.
+
+    Written because a supervisor asking "is anything actually running?" was
+    otherwise reduced to reading Kernel's private lock. The answer must be
+    false on an idle kernel, true while one evaluation is blocked, and false
+    again afterwards -- including after the evaluation was aborted rather than
+    allowed to finish.
+    """
+    with Kernel() as k:
+        assert k.evaluation_in_flight() is False, "a freshly armed kernel is not idle"
+
+        started = threading.Event()
+        done = []
+
+        def run():
+            started.set()
+            with contextlib.suppress(Exception):
+                done.append(k.evaluate("Pause[20]; 1", timeout=60))
+
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        started.wait(10)
+        deadline = time.time() + 10
+        while not k.evaluation_in_flight() and time.time() < deadline:
+            time.sleep(0.05)
+        assert k.evaluation_in_flight() is True, "an evaluation is blocked but the kernel says idle"
+
+        # Deliberately not asserting that the abort confirms within a fixed
+        # window: that is a timing claim, covered by the abort tests, and it made
+        # this one fail on a loaded machine. What matters here is that the
+        # evaluation ends and the predicate follows it.
+        k.abort(wait=30)
+        t.join(30)
+        assert not t.is_alive(), "the aborted evaluation never returned"
+        assert k.evaluation_in_flight() is False, "still reported in flight after the abort"
+        assert k.evaluate("1+1", timeout=30).strip() == "2", "the kernel did not survive"
+
+
 def test_aborting_an_idle_kernel_is_refused_and_harmless():
     """An abort with nothing running must not be sent to the kernel.
 

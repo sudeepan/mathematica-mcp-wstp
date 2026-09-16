@@ -132,6 +132,11 @@ class Kernel:
         self._eval_lock = threading.RLock()
         self._closed = False
         self._abort_requested = threading.Event()
+        # Set once an expression has actually been written to the link and
+        # flushed, cleared when its reply has been consumed. NOT the same as
+        # "the evaluation lock is held": the lock is taken first, and an abort
+        # sent in the gap reaches an idle kernel, which wedges it.
+        self._in_flight = threading.Event()
         self.subkernel_pids_cached: list[int] = []
 
     # -- lifecycle ---------------------------------------------------------
@@ -355,7 +360,11 @@ class Kernel:
             link.put_symbol("InputForm")
             link.end_packet()
             link.flush()
-            return self._read_reply(timeout)
+            self._in_flight.set()
+            try:
+                return self._read_reply(timeout)
+            finally:
+                self._in_flight.clear()
 
     def _eval_string(self, code: str, timeout: float) -> str:
         """Evaluate an expression that already yields a String, and read it raw.
@@ -399,17 +408,21 @@ class Kernel:
             link.put_string(code)
             link.end_packet()
             link.flush()
+            self._in_flight.set()
             started = time.monotonic()
-            while True:
-                remaining = timeout - (time.monotonic() - started)
-                if remaining <= 0 or not link.wait_ready(remaining):
-                    raise TimeoutError("no reply within the deadline")
-                if link.next_packet() == RETURNPKT:
-                    try:
-                        return link.get_bytes()
-                    finally:
-                        link.new_packet()
-                link.new_packet()
+            try:
+                while True:
+                    remaining = timeout - (time.monotonic() - started)
+                    if remaining <= 0 or not link.wait_ready(remaining):
+                        raise TimeoutError("no reply within the deadline")
+                    if link.next_packet() == RETURNPKT:
+                        try:
+                            return link.get_bytes()
+                        finally:
+                            link.new_packet()
+                    link.new_packet()
+            finally:
+                self._in_flight.clear()
 
     def _read_reply(self, timeout: float) -> Reply:
         """Read until the return packet, keeping everything that arrives first.
@@ -540,6 +553,29 @@ class Kernel:
                 f"expected JSON from the kernel, got {raw[:200]!r}"
             ) from exc
 
+    def evaluation_in_flight(self) -> bool:
+        """Has an expression been sent to the kernel whose reply is still owed?
+
+        Deliberately narrow. It answers yes or no about the transport, for a
+        caller that needs a second opinion independent of its own bookkeeping --
+        the case that motivated it is a supervisor deciding whether an emergency
+        abort is defensible when its own records have become contradictory.
+
+        It does NOT say which evaluation, or whose. The link has no notion of
+        request identity, so this must not be used as one.
+
+        The first version answered "is the evaluation lock held", which is not
+        the same question and is wrong in the way that matters. The lock is
+        taken before the expression is written to the link, so there is a window
+        in which the lock is held and the kernel has been sent nothing at all.
+        Measured: a caller polling this predicate and aborting the moment it went
+        true caught that window every time -- 3 trials, in_flight true at 0ms --
+        and the abort, arriving at an idle kernel, left an interrupt pending that
+        wedged it. The evaluation that followed never returned, and the abort was
+        still unconfirmed 30s later.
+        """
+        return self.link is not None and self._in_flight.is_set()
+
     def abort(self, wait: float = 5.0, expect_reply: bool = False) -> bool:
         """Interrupt whatever is running. Returns True if the kernel confirmed.
 
@@ -560,12 +596,9 @@ class Kernel:
         link = self.link
         if link is None:
             return False
-        if not expect_reply:
-            free = self._eval_lock.acquire(blocking=False)
-            if free:
-                self._eval_lock.release()
-                logger.debug("abort ignored: no evaluation in flight")
-                return False
+        if not expect_reply and not self.evaluation_in_flight():
+            logger.debug("abort ignored: no evaluation in flight")
+            return False
         self._abort_requested.set()
         link.abort()
 
