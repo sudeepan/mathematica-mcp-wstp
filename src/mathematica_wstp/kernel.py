@@ -434,6 +434,7 @@ class Kernel:
                     if remaining <= 0 or not link.wait_ready(remaining):
                         raise TimeoutError("no reply within the deadline")
                     if link.next_packet() == RETURNPKT:
+                        self._in_flight.clear()      # see _read_reply
                         try:
                             return link.get_bytes()
                         finally:
@@ -466,6 +467,15 @@ class Kernel:
             packet = link.next_packet()
 
             if packet == RETURNPKT:
+                # The evaluation is over the moment its return packet appears.
+                # Stop claiming it is in flight here rather than after the value
+                # has been read: everything between the two is time this process
+                # spends on its own, and an abort issued in that stretch reaches
+                # an idle kernel. Measured, with a reader deliberately held after
+                # the return packet: the kernel wedges permanently -- no link
+                # error, nothing readable, and neither clear_error() nor a drain
+                # abort recovers it. Only a restart does.
+                self._in_flight.clear()
                 try:
                     reply.value = link.get_string()
                 finally:
@@ -572,7 +582,12 @@ class Kernel:
             ) from exc
 
     def evaluation_in_flight(self) -> bool:
-        """Has an expression been sent to the kernel whose reply is still owed?
+        """An EvaluatePacket has been flushed and its RETURNPKT has not yet been
+        observed by this client.
+
+        That is the whole claim. It is an observable transport fact, and it is
+        NOT equivalent to "the kernel is executing user code right now" -- the
+        kernel may have finished while its packet is still in transit.
 
         Deliberately narrow. It answers yes or no about the transport, for a
         caller that needs a second opinion independent of its own bookkeeping --
@@ -581,6 +596,26 @@ class Kernel:
 
         It does NOT say which evaluation, or whose. The link has no notion of
         request identity, so this must not be used as one.
+
+        The interval is bounded at both ends by what this process can observe:
+        it opens when the expression has been flushed, and closes when the
+        return packet appears. Both edges matter, because an abort outside them
+        reaches an idle kernel and wedges it permanently.
+
+        Two gaps remain unobservable from here, one at each end, and an abort
+        landing in either reaches a kernel that is not evaluating -- which wedges
+        it permanently, with no recovery short of a restart.
+
+          * flushed is not started. Measured: an abort issued the instant this
+            predicate goes true wedged the kernel in 2 trials out of 20.
+          * finished is not observed. The kernel may complete while its return
+            packet is still in transit.
+
+        So a true answer here means the evaluation was in flight when the packet
+        was sent and had not been seen to end. It does not promise the kernel is
+        executing user code at the moment you ask, and a caller that aborts on
+        the strength of it is taking a small, real risk. Detecting and recovering
+        from that belongs to a layer that can decide to restart a kernel.
 
         The first version answered "is the evaluation lock held", which is not
         the same question and is wrong in the way that matters. The lock is

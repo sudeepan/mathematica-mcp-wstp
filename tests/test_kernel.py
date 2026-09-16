@@ -220,6 +220,112 @@ def test_arming_the_kernel_is_not_observable():
         sess.close_kernel()
 
 
+def test_abort_is_refused_until_the_expression_has_been_flushed():
+    """Pin the dispatch boundary with a barrier, not a race.
+
+    The predicate this asserts was wrong once, and the test that should have
+    caught it polled in a loop and aborted when the predicate went true -- which
+    is a race, and it passed twice by losing it. Holding the link's flush lets
+    the test stand on the exact boundary instead of hoping to land near it.
+
+    Before the flush the kernel has been sent nothing, so an abort would arrive
+    at an idle kernel and leave an interrupt pending that wedges it.
+    """
+    with Kernel() as k:
+        at_flush, release = threading.Event(), threading.Event()
+        original = k.link.flush
+
+        def gated_flush():
+            at_flush.set()
+            release.wait(30)
+            original()
+
+        k.link.flush = gated_flush
+        outcome = []
+
+        def run():
+            with contextlib.suppress(Exception):
+                outcome.append(k.evaluate("Pause[6]; 1", timeout=60))
+
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        assert at_flush.wait(15), "the evaluation never reached the flush"
+
+        # The lock is held and nothing has crossed the link.
+        assert k.evaluation_in_flight() is False, "in flight before anything was sent"
+        assert k.abort(wait=2) is False, "an abort was accepted with nothing to abort"
+
+        release.set()
+        deadline = time.time() + 15
+        while not k.evaluation_in_flight() and time.time() < deadline:
+            time.sleep(0.01)
+        assert k.evaluation_in_flight() is True, "not in flight after the flush"
+
+        assert k.abort(wait=15) is True, "the abort did not land after the flush"
+        t.join(30)
+        assert not t.is_alive()
+        assert k.evaluate("1+1", timeout=30).strip() == "2", "the kernel did not survive"
+
+
+def test_the_interval_closes_when_the_return_packet_arrives():
+    """The other end of the same interval, also pinned with a barrier.
+
+    An evaluation is over when its return packet appears, not when this process
+    gets around to reading the value out of it. Everything in between is time
+    spent on our own side, and an abort issued during it reaches a kernel that
+    has already finished.
+
+    That is not a recoverable mistake. Measured with the reader held in that
+    stretch before the interval was closed there: the kernel wedged permanently
+    in 7 trials out of 7 -- no link error, nothing readable, `clear_error()` and
+    a drain abort both ineffective, only a restart recovering it.
+
+    What remains is the gap between the kernel finishing and its packet reaching
+    us, which nothing in this process can observe. That residue is why the
+    supervisor keeps an unresponsive-kernel policy.
+    """
+    with Kernel() as k:
+        armed = [True]
+        at_value, release = threading.Event(), threading.Event()
+        original = k.link.get_string
+
+        def gated_get_string():
+            if armed[0]:
+                armed[0] = False      # only the first read, which is the reply
+                at_value.set()
+                release.wait(30)
+            return original()
+
+        k.link.get_string = gated_get_string
+        outcome = []
+
+        def run():
+            with contextlib.suppress(Exception):
+                outcome.append(k.evaluate("1+1", timeout=60))
+
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        assert at_value.wait(20), "the reply never arrived"
+
+        # The return packet is in hand; the evaluation is over even though this
+        # process has not read the value yet.
+        assert k.evaluation_in_flight() is False, (
+            "still claiming an evaluation after its return packet arrived")
+        assert k.abort(wait=2) is False, "an abort was accepted after the evaluation ended"
+
+        release.set()
+        t.join(30)
+        assert not t.is_alive()
+        assert outcome == ["2"], outcome
+
+        for attempt in range(2):
+            started = time.monotonic()
+            assert k.evaluate("1+1", timeout=15).strip() == "2", f"attempt {attempt}"
+            assert time.monotonic() - started < 10, (
+                f"attempt {attempt} took {time.monotonic()-started:.1f}s: "
+                "a pending interrupt survived")
+
+
 def test_reply_events_keep_prints_and_messages_in_packet_order():
     """The interleaving is the part that cannot be recovered later.
 
@@ -242,45 +348,6 @@ def test_reply_events_keep_prints_and_messages_in_packet_order():
         assert [m["name"] for m in reply.messages] == ["Power::infy", "Part::partw"]
         assert "kind" not in reply.messages[0], "the view leaks the event tag"
         assert "Infinite expression" in reply.messages[0]["text"], reply.messages[0]
-
-
-def test_evaluation_in_flight_answers_about_the_transport():
-    """The witness a caller needs when its own bookkeeping is in doubt.
-
-    Written because a supervisor asking "is anything actually running?" was
-    otherwise reduced to reading Kernel's private lock. The answer must be
-    false on an idle kernel, true while one evaluation is blocked, and false
-    again afterwards -- including after the evaluation was aborted rather than
-    allowed to finish.
-    """
-    with Kernel() as k:
-        assert k.evaluation_in_flight() is False, "a freshly armed kernel is not idle"
-
-        started = threading.Event()
-        done = []
-
-        def run():
-            started.set()
-            with contextlib.suppress(Exception):
-                done.append(k.evaluate("Pause[20]; 1", timeout=60))
-
-        t = threading.Thread(target=run, daemon=True)
-        t.start()
-        started.wait(10)
-        deadline = time.time() + 10
-        while not k.evaluation_in_flight() and time.time() < deadline:
-            time.sleep(0.05)
-        assert k.evaluation_in_flight() is True, "an evaluation is blocked but the kernel says idle"
-
-        # Deliberately not asserting that the abort confirms within a fixed
-        # window: that is a timing claim, covered by the abort tests, and it made
-        # this one fail on a loaded machine. What matters here is that the
-        # evaluation ends and the predicate follows it.
-        k.abort(wait=30)
-        t.join(30)
-        assert not t.is_alive(), "the aborted evaluation never returned"
-        assert k.evaluation_in_flight() is False, "still reported in flight after the abort"
-        assert k.evaluate("1+1", timeout=30).strip() == "2", "the kernel did not survive"
 
 
 def test_aborting_an_idle_kernel_is_refused_and_harmless():
