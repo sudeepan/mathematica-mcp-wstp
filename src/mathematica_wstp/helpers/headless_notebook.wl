@@ -29,6 +29,7 @@ MCPFindDefining::usage = "MCPFindDefining[id, symbol] lists the cells that assig
 MCPCells::usage = "MCPCells[id, offset, limit, includeContent, style] lists cells; style \"\" means all.";
 MCPEvaluateCell::usage = "MCPEvaluateCell[id, index, timeout] evaluates one cell.";
 MCPEvaluateRange::usage = "MCPEvaluateRange[id, from, to, timeout, stopOnError] evaluates a span of cells.";
+MCPEvaluateInput::usage = "MCPEvaluateInput[id, ordinal, timeout, writeOutputs, sentinel] evaluates the nth input cell, counting from the top.";
 MCPWriteCell::usage = "MCPWriteCell[id, content, style, position, anchor] inserts a cell.";
 MCPDeleteCell::usage = "MCPDeleteCell[id, index] removes a cell.";
 MCPSave::usage = "MCPSave[id, path] writes the session's notebook expression to disk.";
@@ -509,6 +510,33 @@ applyOutputEdits[nb_, edits_] := Module[{out = nb, moving},
      {e, moving}];
   out
 ];
+
+(* Evaluate one input cell, named by its ORDINAL rather than its position.
+
+   A caller driving the replay itself -- one request per cell, so that each cell
+   has its own execution identity -- cannot use raw indices: writing an output
+   inserts a cell, so every index after it shifts, and the caller would have to
+   re-list the document between cells to stay correct. The input ordinal does not
+   move, which is why the label bookkeeping already uses it.
+
+   Everything else is deliberately NOT reimplemented here. This resolves the
+   ordinal to a position and hands the work to MCPEvaluateRange with from == to,
+   so labelling, write-back, the $Line counter and the doneInputs set stay in one
+   place and cannot drift between the two paths. *)
+MCPEvaluateInput[id_String, ordinal_Integer, timeout_, writeOutputs : (True | False) : False,
+                 abortSentinel_String : ""] :=
+  sessionOr[id, Module[{nb, pos, ords, hit},
+    nb = $Sessions[id, "nb"];
+    pos = leafPositions[nb];
+    ords = inputOrdinals[nb, pos];
+    hit = FirstPosition[ords, ordinal, None, {1}];
+    If[hit === None,
+      Return[err["No such input ordinal",
+                 <|"ordinal" -> ordinal, "inputs" -> Max[ords]|>]]
+    ];
+    MCPEvaluateRange[id, First[hit] - 1, First[hit] - 1, timeout, True,
+                     writeOutputs, abortSentinel]
+  ]];
 
 MCPEvaluateRange[id_String, from_Integer, to_Integer, timeout_, stopOnError : (True | False),
                  writeOutputs : (True | False) : False, abortSentinel_String : ""] :=

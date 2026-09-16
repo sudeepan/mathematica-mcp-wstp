@@ -24,6 +24,8 @@ import json
 import logging
 import os
 import tempfile
+import uuid
+import time
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -74,7 +76,9 @@ class HeadlessNotebooks:
     def _helper_path() -> str:
         return str(Path(__file__).parent / "helpers" / "headless_notebook.wl")
 
-    def _call(self, function: str, *args: Any, timeout: int = 60) -> dict[str, Any]:
+    def _call(self, function: str, *args: Any, timeout: int = 60,
+              correlation: dict[str, str] | None = None,
+              idempotency_key: str | None = None) -> dict[str, Any]:
         """Invoke one helper function and parse its JSON reply.
 
         The helper is loaded behind an in-kernel sentinel, so a restarted kernel
@@ -115,7 +119,9 @@ class HeadlessNotebooks:
         # One evaluation, one handle. The backend decides how bytes cross the
         # link; this layer only needs the bytes and, later, the identity of the
         # execution that produced them.
-        result = get_evaluator().submit_bytes(code, timeout=timeout).wait(timeout + 30)
+        result = get_evaluator().submit_bytes(
+            code, timeout=timeout, idempotency_key=idempotency_key,
+            correlation=correlation).wait(timeout + 30)
         if not result.success:
             return {
                 "success": False,
@@ -139,7 +145,9 @@ class HeadlessNotebooks:
             return parsed
         return {"success": False, "error": "Unexpected reply shape", "raw": text[:2000], "headless": True}
 
-    def _call_with_session(self, function: str, notebook_id: str, *args: Any, timeout: int = 60) -> dict[str, Any]:
+    def _call_with_session(self, function: str, notebook_id: str, *args: Any, timeout: int = 60,
+                           correlation: dict[str, str] | None = None,
+                           idempotency_key: str | None = None) -> dict[str, Any]:
         """``_call`` that transparently reopens a session the kernel has lost.
 
         A silent kernel swap is the failure mode most likely to waste a long
@@ -148,7 +156,8 @@ class HeadlessNotebooks:
         layer owns — but variables the notebook defined are genuinely gone, so
         the caller is told the replay has to restart.
         """
-        result = self._call(function, notebook_id, *args, timeout=timeout)
+        result = self._call(function, notebook_id, *args, timeout=timeout,
+                            correlation=correlation, idempotency_key=idempotency_key)
         if result.get("success") or "No such headless notebook session" not in str(result.get("error", "")):
             return result
 
@@ -359,6 +368,13 @@ class HeadlessNotebooks:
         stop_on_error: bool = True,
         write_outputs: bool = False,
     ) -> dict[str, Any]:
+        """Evaluate a span of cells in one kernel evaluation.
+
+        BASELINE span execution: the loop runs inside Wolfram, so the span is a
+        single execution with a single identity, and its output edits are applied
+        together at the end. ``replay_cells`` is the per-cell alternative, which
+        trades round trips for per-cell identity and incremental durability.
+        """
         notebook_id = self._resolve(notebook)
         if notebook_id is None:
             return self._no_session(notebook)
@@ -392,6 +408,106 @@ class HeadlessNotebooks:
             _session.set_abort_sentinel(None)
             with contextlib.suppress(OSError):
                 os.unlink(sentinel)
+
+    def replay_cells(
+        self,
+        notebook: str | None = None,
+        first: int = 1,
+        last: int = -1,
+        timeout: int = 60,
+        stop_on_error: bool = True,
+        write_outputs: bool = False,
+        run: str | None = None,
+    ) -> dict[str, Any]:
+        """Replay inputs one at a time, so every cell is its own execution.
+
+        EXPERIMENTAL, auditable per-cell execution. ``evaluate_range`` remains
+        the baseline span path; both exist so the two can be compared, and one
+        of them is expected to be retired once there is evidence for which.
+
+        ``evaluate_range`` hands a whole span to the kernel and gets one answer
+        back. That is fewer round trips and it is the right thing when nobody
+        needs to know what happened cell by cell. It also means a span has ONE
+        execution identity: if the client dies halfway, what ran is not
+        recoverable from the outside, and a user's abort has to be signalled
+        through a file on disk because the kernel is busy for the whole span and
+        cannot be asked anything.
+
+        Driving the loop here costs a round trip per cell -- measured at about
+        9 ms, which is noise beside any real cell -- and buys a request, a
+        token, a correlation and an idempotency key for each one. That is what
+        makes a replay resumable rather than merely repeatable.
+
+        Cells are addressed by input ORDINAL, never by index: writing an output
+        inserts a cell and shifts every index after it.
+        """
+        notebook_id = self._resolve(notebook)
+        if notebook_id is None:
+            return self._no_session(notebook)
+
+        listing = self.cells(notebook=notebook_id, limit=100000)
+        if not listing.get("success"):
+            return listing
+        inputs = [c for c in listing.get("cells", [])
+                  if c.get("style") in ("Input", "Code")]
+        total = len(inputs)
+        upper = total if last < 0 else min(last, total)
+        if first < 1 or first > total:
+            return {"success": False, "headless": True,
+                    "error": f"first ordinal {first} is outside 1..{total}"}
+
+        run_id = run or f"R{uuid.uuid4().hex[:10]}"
+        started = time.time()
+        cells: list[dict[str, Any]] = []
+        executed = skipped = failed = 0
+        stopped_at = None
+
+        for ordinal in range(first, upper + 1):
+            child = f"c{ordinal}"
+            reply = self._call_with_session(
+                "MCPEvaluateInput", notebook_id, int(ordinal), int(timeout),
+                bool(write_outputs), "",
+                timeout=timeout + 15,
+                correlation={"parent": run_id, "child": child, "kind": "notebook_cell"},
+                # Stable across a reconnect: the same cell of the same replay is
+                # the same submission, so a client that loses its answer can ask
+                # again without running the cell twice.
+                idempotency_key=f"{run_id}.{child}",
+            )
+            entry = {"ordinal": ordinal, "child": child, "run": run_id,
+                     "success": bool(reply.get("success"))}
+            results = reply.get("results") or []
+            if results:
+                first_result = results[0]
+                entry.update({k: first_result.get(k) for k in
+                              ("index", "style", "output", "printed", "messages",
+                               "timed_out", "aborted", "timing_ms", "reason")
+                              if k in first_result})
+            if not reply.get("success"):
+                entry["error"] = reply.get("error")
+            cells.append(entry)
+
+            if entry.get("timed_out") or entry.get("aborted") or not entry["success"]:
+                failed += 1
+                if stop_on_error:
+                    stopped_at = ordinal
+                    break
+            elif entry.get("reason"):
+                skipped += 1
+            else:
+                executed += 1
+
+        return {
+            "success": stopped_at is None,
+            "headless": True,
+            "run": run_id,
+            "notebook": notebook_id,
+            "summary": {"inputs": total, "attempted": len(cells), "executed": executed,
+                        "skipped": skipped, "failed": failed,
+                        "stopped_at_ordinal": stopped_at,
+                        "seconds": round(time.time() - started, 2)},
+            "cells": cells,
+        }
 
     def verify_self(self, notebook: str | None = None) -> dict[str, Any]:
         """Check the open document's own cell labels, with no reference needed."""

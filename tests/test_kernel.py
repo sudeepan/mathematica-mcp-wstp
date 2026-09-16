@@ -19,6 +19,7 @@ from __future__ import annotations
 import contextlib
 import os
 import signal
+import tempfile
 import sys
 import threading
 import time
@@ -324,6 +325,87 @@ def test_the_interval_closes_when_the_return_packet_arrives():
             assert time.monotonic() - started < 10, (
                 f"attempt {attempt} took {time.monotonic()-started:.1f}s: "
                 "a pending interrupt survived")
+
+
+def test_replay_gives_every_cell_its_own_identity():
+    """A per-cell replay is resumable; a span replay is only repeatable.
+
+    Each cell must arrive at the evaluator as its own submission, carrying a
+    correlation that names the run and the cell, and an idempotency key stable
+    enough that a client which loses the answer can ask again without running
+    the cell twice.
+
+    Cells are addressed by input ordinal rather than index on purpose: writing an
+    output inserts a cell, so the indices move while the replay is under way.
+    The test asserts that they moved, because a replay that addressed indices
+    would have silently evaluated the wrong cells.
+    """
+    import uuid as _uuid
+
+    from mathematica_wstp import evaluator as ev_mod
+    from mathematica_wstp import notebooks, session
+
+    seen = []
+
+    class Recording:
+        """Delegates, and writes down what the notebook layer asked for."""
+
+        name = "recording"
+
+        def __init__(self, inner):
+            self._inner = inner
+
+        def submit_bytes(self, code, timeout=60, idempotency_key=None, correlation=None):
+            seen.append((idempotency_key, dict(correlation or {})))
+            return self._inner.submit_bytes(code, timeout=timeout,
+                                            idempotency_key=idempotency_key,
+                                            correlation=correlation)
+
+    previous = ev_mod.set_evaluator(Recording(ev_mod.DirectSessionEvaluator()))
+    path = os.path.join(tempfile.gettempdir(), f"replay-identity-{_uuid.uuid4().hex[:8]}.nb")
+    try:
+        nb = notebooks.get_headless_notebooks()
+        made = nb.create(title="Replay identity", path=path)
+        assert made.get("success"), made
+        nbid = made["id"]
+        for source in ("zz = 6*7", "zz + 1", "zz^2"):
+            assert nb.write_cell(source, style="Input", notebook=nbid).get("success")
+
+        before = [c["index"] for c in nb.cells(notebook=nbid)["cells"]
+                  if c["style"] in ("Input", "Code")]
+
+        seen.clear()
+        replay = nb.replay_cells(notebook=nbid, write_outputs=True, timeout=30)
+        assert replay["success"], replay
+        assert replay["summary"]["executed"] == 3, replay["summary"]
+
+        # State really did carry from cell to cell.
+        outputs = [c.get("output") for c in replay["cells"]]
+        assert outputs == ["42", "43", "1764"], outputs
+
+        # One submission per cell, each naming the run and the cell.
+        run = replay["run"]
+        cell_submissions = [(k, c) for k, c in seen if c.get("kind") == "notebook_cell"]
+        assert len(cell_submissions) == 3, seen
+        assert [c["child"] for _, c in cell_submissions] == ["c1", "c2", "c3"]
+        assert {c["parent"] for _, c in cell_submissions} == {run}
+        assert [k for k, _ in cell_submissions] == [f"{run}.c1", f"{run}.c2", f"{run}.c3"]
+
+        # Distinct per cell, and derived from nothing that moves.
+        assert len({k for k, _ in cell_submissions}) == 3
+
+        after = [c["index"] for c in nb.cells(notebook=nbid)["cells"]
+                 if c["style"] in ("Input", "Code")]
+        assert after != before, (
+            "no outputs were inserted, so this run never exercised the shifting "
+            "indices that ordinal addressing exists to survive")
+    finally:
+        ev_mod.set_evaluator(previous)
+        with contextlib.suppress(Exception):
+            notebooks.reset_headless_notebooks()
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+        session.close_kernel()
 
 
 def test_direct_evaluator_returns_exact_bytes():
