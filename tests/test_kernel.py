@@ -327,6 +327,62 @@ def test_the_interval_closes_when_the_return_packet_arrives():
                 "a pending interrupt survived")
 
 
+def test_an_aborted_cell_says_who_aborted_it():
+    """A user's abort and a cell's own Abort[] must not be recorded alike.
+
+    They are indistinguishable inside the kernel -- both arrive as user-initiated
+    aborts and CheckAbort absorbs both identically -- so the only thing that can
+    tell them apart is the sentinel the client marks before signalling. Until
+    that is consulted, nothing in the kernel knows whose abort it was, and
+    saying "the cell called Abort[]" is a claim about the science rather than an
+    observation.
+
+    Both directions are asserted, because a version that always said "the client
+    aborted it" would be just as wrong and would pass a one-sided test.
+    """
+    import uuid as _uuid
+
+    from mathematica_wstp import notebooks, session
+
+    path = os.path.join(tempfile.gettempdir(), f"abort-attribution-{_uuid.uuid4().hex[:8]}.nb")
+    try:
+        nb = notebooks.get_headless_notebooks()
+        made = nb.create(title="Abort attribution", path=path)
+        assert made.get("success"), made
+        nbid = made["id"]
+        for source in ('Pause[15]; "NEVER"', "(Abort[]; 1)"):
+            assert nb.write_cell(source, style="Input", notebook=nbid).get("success")
+
+        # The client aborts a cell that would otherwise run for fifteen seconds.
+        outcome = {}
+
+        def replay():
+            outcome["r"] = nb.replay_cells(notebook=nbid, first=1, last=1,
+                                           timeout=60, write_outputs=False)
+
+        t = threading.Thread(target=replay, daemon=True)
+        t.start()
+        time.sleep(3)
+        session.abort_current(wait=10)
+        t.join(45)
+        assert not t.is_alive(), "the aborted cell never returned"
+        user_cell = outcome["r"]["cells"][0]
+        assert user_cell.get("aborted") is True, user_cell
+        assert "client aborted" in (user_cell.get("reason") or ""), user_cell.get("reason")
+
+        # A cell that aborts itself, with nobody asking.
+        own = nb.replay_cells(notebook=nbid, first=2, last=2, timeout=30,
+                              write_outputs=False)["cells"][0]
+        assert own.get("aborted") is True, own
+        assert "the cell called Abort[]" in (own.get("reason") or ""), own.get("reason")
+    finally:
+        with contextlib.suppress(Exception):
+            notebooks.reset_headless_notebooks()
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+        session.close_kernel()
+
+
 def test_replay_gives_every_cell_its_own_identity():
     """A per-cell replay is resumable; a span replay is only repeatable.
 

@@ -276,8 +276,13 @@ evalCell[c_, dir_String, path_String, timeout_] := Module[
     "aborted" -> cellAborted,
     (* A plain string, never Nothing: Nothing is a Symbol, RawJSON cannot encode
        a symbol, and the export would fail for every cell in the range. *)
+    (* Provisional. evalCell cannot tell WHOSE abort this was: a user's abort
+       and a cell's own Abort[] are indistinguishable here, and only the caller
+       holding the sentinel knows. The span loop rewrites this when it finds the
+       sentinel set. Saying "the cell called Abort[]" unconditionally was a claim
+       about the science that the kernel had no way to support. *)
     "reason" -> If[cellAborted,
-      "the cell called Abort[] (or something it invoked did); the replay continued", ""],
+      "aborted; the source of the abort has not been established here", ""],
     "output" -> If[aborted || cellAborted, "", truncate[ToString[res, InputForm]]],
     "printed" -> truncate[printed],
     "messages" -> (ToString[#, InputForm] & /@ msgs),
@@ -597,8 +602,15 @@ MCPEvaluateRange[id_String, from_Integer, to_Integer, timeout_, stopOnError : (T
          in the kernel, so the client marks the sentinel file before signalling
          and we read it here. No file (or no path given) means the abort came
          from the cell, and the replay continues as it always has. *)
-      If[TrueQ[r["aborted"]] && userAbortedQ[abortSentinel],
-        stoppedAt = i; Break[]];
+      (* Ask once, and use the answer for both decisions: userAbortedQ CONSUMES
+         the sentinel, so a second call would report False and the record would
+         contradict the halt. *)
+      If[TrueQ[r["aborted"]],
+        If[userAbortedQ[abortSentinel],
+          results[[-1, "reason"]] = "the client aborted this cell; the replay stopped here";
+          stoppedAt = i; Break[],
+          results[[-1, "reason"]] =
+            "the cell called Abort[] (or something it invoked did); the replay continued"]];
       If[stopOnError && TrueQ[r["timed_out"]], stoppedAt = i; Break[]],
       {i, from, upper}
     ];

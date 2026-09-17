@@ -458,6 +458,23 @@ class HeadlessNotebooks:
 
         run_id = run or f"R{uuid.uuid4().hex[:10]}"
         started = time.time()
+
+        # The same out-of-band channel the span path uses, and for the same
+        # reason: while a cell is running, the kernel cannot be asked anything,
+        # so a user's abort has to reach the helper by other means. Without it
+        # the helper has no way to tell an abort it was sent from a cell that
+        # called Abort[] itself, and reports the user's interruption as the
+        # cell's own -- which is a false claim about what the science did.
+        #
+        # A supervisor-backed evaluator does not need this: it records the
+        # control intent structurally. The file is what the direct backend has.
+        from . import session as _session
+
+        sentinel = os.path.join(tempfile.gettempdir(),
+                                f"mcp-wstp-abort-{os.getpid()}-{notebook_id}-{run_id}")
+        with contextlib.suppress(OSError):
+            os.unlink(sentinel)
+        _session.set_abort_sentinel(sentinel)
         cells: list[dict[str, Any]] = []
         executed = skipped = failed = 0
         stopped_at = None
@@ -466,7 +483,7 @@ class HeadlessNotebooks:
             child = f"c{ordinal}"
             reply = self._call_with_session(
                 "MCPEvaluateInput", notebook_id, int(ordinal), int(timeout),
-                bool(write_outputs), "",
+                bool(write_outputs), sentinel,
                 timeout=timeout + 15,
                 correlation={"parent": run_id, "child": child, "kind": "notebook_cell"},
                 # Stable across a reconnect: the same cell of the same replay is
@@ -496,6 +513,10 @@ class HeadlessNotebooks:
                 skipped += 1
             else:
                 executed += 1
+
+        _session.set_abort_sentinel(None)
+        with contextlib.suppress(OSError):
+            os.unlink(sentinel)
 
         return {
             "success": stopped_at is None,
