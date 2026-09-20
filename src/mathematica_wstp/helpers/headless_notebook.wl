@@ -31,6 +31,7 @@ MCPEvaluateCell::usage = "MCPEvaluateCell[id, index, timeout] evaluates one cell
 MCPEvaluateRange::usage = "MCPEvaluateRange[id, from, to, timeout, stopOnError] evaluates a span of cells.";
 MCPEvaluateInput::usage = "MCPEvaluateInput[id, ordinal, timeout, writeOutputs, sentinel] evaluates the nth input cell, counting from the top.";
 MCPInputDigests::usage = "MCPInputDigests[id] hashes the stored boxes of every input cell, by ordinal.";
+MCPOutputProvenance::usage = "MCPOutputProvenance[id] reports which replay child wrote each output cell.";
 MCPWriteCell::usage = "MCPWriteCell[id, content, style, position, anchor] inserts a cell.";
 MCPDeleteCell::usage = "MCPDeleteCell[id, index] removes a cell.";
 MCPSave::usage = "MCPSave[id, path] writes the session's notebook expression to disk.";
@@ -463,7 +464,38 @@ ownedOutputs[nb_, pos_, i_] := Module[{j = i + 1, found = {}, st},
   found
 ];
 
-outputEdit[nb_, pos_, i_, rawValue_, line_Integer, form_] := Module[
+(* Mark an output cell with the replay child that produced it.
+
+   TaggingRules on a cell survive NotebookSave and travel with the file, which
+   is what makes this evidence rather than a note to ourselves. An output cell
+   alone proves only that SOMETHING wrote an output there: a person, an earlier
+   replay, or this one. The tag says which.
+
+   Deliberately not the request id or the evaluation token: those are known only
+   after the evaluation returns, and writing them would need a second pass over
+   the document. The tag carries what is known before submission, and the
+   manifest carries child -> request/token, so the join is two hops and neither
+   record has to be rewritten. *)
+withProvenance[cell_, ""] := cell;
+withProvenance[cell_Cell, tag_String] := Module[{args, style, opts, tr},
+  args = List @@ cell;
+  (* A Cell is Cell[content, style, options...] -- the style is positional and
+     an option cannot be put in front of it. Notebook[] has no such slot, which
+     is why the notebook-level stamp beside this one looks different and why
+     copying its shape here silently produced cells whose style was an option:
+     they evaluated, they were written, and every one of them read back as
+     "Unknown". *)
+  If[Length[args] < 2 || !StringQ[args[[2]]], Return[cell]];
+  style = args[[2]];
+  tr = FirstCase[Drop[args, 2], (TaggingRules -> v_) :> v, {}];
+  opts = DeleteCases[Drop[args, 2], TaggingRules -> _];
+  tr = Prepend[DeleteCases[Flatten[{tr}], ("MCPReplayChild" -> _)],
+               "MCPReplayChild" -> tag];
+  Cell @@ Join[{args[[1]], style, TaggingRules -> tr}, opts]
+];
+withProvenance[cell_, _] := cell;
+
+outputEdit[nb_, pos_, i_, rawValue_, line_Integer, form_, provenance_String : ""] := Module[
   {here, owned, vals, cells, k, m, edits = {}, anchor},
   vals = resultsForCell[Extract[nb, pos[[i + 1]]], rawValue];
   here = pos[[i + 1]];
@@ -472,8 +504,10 @@ outputEdit[nb_, pos_, i_, rawValue_, line_Integer, form_] := Module[
      survivors: a three-statement cell at In[9] whose second statement is the
      only one returning a value shows Out[10], not Out[9]. *)
   cells = Table[
-    withLabel[Cell[outputBoxes[vals[[j, 2]], form], "Output"],
-              "Out[" <> ToString[line + vals[[j, 1]] - 1] <> "]="],
+    withProvenance[
+      withLabel[Cell[outputBoxes[vals[[j, 2]], form], "Output"],
+                "Out[" <> ToString[line + vals[[j, 1]] - 1] <> "]="],
+      provenance],
     {j, Length[vals]}];
   k = Length[cells]; m = Length[owned];
   (* Reuse the output cells already there, then add or remove to match. Anything
@@ -551,6 +585,25 @@ MCPInputDigests[id_String] :=
     ok[<|"id" -> id, "inputs" -> Length[out], "digests" -> out|>]
   ]];
 
+(* Which replay child wrote each output cell, according to the document itself.
+
+   Read back from the notebook rather than from anything this process
+   remembers, because the question a reconciling client is asking is exactly
+   whether the document agrees with its own records. *)
+MCPOutputProvenance[id_String] :=
+  sessionOr[id, Module[{nb, pos, out = {}, c, tr, tag},
+    nb = $Sessions[id, "nb"];
+    pos = leafPositions[nb];
+    Do[
+      c = Extract[nb, pos[[q]]];
+      If[cellStyle[c] === "Output",
+        tr = FirstCase[Rest[List @@ c], (TaggingRules -> v_) :> v, {}];
+        tag = FirstCase[Flatten[{tr}], ("MCPReplayChild" -> v_) :> v, ""];
+        AppendTo[out, <|"index" -> q - 1, "child" -> tag|>]],
+      {q, Length[pos]}];
+    ok[<|"id" -> id, "outputs" -> Length[out], "provenance" -> out|>]
+  ]];
+
 (* Evaluate one input cell, named by its ORDINAL rather than its position.
 
    A caller driving the replay itself -- one request per cell, so that each cell
@@ -564,7 +617,7 @@ MCPInputDigests[id_String] :=
    so labelling, write-back, the $Line counter and the doneInputs set stay in one
    place and cannot drift between the two paths. *)
 MCPEvaluateInput[id_String, ordinal_Integer, timeout_, writeOutputs : (True | False) : False,
-                 abortSentinel_String : ""] :=
+                 abortSentinel_String : "", provenance_String : ""] :=
   sessionOr[id, Module[{nb, pos, ords, hit},
     nb = $Sessions[id, "nb"];
     pos = leafPositions[nb];
@@ -575,11 +628,12 @@ MCPEvaluateInput[id_String, ordinal_Integer, timeout_, writeOutputs : (True | Fa
                  <|"ordinal" -> ordinal, "inputs" -> Max[ords]|>]]
     ];
     MCPEvaluateRange[id, First[hit] - 1, First[hit] - 1, timeout, True,
-                     writeOutputs, abortSentinel]
+                     writeOutputs, abortSentinel, provenance]
   ]];
 
 MCPEvaluateRange[id_String, from_Integer, to_Integer, timeout_, stopOnError : (True | False),
-                 writeOutputs : (True | False) : False, abortSentinel_String : ""] :=
+                 writeOutputs : (True | False) : False, abortSentinel_String : "",
+                 provenance_String : ""] :=
   sessionOr[id, Module[{nb, pos, results = {}, upper, c, r, edits = {}, e, inserted = 0, line, outForm,
                        stoppedAt = None, ords, done, relabelled = {}, ord,
                        skippedInputs = {}},
@@ -626,7 +680,7 @@ MCPEvaluateRange[id_String, from_Integer, to_Integer, timeout_, stopOnError : (T
             "previous_label" -> labelNumber[c], "new_label" -> line + 1|>],
           AppendTo[done, ord]];
         AppendTo[edits, inputLabelEdit[nb, pos, i, line + 1]];
-        edits = Join[edits, outputEdit[nb, pos, i, $lastResult, line + 1, outForm]];
+        edits = Join[edits, outputEdit[nb, pos, i, $lastResult, line + 1, outForm, provenance]];
         (* Each result consumed a line number, exactly as the front end does. *)
         (* Every statement consumes a line number, whether or not it printed
            anything: the front end advances In[] per statement, not per output. *)

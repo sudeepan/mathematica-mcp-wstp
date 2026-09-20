@@ -327,6 +327,73 @@ def test_the_interval_closes_when_the_return_packet_arrives():
                 "a pending interrupt survived")
 
 
+def test_an_output_says_which_replay_child_wrote_it():
+    """An output cell alone proves only that something wrote an output there.
+
+    A person, an earlier replay, or this run all leave the same mark. So each
+    output carries the child that produced it, in TaggingRules, which survive a
+    save and travel with the file -- that is what makes it evidence rather than
+    a note to ourselves.
+
+    The interesting assertion is the last one: after a cell above it is deleted,
+    the surviving output has MOVED, and must still be recognised as its child's.
+    A binding by position would pass every other check here and fail that one.
+    """
+    import uuid as _uuid
+
+    from mathematica_wstp import notebooks, session
+
+    path = os.path.join(tempfile.gettempdir(), f"provenance-{_uuid.uuid4().hex[:8]}.nb")
+    replay_dir = os.path.join(tempfile.gettempdir(), f"provenance-m-{_uuid.uuid4().hex[:8]}")
+    os.environ["MATHEMATICA_WSTP_REPLAY_DIR"] = replay_dir
+    try:
+        nb = notebooks.get_headless_notebooks()
+        made = nb.create(title="Output provenance", path=path)
+        assert made.get("success"), made
+        nbid = made["id"]
+        for source in ("o1 = 1", "o2 = 2"):
+            assert nb.write_cell(source, style="Input", notebook=nbid).get("success")
+
+        replay = nb.replay_cells(notebook=nbid, timeout=60, write_outputs=True)
+        assert replay["success"], replay
+
+        # The outputs are real Output cells. An earlier version of the tag put
+        # TaggingRules where the style belongs, and every one of them read back
+        # as "Unknown" while the replay still reported them written.
+        styles = [c["style"] for c in nb.cells(notebook=nbid)["cells"]]
+        assert styles.count("Output") == 2, styles
+
+        seen = nb.reconcile_replay(replay["manifest"], notebook=nbid)
+        assert [c["output"] for c in seen["children"]] == [
+            "PRESENT at index 2", "PRESENT at index 4"], seen["children"]
+
+        # It survives the file, not just the session.
+        assert nb.save(nbid, path).get("success")
+        notebooks.reset_headless_notebooks()
+        reopened = notebooks.get_headless_notebooks()
+        rid = reopened.open(path)["id"]
+        after_save = reopened.reconcile_replay(replay["manifest"], notebook=rid)
+        assert [c["output"] for c in after_save["children"]] == [
+            "PRESENT at index 2", "PRESENT at index 4"], after_save["children"]
+
+        # Someone deletes the first output by hand. The second one moves.
+        outputs = [c["index"] for c in reopened.cells(notebook=rid)["cells"]
+                   if c["style"] == "Output"]
+        assert reopened.delete_cell(outputs[0], notebook=rid).get("success")
+
+        edited = reopened.reconcile_replay(replay["manifest"], notebook=rid)
+        assert edited["children"][0]["output"] == "MISSING_OR_OVERWRITTEN", edited["children"][0]
+        assert edited["children"][1]["output"] == "PRESENT at index 3", (
+            "the surviving output moved and was no longer recognised as its child's")
+    finally:
+        os.environ.pop("MATHEMATICA_WSTP_REPLAY_DIR", None)
+        with contextlib.suppress(Exception):
+            notebooks.reset_headless_notebooks()
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+        session.close_kernel()
+
+
 def test_reconciliation_reports_what_can_and_cannot_be_established():
     """What a client can find out about a replay it did not finish.
 

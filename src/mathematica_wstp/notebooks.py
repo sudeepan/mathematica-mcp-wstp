@@ -516,6 +516,12 @@ class HeadlessNotebooks:
             reply = self._call_with_session(
                 "MCPEvaluateInput", notebook_id, int(ordinal), int(timeout),
                 bool(write_outputs), sentinel,
+                # Rides with the output cell and survives a save, so the
+                # document can later say which child wrote what. Only what is
+                # known before submission goes in here; the request id and token
+                # are joined through the manifest.
+                f"run={run_id};child={child};ordinal={ordinal};"
+                f"input={(digests.get(ordinal) or '')[:16]}",
                 timeout=timeout + 15,
                 correlation={"parent": run_id, "child": child, "kind": "notebook_cell"},
                 # Stable across a reconnect: the same cell of the same replay is
@@ -633,6 +639,19 @@ class HeadlessNotebooks:
             else:
                 source_check = f"deferred: {str(probe.get('error'))[:120]}"
 
+        # What the document says about who wrote its outputs. An output cell on
+        # its own proves only that something wrote one: a person, an earlier
+        # replay, or this run. The tag says which, and it survives a save.
+        written: dict[str, int] = {}
+        if source_check == "done":
+            marks = self._call_with_session("MCPOutputProvenance", notebook_id, timeout=30)
+            if marks.get("success"):
+                for item in marks.get("provenance", []):
+                    tag = item.get("child") or ""
+                    for part in tag.split(";"):
+                        if part.startswith("child="):
+                            written[f'{tag.split(";")[0].removeprefix("run=")}.{part[6:]}'] = item["index"]
+
         children: list[dict[str, Any]] = []
         diverged = None
         for entry in manifest.data["children"]:
@@ -661,6 +680,14 @@ class HeadlessNotebooks:
                 record["request_id"] = entry.get("request_id")
                 record["evaluation_token"] = entry.get("evaluation_token")
                 record["output_in_session"] = entry.get("output_in_session")
+                if source_check == "done" and entry.get("output_in_session"):
+                    key = f'{manifest.run_id}.{entry["child_id"]}'
+                    if key in written:
+                        record["output"] = f"PRESENT at index {written[key]}"
+                    else:
+                        # It ran and its output was applied, and the document no
+                        # longer carries that mark: someone has been here since.
+                        record["output"] = "MISSING_OR_OVERWRITTEN"
             elif entry["state"] == "SUBMITTED":
                 # The answer was lost, not the work. Ask by the one name that
                 # outlives the client that chose it.
