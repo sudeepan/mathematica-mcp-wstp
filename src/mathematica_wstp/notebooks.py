@@ -574,6 +574,140 @@ class HeadlessNotebooks:
             "cells": cells,
         }
 
+    def reconcile_replay(
+        self,
+        manifest_path: str,
+        notebook: str | None = None,
+        evaluator_lookup=None,
+    ) -> dict[str, Any]:
+        """Work out what a replay actually achieved, after whatever interrupted it.
+
+        Three questions, in this order, because the first can make the others
+        moot:
+
+        1. Is the notebook still the one this run planned to replay? Compared by
+           stored-box digest, per child. Nothing else can answer this -- the
+           payload a cell submission carries names the session and the ordinal
+           and never the cell's content, so an execution ledger cannot tell two
+           different cells at the same ordinal apart.
+
+        2. For every child recorded as SUBMITTED, what became of it? The answer
+           is looked up by the caller-chosen idempotency key, not by submitting
+           anything again. A resubmission cannot recover it anyway: the payload
+           embeds the submitting process's own pid, so a new client reproduces a
+           different request and is rightly refused.
+
+        3. Which children never ran at all?
+
+        On divergence this stops and says so. It does not carry on to the later
+        children, because one changed cell can alter definitions, assumptions
+        and package state that everything after it depends on, and without a
+        dependency graph the notebook layer cannot know otherwise. The completed
+        prefix is preserved rather than discarded: what ran, ran.
+        """
+        from .replay_manifest import ReplayManifest
+
+        try:
+            manifest = ReplayManifest.load(manifest_path)
+        except (OSError, ValueError) as exc:
+            return {"success": False, "headless": True,
+                    "error": f"could not read the replay manifest: {exc}"}
+
+        # Two stages, in this order, because the kernel may still be busy with
+        # the very work being reconciled. Execution facts come from the ledger
+        # and need no kernel at all; only the source check needs one. A client
+        # that demanded the kernel first would be unable to find out what it was
+        # busy with.
+        notebook_id = self._resolve(notebook)
+        current: dict[int, str] = {}
+        source_check = "done"
+        if notebook_id is None:
+            source_check = "skipped: no open notebook session"
+        else:
+            try:
+                probe = self._call_with_session("MCPInputDigests", notebook_id, timeout=30)
+            except Exception as exc:                  # noqa: BLE001 - reported, not hidden
+                probe = {"success": False, "error": f"{type(exc).__name__}: {exc}"}
+            if probe.get("success"):
+                current = {d["ordinal"]: d["digest"] for d in probe.get("digests", [])}
+            else:
+                source_check = f"deferred: {str(probe.get('error'))[:120]}"
+
+        children: list[dict[str, Any]] = []
+        diverged = None
+        for entry in manifest.data["children"]:
+            ordinal = entry["ordinal"]
+            record = {"ordinal": ordinal, "child_id": entry["child_id"],
+                      "recorded_state": entry["state"],
+                      "idempotency_key": entry["idempotency_key"]}
+            now = current.get(ordinal)
+            if source_check != "done":
+                pass                                   # cannot judge the source yet
+            elif entry.get("input_digest") and now and now != entry["input_digest"]:
+                record["verdict"] = "SOURCE_DIVERGED"
+                record["detail"] = "the input under this ordinal is not the one that was planned"
+                children.append(record)
+                diverged = diverged or record
+                continue
+            elif now is None:
+                record["verdict"] = "SOURCE_MISSING"
+                record["detail"] = "there is no input at this ordinal any more"
+                children.append(record)
+                diverged = diverged or record
+                continue
+
+            if entry["state"] == "EXECUTED":
+                record["verdict"] = "COMPLETE"
+                record["request_id"] = entry.get("request_id")
+                record["evaluation_token"] = entry.get("evaluation_token")
+                record["output_in_session"] = entry.get("output_in_session")
+            elif entry["state"] == "SUBMITTED":
+                # The answer was lost, not the work. Ask by the one name that
+                # outlives the client that chose it.
+                found = evaluator_lookup(entry["idempotency_key"]) if evaluator_lookup else None
+                if found and "state=RUNNING" in str(found):
+                    # Still in the kernel, with nobody waiting for it. The
+                    # caller decides whether to wait or take it over; this layer
+                    # does not abort other people's science on its own.
+                    record["verdict"] = "STILL_RUNNING"
+                    record["found"] = found
+                elif found:
+                    record["verdict"] = "RECOVERED"
+                    record["found"] = found
+                else:
+                    record["verdict"] = "UNRESOLVED"
+                    record["detail"] = ("submitted, and no execution record was found for its key; "
+                                        "whether it ran cannot be established from here")
+            else:
+                record["verdict"] = "NEVER_SUBMITTED"
+            children.append(record)
+
+        if diverged:
+            manifest.block("INPUT_DIGEST_MISMATCH", diverged["child_id"])
+
+        verdicts: dict[str, int] = {}
+        for record in children:
+            verdicts[record["verdict"]] = verdicts.get(record["verdict"], 0) + 1
+
+        return {
+            "success": True,
+            "headless": True,
+            "run": manifest.run_id,
+            "manifest": manifest.path,
+            "blocked": manifest.blocked,
+            "source_check": source_check,
+            "resumable_from": (None if diverged else
+                               next((c["ordinal"] for c in children
+                                     if c["verdict"] in ("NEVER_SUBMITTED", "UNRESOLVED")), None)),
+            "summary": verdicts,
+            "children": children,
+            "choices": ([] if not diverged else [
+                "restore the original cell and reconcile this run again",
+                f"abandon run {manifest.run_id} at {diverged['child_id']}",
+                "start a new replay run against the edited notebook",
+            ]),
+        }
+
     def verify_self(self, notebook: str | None = None) -> dict[str, Any]:
         """Check the open document's own cell labels, with no reference needed."""
         notebook_id = self._resolve(notebook)

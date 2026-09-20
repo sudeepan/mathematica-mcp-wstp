@@ -327,6 +327,98 @@ def test_the_interval_closes_when_the_return_packet_arrives():
                 "a pending interrupt survived")
 
 
+def test_reconciliation_reports_what_can_and_cannot_be_established():
+    """What a client can find out about a replay it did not finish.
+
+    Three answers, and the test insists they stay distinct: a child that
+    completed, a child that was handed over and whose answer was lost, and a
+    child that never went anywhere. The lost one is resolved by the key its
+    caller chose, because that is the only name that outlives the caller -- a
+    resubmission cannot serve, since the payload embeds the submitting process's
+    own pid.
+
+    Then the notebook is edited underneath the run, which must stop it: one
+    changed cell can alter definitions and assumptions that every later cell
+    depends on, and nothing here knows otherwise.
+    """
+    import uuid as _uuid
+
+    from mathematica_wstp import notebooks, session
+    from mathematica_wstp.replay_manifest import ReplayManifest
+
+    path = os.path.join(tempfile.gettempdir(), f"reconcile-{_uuid.uuid4().hex[:8]}.nb")
+    replay_dir = os.path.join(tempfile.gettempdir(), f"reconcile-m-{_uuid.uuid4().hex[:8]}")
+    os.environ["MATHEMATICA_WSTP_REPLAY_DIR"] = replay_dir
+    try:
+        nb = notebooks.get_headless_notebooks()
+        made = nb.create(title="Reconcile", path=path)
+        assert made.get("success"), made
+        nbid = made["id"]
+        for source in ("q1 = 1", "q2 = 2", "q3 = 3"):
+            assert nb.write_cell(source, style="Input", notebook=nbid).get("success")
+
+        replay = nb.replay_cells(notebook=nbid, timeout=60, write_outputs=True)
+        assert replay["success"], replay
+
+        # Everything ran, so everything reconciles as complete and there is
+        # nothing left to resume.
+        done = nb.reconcile_replay(replay["manifest"], notebook=nbid)
+        assert done["success"], done
+        assert done["source_check"] == "done", done["source_check"]
+        assert [c["verdict"] for c in done["children"]] == ["COMPLETE"] * 3, done["children"]
+        assert done["resumable_from"] is None, done
+        assert done["blocked"] is None, done
+
+        # Rewrite history as if the client had died mid-run: c2 handed over and
+        # unanswered, c3 never reached.
+        manifest = ReplayManifest.load(replay["manifest"])
+        manifest.mark(2, state="SUBMITTED", request_id=None, evaluation_token=None)
+        manifest.mark(3, state="PLANNED", request_id=None, evaluation_token=None)
+
+        # Without a way to ask, the honest answer is that it cannot be settled.
+        blind = nb.reconcile_replay(replay["manifest"], notebook=nbid)
+        assert [c["verdict"] for c in blind["children"]] == [
+            "COMPLETE", "UNRESOLVED", "NEVER_SUBMITTED"], blind["children"]
+        assert blind["resumable_from"] == 2, blind
+
+        # With one, the lost child is resolved by its key and nothing is resubmitted.
+        asked = []
+
+        def lookup(key):
+            asked.append(key)
+            return f"{key} -> E41 state=COMPLETED token=K1/V31/E41"
+
+        seen = nb.reconcile_replay(replay["manifest"], notebook=nbid, evaluator_lookup=lookup)
+        assert asked == [f"{replay['run']}.c2"], asked
+        recovered = seen["children"][1]
+        assert recovered["verdict"] == "RECOVERED", recovered
+        assert "E41" in recovered["found"], recovered
+        assert seen["resumable_from"] == 3, seen
+
+        # Now change the science under an ordinal.
+        listing = nb.cells(notebook=nbid)
+        first_input = [c["index"] for c in listing["cells"] if c["style"] in ("Input", "Code")][0]
+        assert nb.delete_cell(first_input, notebook=nbid).get("success")
+
+        diverged = nb.reconcile_replay(replay["manifest"], notebook=nbid, evaluator_lookup=lookup)
+        assert diverged["blocked"], diverged
+        assert diverged["blocked"]["reason"] == "INPUT_DIGEST_MISMATCH", diverged["blocked"]
+        assert diverged["resumable_from"] is None, "a diverged run must not offer a resume point"
+        assert diverged["choices"], "a blocked run must offer the caller a way forward"
+        # The prefix keeps its history even though the run may not continue.
+        assert diverged["children"][0]["recorded_state"] == "EXECUTED", diverged["children"][0]
+        assert diverged["children"][0]["verdict"] in ("SOURCE_DIVERGED", "SOURCE_MISSING")
+        # And the block is durable, not merely reported.
+        assert ReplayManifest.load(replay["manifest"]).blocked, "the block was not persisted"
+    finally:
+        os.environ.pop("MATHEMATICA_WSTP_REPLAY_DIR", None)
+        with contextlib.suppress(Exception):
+            notebooks.reset_headless_notebooks()
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+        session.close_kernel()
+
+
 def test_the_replay_manifest_is_durable_before_the_first_cell_runs():
     """The ordering is the point of the file, not a detail of it.
 
