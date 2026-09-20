@@ -155,7 +155,8 @@ MCPOpen[id_String, path_String] := Module[{nb, abs, dir},
     ]]
   ];
   dir = DirectoryName[abs];
-  $Sessions[id] = <|"path" -> abs, "dir" -> dir, "nb" -> nb, "dirty" -> False|>;
+  $Sessions[id] = <|"path" -> abs, "dir" -> dir, "nb" -> nb, "dirty" -> False,
+                    "posCache" -> None, "ordCache" -> None|>;
   ok[<|
     "id" -> id, "path" -> abs, "directory" -> dir,
     "cell_count" -> Length[leafPositions[nb]],
@@ -170,7 +171,7 @@ MCPCreate[id_String, path_String, title_String] := Module[{nb, cells},
   $Sessions[id] = <|
     "path" -> If[path === "", "", ExpandFileName[path]],
     "dir" -> If[path === "", Directory[], DirectoryName[ExpandFileName[path]]],
-    "nb" -> nb, "dirty" -> True
+    "nb" -> nb, "dirty" -> True, "posCache" -> None, "ordCache" -> None
   |>;
   ok[<|"id" -> id, "path" -> $Sessions[id, "path"], "cell_count" -> Length[cells], "headless" -> True|>]
 ];
@@ -323,6 +324,38 @@ userAbortedQ[path_String] := Module[{hit},
    different cells. The input ORDINAL is stable, because inserting an Output
    never changes which input a cell is. That makes it the right key for noticing
    that a span has already labelled a cell. *)
+(* The document is traversed once per change, not once per cell.
+
+   leafPositions is Position over the whole notebook expression: 115 ms on a
+   994-cell document, and a per-cell replay was paying it at least twice per
+   cell, which is most of the 400 ms per cell that Phase D measured.
+
+   The cache is only safe if it cannot outlive the document it describes, and
+   the way it would go wrong is precisely the bug ordinal addressing exists to
+   avoid: writing an output inserts a cell, every later position shifts, and a
+   stale cache would then evaluate the wrong cell. So there is exactly one way
+   to put a notebook into a session -- setNotebook -- and it clears the cache.
+   Nothing assigns "nb" directly. *)
+setNotebook[id_String, nb_] := (
+  $Sessions[id, "nb"] = nb;
+  $Sessions[id, "posCache"] = None;
+  $Sessions[id, "ordCache"] = None;
+  nb);
+
+sessionPos[id_String] := Module[{cached},
+  cached = Lookup[$Sessions[id], "posCache", None];
+  If[cached === None,
+    cached = leafPositions[$Sessions[id, "nb"]];
+    $Sessions[id, "posCache"] = cached];
+  cached];
+
+sessionOrds[id_String] := Module[{cached},
+  cached = Lookup[$Sessions[id], "ordCache", None];
+  If[cached === None,
+    cached = inputOrdinals[$Sessions[id, "nb"], sessionPos[id]];
+    $Sessions[id, "ordCache"] = cached];
+  cached];
+
 inputOrdinals[nb_, pos_] := Module[{k = 0},
   Table[If[MemberQ[{"Input", "Code"}, cellStyle[Extract[nb, pos[[q]]]]], ++k, 0],
     {q, Length[pos]}]
@@ -618,10 +651,9 @@ MCPOutputProvenance[id_String] :=
    place and cannot drift between the two paths. *)
 MCPEvaluateInput[id_String, ordinal_Integer, timeout_, writeOutputs : (True | False) : False,
                  abortSentinel_String : "", provenance_String : ""] :=
-  sessionOr[id, Module[{nb, pos, ords, hit},
-    nb = $Sessions[id, "nb"];
-    pos = leafPositions[nb];
-    ords = inputOrdinals[nb, pos];
+  sessionOr[id, Module[{pos, ords, hit},
+    pos = sessionPos[id];
+    ords = sessionOrds[id];
     hit = FirstPosition[ords, ordinal, None, {1}];
     If[hit === None,
       Return[err["No such input ordinal",
@@ -641,8 +673,9 @@ MCPEvaluateRange[id_String, from_Integer, to_Integer, timeout_, stopOnError : (T
     line = Lookup[$Sessions[id], "line", 0];
     done = Lookup[$Sessions[id], "doneInputs", {}];
     outForm = documentOutputForm[nb];
-    pos = leafPositions[nb];
-    ords = inputOrdinals[nb, pos];
+    (* Same document, so the session's cache answers: see setNotebook. *)
+    pos = sessionPos[id];
+    ords = sessionOrds[id];
     upper = If[to < 0, Length[pos] - 1, Min[to, Length[pos] - 1]];
     (* Did this span start past an executable cell nothing has run?
 
@@ -705,7 +738,7 @@ MCPEvaluateRange[id_String, from_Integer, to_Integer, timeout_, stopOnError : (T
     ];
     If[writeOutputs && edits =!= {},
       inserted = Total[Length /@ Cases[edits, {_, c_List, "inserted"} :> c]];
-      $Sessions[id, "nb"] = stampReplay[applyOutputEdits[nb, edits]];
+      setNotebook[id, stampReplay[applyOutputEdits[nb, edits]]];
       $Sessions[id, "dirty"] = True;
       $Sessions[id, "line"] = line;
     ];
@@ -844,7 +877,7 @@ MCPWriteCell[id_String, content_String, style_String, position_String, anchor_In
       _, Length[cells]
     ];
     updated = Insert[cells, newCell, at + 1];
-    $Sessions[id, "nb"] = ReplacePart[nb, 1 -> updated];
+    setNotebook[id, ReplacePart[nb, 1 -> updated]];
     $Sessions[id, "dirty"] = True;
     ok[<|"id" -> id, "inserted_at" -> at, "cell_count" -> Length[leafPositions[$Sessions[id, "nb"]]]|>]
   ]];
@@ -856,7 +889,7 @@ MCPDeleteCell[id_String, index_Integer] :=
     If[index < 0 || index >= Length[pos],
       Return[err["Cell index out of range", <|"index" -> index, "total" -> Length[pos]|>]]
     ];
-    $Sessions[id, "nb"] = Delete[nb, pos[[index + 1]]];
+    setNotebook[id, Delete[nb, pos[[index + 1]]]];
     $Sessions[id, "dirty"] = True;
     ok[<|"id" -> id, "deleted" -> index, "cell_count" -> Length[leafPositions[$Sessions[id, "nb"]]]|>]
   ]];
