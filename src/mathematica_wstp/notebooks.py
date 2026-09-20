@@ -31,6 +31,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .replay_manifest import ReplayManifest
+
 logger = logging.getLogger("mathematica_wstp.notebooks")
 
 # Guards the registry only. Kernel evaluation is serialised inside session.py.
@@ -142,6 +144,12 @@ class HeadlessNotebooks:
         if isinstance(parsed, dict):
             parsed.setdefault("headless", True)
             parsed.setdefault("execution_method", result.backend)
+            # Only a backend with durable identity has these; the direct one
+            # reports local bookkeeping, which is why it also reports that it is
+            # not authenticated.
+            parsed.setdefault("execution_id", result.request_id)
+            parsed.setdefault("execution_token", result.token)
+            parsed.setdefault("execution_authenticated", result.authenticated)
             return parsed
         return {"success": False, "error": "Unexpected reply shape", "raw": text[:2000], "headless": True}
 
@@ -459,6 +467,28 @@ class HeadlessNotebooks:
         run_id = run or f"R{uuid.uuid4().hex[:10]}"
         started = time.time()
 
+        # Content identity per input, so a reconnecting client can tell that
+        # ordinal 7 still exists but is no longer the same science.
+        digests = {}
+        probe = self._call_with_session("MCPInputDigests", notebook_id, timeout=30)
+        if probe.get("success"):
+            digests = {d["ordinal"]: d["digest"] for d in probe.get("digests", [])}
+
+        plan = [{"ordinal": n, "child_id": f"c{n}",
+                 "idempotency_key": f"{run_id}.c{n}",
+                 "input_digest": digests.get(n)}
+                for n in range(first, upper + 1)]
+
+        # Written and fsynced BEFORE the first child is submitted. A run whose
+        # identity exists only in this process is lost by exactly the failure
+        # that makes reconciliation necessary.
+        manifest = None
+        try:
+            manifest = ReplayManifest.create(
+                self._sessions[notebook_id].path, notebook_id, run_id, plan)
+        except OSError as exc:
+            logger.warning("could not persist the replay manifest: %s", exc)
+
         # The same out-of-band channel the span path uses, and for the same
         # reason: while a cell is running, the kernel cannot be asked anything,
         # so a user's abort has to reach the helper by other means. Without it
@@ -481,6 +511,8 @@ class HeadlessNotebooks:
 
         for ordinal in range(first, upper + 1):
             child = f"c{ordinal}"
+            if manifest:
+                manifest.mark(ordinal, state="SUBMITTED")
             reply = self._call_with_session(
                 "MCPEvaluateInput", notebook_id, int(ordinal), int(timeout),
                 bool(write_outputs), sentinel,
@@ -502,7 +534,18 @@ class HeadlessNotebooks:
                               if k in first_result})
             if not reply.get("success"):
                 entry["error"] = reply.get("error")
+            entry["request_id"] = reply.get("execution_id")
+            entry["evaluation_token"] = reply.get("execution_token")
             cells.append(entry)
+            if manifest:
+                manifest.mark(ordinal, state="EXECUTED",
+                              request_id=reply.get("execution_id"),
+                              evaluation_token=reply.get("execution_token"),
+                              backend=reply.get("execution_method"),
+                              # Applied to the live session document -- which is
+                              # not the file, and not durable until a save.
+                              output_in_session=bool(write_outputs
+                                                     and reply.get("outputs_written")))
 
             if entry.get("timed_out") or entry.get("aborted") or not entry["success"]:
                 failed += 1
@@ -522,6 +565,7 @@ class HeadlessNotebooks:
             "success": stopped_at is None,
             "headless": True,
             "run": run_id,
+            "manifest": manifest.path if manifest else None,
             "notebook": notebook_id,
             "summary": {"inputs": total, "attempted": len(cells), "executed": executed,
                         "skipped": skipped, "failed": failed,

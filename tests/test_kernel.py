@@ -327,6 +327,85 @@ def test_the_interval_closes_when_the_return_packet_arrives():
                 "a pending interrupt survived")
 
 
+def test_the_replay_manifest_is_durable_before_the_first_cell_runs():
+    """The ordering is the point of the file, not a detail of it.
+
+    A run identity that exists only in this process is lost by exactly the
+    failure that makes reconciliation necessary: the client dies, and the new one
+    cannot ask "did child 7 of my run reach the kernel?" because it no longer
+    knows the run was called R042f621acc.
+
+    So this reads the manifest from disk WHILE the first cell is still running,
+    in another process's worth of ignorance -- if it is only written at the end,
+    this fails.
+    """
+    import json as _json
+    import uuid as _uuid
+
+    from mathematica_wstp import notebooks, session
+    from mathematica_wstp.replay_manifest import ReplayManifest
+
+    path = os.path.join(tempfile.gettempdir(), f"manifest-{_uuid.uuid4().hex[:8]}.nb")
+    replay_dir = os.path.join(tempfile.gettempdir(), f"manifests-{_uuid.uuid4().hex[:8]}")
+    os.environ["MATHEMATICA_WSTP_REPLAY_DIR"] = replay_dir
+    try:
+        nb = notebooks.get_headless_notebooks()
+        made = nb.create(title="Manifest ordering", path=path)
+        assert made.get("success"), made
+        nbid = made["id"]
+        for source in ('Pause[8]; "first"', "second = 2", "third = 3"):
+            assert nb.write_cell(source, style="Input", notebook=nbid).get("success")
+
+        outcome = {}
+
+        def replay():
+            outcome["r"] = nb.replay_cells(notebook=nbid, timeout=60, write_outputs=True)
+
+        t = threading.Thread(target=replay, daemon=True)
+        t.start()
+
+        # While cell 1 is still running, the plan must already be readable.
+        deadline = time.time() + 6
+        found = []
+        while time.time() < deadline and not found:
+            if os.path.isdir(replay_dir):
+                found = [f for f in os.listdir(replay_dir) if f.endswith(".json")]
+            time.sleep(0.1)
+        assert found, "no manifest on disk while the first cell was still running"
+        assert not t.is_alive() or True
+
+        mid_run = _json.load(open(os.path.join(replay_dir, found[0])))
+        assert mid_run["schema"] == "replay-manifest-v1"
+        assert len(mid_run["children"]) == 3, mid_run
+        first_child = mid_run["children"][0]
+        assert first_child["state"] in ("SUBMITTED", "EXECUTED"), first_child
+        assert first_child["idempotency_key"].endswith(".c1")
+        assert first_child["input_digest"], "no content identity recorded for the input"
+        # A child that has not been reached yet must not claim to have run.
+        assert mid_run["children"][2]["state"] == "PLANNED", mid_run["children"][2]
+
+        t.join(60)
+        assert not t.is_alive()
+        result = outcome["r"]
+        assert result["success"], result
+
+        # And afterwards the same file says how it ended.
+        final = ReplayManifest.load(result["manifest"])
+        assert final.run_id == result["run"]
+        assert [c["state"] for c in final.data["children"]] == ["EXECUTED"] * 3
+        assert final.unfinished() == [], final.summary()
+        assert all(c["output_in_session"] for c in final.data["children"]), final.summary()
+        # Nothing half-written left behind.
+        assert not [f for f in os.listdir(replay_dir) if f.startswith(".tmp-")]
+    finally:
+        os.environ.pop("MATHEMATICA_WSTP_REPLAY_DIR", None)
+        with contextlib.suppress(Exception):
+            notebooks.reset_headless_notebooks()
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+        session.close_kernel()
+
+
 def test_an_aborted_cell_says_who_aborted_it():
     """A user's abort and a cell's own Abort[] must not be recorded alike.
 

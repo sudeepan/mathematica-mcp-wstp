@@ -30,6 +30,7 @@ MCPCells::usage = "MCPCells[id, offset, limit, includeContent, style] lists cell
 MCPEvaluateCell::usage = "MCPEvaluateCell[id, index, timeout] evaluates one cell.";
 MCPEvaluateRange::usage = "MCPEvaluateRange[id, from, to, timeout, stopOnError] evaluates a span of cells.";
 MCPEvaluateInput::usage = "MCPEvaluateInput[id, ordinal, timeout, writeOutputs, sentinel] evaluates the nth input cell, counting from the top.";
+MCPInputDigests::usage = "MCPInputDigests[id] hashes the stored boxes of every input cell, by ordinal.";
 MCPWriteCell::usage = "MCPWriteCell[id, content, style, position, anchor] inserts a cell.";
 MCPDeleteCell::usage = "MCPDeleteCell[id, index] removes a cell.";
 MCPSave::usage = "MCPSave[id, path] writes the session's notebook expression to disk.";
@@ -515,6 +516,40 @@ applyOutputEdits[nb_, edits_] := Module[{out = nb, moving},
      {e, moving}];
   out
 ];
+
+(* A content identity for each input cell, so a replay can notice that the
+   science under an ordinal has changed.
+
+   The hash is over the cell's source TEXT, recovered structurally from its
+   boxes, and over nothing else.
+
+   Not the whole Cell: evaluating a cell writes In[7]:= into its options, so a
+   digest over those would change merely because the cell had been run -- which
+   is exactly when a reconciling client needs it to have stayed the same.
+
+   Not the boxes themselves either, which was the first attempt and was wrong.
+   A cell written from text is stored as BoxData["o1 = 1 + 2"], and saving the
+   notebook parses it into BoxData[RowBox[{"o1"," ","=",...}]]. Same source,
+   different structure, different hash -- so every child of a saved-and-reopened
+   replay reported its science as changed. Measured, not supposed.
+
+   boxText is the project's inert boxes-to-text conversion: it does not go
+   through ToExpression, so hashing a notebook cannot re-execute it, and both
+   shapes above reduce to the same string. *)
+MCPInputDigests[id_String] :=
+  sessionOr[id, Module[{nb, pos, ords, out = {}},
+    nb = $Sessions[id, "nb"];
+    pos = leafPositions[nb];
+    ords = inputOrdinals[nb, pos];
+    Do[
+      If[ords[[q]] > 0,
+        AppendTo[out, <|"ordinal" -> ords[[q]], "index" -> q - 1,
+                        "digest" -> Hash[boxText[First[Extract[nb, pos[[q]]]] /.
+                                                  BoxData[b_] :> b],
+                                         "SHA256", "HexString"]|>]],
+      {q, Length[pos]}];
+    ok[<|"id" -> id, "inputs" -> Length[out], "digests" -> out|>]
+  ]];
 
 (* Evaluate one input cell, named by its ORDINAL rather than its position.
 
