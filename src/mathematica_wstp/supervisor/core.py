@@ -102,6 +102,8 @@ class SupervisorConfig:
     grace: float = 5.0              # observation window, not a wait
     confirm: float = 0.0            # synchronous wait: none by default
     hold_before_activation: bool = False
+    reclaim_after: float = 86400.0  # idle seconds before an unused kernel is released
+    reclaim_check_every: float = 60.0
 
     @classmethod
     def from_env(cls) -> SupervisorConfig:
@@ -114,6 +116,8 @@ class SupervisorConfig:
             grace=float(_env("SUP_GRACE", "5")),
             confirm=float(_env("SUP_CONFIRM", "0")),
             hold_before_activation=_env("SUP_HOLD_BEFORE_ACTIVATION", "") == "1",
+            reclaim_after=float(_env("SUP_RECLAIM_AFTER", "86400")),
+            reclaim_check_every=float(_env("SUP_RECLAIM_CHECK_EVERY", "60")),
         )
 
 
@@ -129,7 +133,16 @@ SOCK = AUDIT = SPOOL = ""
 MAX_INLINE = MAX_INLINE_BYTES = 4096
 GRACE, CONFIRM = 5.0, 0.0
 SESSION = SHORT = STORE = ""
+RECLAIM_AFTER, RECLAIM_CHECK_EVERY = 86400.0, 60.0
 _configured = False
+
+# A kernel is worth keeping because it holds state that cost something to
+# build. It is worth releasing because holding it costs memory -- a stale
+# parallel pool here has been measured at gigabytes. These two say when the
+# second consideration is allowed to win.
+clients = [0]                  # connected right now
+last_activity = [0.0]          # any command from any client
+shutdown_requested = threading.Event()
 
 
 def configure(config: SupervisorConfig | None = None) -> SupervisorConfig:
@@ -140,11 +153,15 @@ def configure(config: SupervisorConfig | None = None) -> SupervisorConfig:
     this at import, which is why it could only ever be run, never examined.
     """
     global SOCK, AUDIT, SPOOL, MAX_INLINE, MAX_INLINE_BYTES, GRACE, CONFIRM
+    global RECLAIM_AFTER, RECLAIM_CHECK_EVERY
     global SESSION, SHORT, STORE, _configured
     config = config or SupervisorConfig.from_env()
     SOCK, AUDIT, SPOOL = config.sock, config.audit, config.spool
     MAX_INLINE, MAX_INLINE_BYTES = config.max_inline, config.max_inline_bytes
     GRACE, CONFIRM = config.grace, config.confirm
+    RECLAIM_AFTER = config.reclaim_after
+    RECLAIM_CHECK_EVERY = config.reclaim_check_every
+    last_activity[0] = time.time()
 
     SESSION = str(uuid.uuid4())          # 128 bits, stored in full
     SHORT = "S" + SESSION[:8]            # what humans read
@@ -849,9 +866,14 @@ def kernel_state():
 
 def serve(conn):
     owned = []
+    with lock:
+        clients[0] += 1
+        last_activity[0] = time.time()
     try:
         f = conn.makefile("rw")
         for line in f:
+            with lock:
+                last_activity[0] = time.time()
             cmd, _, arg = line.strip().partition(" ")
             mark = (lambda s: f"UNTRUSTED[{s}]") if faulted[0] else (lambda s: s)
             fire = None
@@ -991,13 +1013,35 @@ def serve(conn):
                             f"kind={e['result_kind']} artifact={e['artifact'] or 'none'} "
                             f"claimed={e['claimed']} "
                             f"correlation_asserted={','.join(f'{a}:{b}' for a, b in e['correlation'].items()) or 'none'}")
+            elif cmd == "SHUTDOWN":
+                # Deliberate release, with the same absolute protections the
+                # reaper obeys: work in flight and an uncollected result are
+                # never destroyed on request, only reported.
+                with lock:
+                    state = kernel_state()
+                    if not state.startswith("IDLE"):
+                        res = f"REFUSED {state}"
+                    else:
+                        event("SUPERVISOR_DOWN", cause="requested")
+                        res = "STOPPING"
+                        shutdown_requested.set()
+            elif cmd == "RECLAIM":
+                # Why this laboratory is being kept, in the reaper's own words.
+                # A client deciding whether to leave work here should be able to
+                # see the rule that governs it rather than infer it.
+                with lock:
+                    reason = reclaimable(discount_clients=1)
+                    res = (f"RECLAIMABLE idle_for={time.time()-last_activity[0]:.0f}s"
+                           if not reason else
+                           f"KEPT {reason} after={RECLAIM_AFTER:.0f}s "
+                           f"clients={clients[0] - 1}")
             elif cmd == "READINESS":
                 with lock:
                     res = f"{readiness[0]} generation=K{kernel_gen[0]} pid={kern[0].pid}" + (
                         f" note={health_note[0]}" if health_note[0] else "")
             elif cmd == "SESSION":
                 res = (f"{SESSION} short={SHORT} kernel_generation=K{kernel_gen[0]} "
-                       f"kernel_pid={kern[0].pid} events={seq[0]}")
+                       f"pid={os.getpid()} kernel_pid={kern[0].pid} events={seq[0]}")
             elif cmd == "LEDGER":
                 with lock: res = mark(" | ".join(
                     f"{i}:{v['state']}[{v['token'] or 'no-token'}]"
@@ -1101,7 +1145,71 @@ def serve(conn):
     finally:
         with lock:
             for rid in owned: ledger[rid]["owner_alive"] = False
+            clients[0] -= 1
+            last_activity[0] = time.time()
         conn.close()
+        if shutdown_requested.is_set():
+            # After the reply has been written and the socket closed: a client
+            # that asked for a shutdown is entitled to hear that it was granted.
+            with contextlib.suppress(Exception):
+                if kern[0]:
+                    kern[0].stop()
+            os._exit(0)
+
+
+# --- letting go of one ------------------------------------------------------
+
+def reclaimable(now: float | None = None, discount_clients: int = 0) -> str:
+    """Why this laboratory may not be released yet, or "" when it may be.
+
+    Deliberately asks ``kernel_state`` rather than forming its own opinion: a
+    reaper with a private idea of "idle" would eventually disagree with what
+    STATUS tells a client, and the disagreement would show up as a kernel that
+    vanished while something still needed it.
+
+    The order matters. Work in flight and an unclaimed result are absolute -- no
+    amount of elapsed time makes it acceptable to destroy either. Only once
+    neither holds does the clock get a say.
+    """
+    now = now if now is not None else time.time()
+    state = kernel_state()
+    if not state.startswith("IDLE"):
+        return state.split()[0]
+    # ``discount_clients`` is how a client asks about a laboratory without its
+    # own question being the answer: reaching this command means holding a
+    # connection, so an asker that counted itself would always be told the
+    # laboratory is in use, by itself.
+    connected = clients[0] - discount_clients
+    if connected > 0:
+        return f"CLIENTS_CONNECTED {connected}"
+    idle_for = now - last_activity[0]
+    if idle_for < RECLAIM_AFTER:
+        return f"IDLE_ONLY_{idle_for:.0f}S"
+    return ""
+
+
+def reaper(stop: threading.Event) -> None:
+    """Release a kernel nobody is using, and say so before doing it.
+
+    A kernel that is merely unused still holds definitions someone paid for, so
+    this is slow by design: the default window is a day, long enough that a
+    multi-day evaluation is never at risk from it and short enough that an
+    abandoned session does not hold memory indefinitely.
+    """
+    while not stop.wait(RECLAIM_CHECK_EVERY):
+        with lock:
+            reason = reclaimable()
+            if reason:
+                continue
+            event("RECLAIMING", idle_for=round(time.time() - last_activity[0]),
+                  kernel=kern[0].pid if kern[0] else None)
+        try:
+            if kern[0]:
+                kern[0].stop()
+        except Exception as exc:                  # noqa: BLE001 - recorded, not hidden
+            event("RECLAIM_FAILED", detail=f"{type(exc).__name__}: {exc}")
+        event("SUPERVISOR_DOWN", cause="idle")
+        os._exit(0)
 
 
 # --- running one ------------------------------------------------------------
@@ -1130,13 +1238,18 @@ def serve_forever(config: SupervisorConfig | None = None) -> None:
     srv.bind(SOCK)
     srv.listen(8)
     event("SUPERVISOR_UP", pid=os.getpid(), kernel=kern[0].pid,
-          spool=SPOOL, max_inline=MAX_INLINE, socket=SOCK)
+          spool=SPOOL, max_inline=MAX_INLINE, socket=SOCK,
+          reclaim_after=RECLAIM_AFTER)
+    stop = threading.Event()
+    if RECLAIM_AFTER > 0:
+        threading.Thread(target=reaper, args=(stop,), daemon=True).start()
     print("READY", flush=True)
     try:
         while True:
             conn, _ = srv.accept()
             threading.Thread(target=serve, args=(conn,), daemon=True).start()
     finally:
+        stop.set()
         srv.close()
         with contextlib.suppress(OSError):
             os.unlink(SOCK)

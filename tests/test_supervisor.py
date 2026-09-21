@@ -17,7 +17,10 @@ Run: .venv/bin/python tests/test_supervisor.py
 
 from __future__ import annotations
 
+import contextlib
 import os
+import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -235,6 +238,198 @@ def test_the_kernel_outlives_a_client_that_disconnects():
         assert "COMPLETED" in reply, reply
         # The value the dead client's request assigned is still in the kernel.
         assert "12345" in reply, reply
+    finally:
+        lab.stop()
+
+
+def test_a_socket_file_is_not_evidence_of_a_supervisor():
+    """A supervisor killed outright leaves its socket behind.
+
+    The distinction decides whether starting a new one is correct or would
+    steal a live supervisor's clients, so it is answered by connecting and
+    asking rather than by looking at the filesystem.
+    """
+    from mathematica_wstp.supervisor import lifecycle
+
+    absent = lifecycle.probe("/tmp/there-is-nothing-here.sock")
+    assert absent.running is False and absent.stale_socket is False, absent
+
+    leftover = os.path.join(tempfile.mkdtemp(), "left.sock")
+    open(leftover, "w").close()
+    info = lifecycle.probe(leftover)
+    assert info.running is False, info
+    assert info.stale_socket is True, "a dead socket was read as a live supervisor"
+
+
+def test_a_started_supervisor_outlives_the_process_that_started_it():
+    """The property the whole milestone exists for.
+
+    A starter is spawned, told to start a supervisor, and then killed. If the
+    supervisor were an ordinary child it would be reparented but its kernel
+    would still be reachable; what is actually being checked is that neither
+    the supervisor nor its kernel is in the starter's process group, so the
+    signal that stops a server does not reach the laboratory.
+    """
+    from mathematica_wstp.supervisor import lifecycle
+
+    workdir = tempfile.mkdtemp(prefix="sup-detach-")
+    sock = os.path.join(workdir, "s.sock")
+    starter_src = os.path.join(workdir, "starter.py")
+    with open(starter_src, "w") as fh:
+        fh.write(
+            "import sys, time\n"
+            f"sys.path.insert(0, {os.path.join(ROOT, 'src')!r})\n"
+            "from mathematica_wstp.supervisor import SupervisorConfig, start\n"
+            f"info = start(SupervisorConfig(sock={sock!r}, "
+            f"audit={os.path.join(workdir, 'a.log')!r}, "
+            f"spool={os.path.join(workdir, 'art')!r}))\n"
+            "print(info.running, flush=True)\n"
+            "time.sleep(600)\n")
+
+    starter = subprocess.Popen([PYTHON, "-u", starter_src], stdout=subprocess.PIPE,
+                               stderr=subprocess.DEVNULL, text=True, bufsize=1)
+    try:
+        assert starter.stdout.readline().strip() == "True", "supervisor never came up"
+        before = lifecycle.probe(sock)
+        assert before.running, before
+        assert before.pid and before.pid != starter.pid, (before.pid, starter.pid)
+        # Not merely a different pid: a different process group, which is what
+        # makes a group signal miss it.
+        assert os.getpgid(before.pid) != os.getpgid(starter.pid), "same process group"
+
+        starter.kill()
+        starter.wait(timeout=20)
+        time.sleep(2)
+
+        after = lifecycle.probe(sock)
+        assert after.running, "the supervisor died with the process that started it"
+        assert after.session == before.session, (before.session, after.session)
+    finally:
+        with contextlib.suppress(Exception):
+            starter.kill()
+        info = lifecycle.probe(sock)
+        if info.running and info.pid:
+            with contextlib.suppress(Exception):
+                os.kill(info.pid, signal.SIGKILL)
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_starting_twice_returns_the_one_that_is_running():
+    """Starting is idempotent, or two laboratories fight over one socket."""
+    from mathematica_wstp.supervisor import SupervisorConfig, lifecycle
+
+    workdir = tempfile.mkdtemp(prefix="sup-twice-")
+    config = SupervisorConfig(sock=os.path.join(workdir, "s.sock"),
+                              audit=os.path.join(workdir, "a.log"),
+                              spool=os.path.join(workdir, "art"))
+    try:
+        first = lifecycle.start(config)
+        assert first.running, first
+        second = lifecycle.start(config)
+        assert second.running, second
+        assert second.session == first.session, "a second supervisor was started"
+        assert second.pid == first.pid, (first.pid, second.pid)
+    finally:
+        info = lifecycle.probe(config.sock)
+        if info.running and info.pid:
+            with contextlib.suppress(Exception):
+                os.kill(info.pid, signal.SIGKILL)
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_an_idle_laboratory_is_released_and_a_busy_one_is_not():
+    """When a kernel nobody is using may be let go.
+
+    Two absolutes first: work in flight and a result nobody collected are never
+    destroyed, however long the wait. Only once neither holds does elapsed time
+    get a say. The window is a day by default; it is seconds here so the rule
+    can be observed rather than argued about.
+    """
+    lab = Lab().start(SUP_RECLAIM_AFTER="3", SUP_RECLAIM_CHECK_EVERY="1")
+    kernel_pid = lab.kernel_pid
+    try:
+        # Busy: a long evaluation must hold the laboratory open well past the
+        # window it would otherwise be reclaimed in.
+        rid = lab.talk("SUBMIT slow t=60 Pause[8]; 1")
+        assert rid.startswith("E"), rid
+        time.sleep(5)                       # longer than the reclaim window
+        kept = lab.talk("RECLAIM")
+        assert kept.startswith("KEPT BUSY"), kept
+        assert os.path.exists(f"/proc/{kernel_pid}"), "a busy kernel was reclaimed"
+
+        reply = wait_terminal(lab, rid)
+        assert "COMPLETED" in reply, reply
+
+        # Collected, no clients, and past the window: now it may go.
+        deadline = time.monotonic() + 40
+        while time.monotonic() < deadline:
+            if not os.path.exists(f"/proc/{kernel_pid}"):
+                break
+            time.sleep(0.5)
+        else:
+            raise AssertionError(f"idle kernel was never released: {lab.talk('RECLAIM')}")
+
+        assert lab.proc.wait(timeout=20) == 0, "the supervisor did not exit cleanly"
+        lines = lab.audit_lines()
+        assert any("RECLAIMING" in ln for ln in lines), lines[-3:]
+        assert any("SUPERVISOR_DOWN" in ln and "idle" in ln for ln in lines), lines[-3:]
+    finally:
+        lab.stop()
+
+
+def test_an_unclaimed_result_is_not_thrown_away_by_the_clock():
+    """An answer nobody has collected outranks any idle window.
+
+    This is the case that makes the policy worth stating separately: the kernel
+    is not busy, no client is connected, and the elapsed time says release --
+    but a result computed for someone who has not come back for it is exactly
+    what the supervisor exists to hold.
+    """
+    lab = Lab().start(SUP_RECLAIM_AFTER="3", SUP_RECLAIM_CHECK_EVERY="1")
+    kernel_pid = lab.kernel_pid
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.connect(lab.sock)
+        f = sock.makefile("rw")
+        f.write("SUBMIT orphan 6*7\n")
+        f.flush()
+        rid = f.readline().strip()
+        assert rid.startswith("E"), rid
+        time.sleep(1)
+        # Both, and in this order: makefile() duplicates the descriptor, so
+        # closing the socket alone leaves the connection open from the
+        # supervisor's side and the client looks like it never left.
+        f.close()
+        sock.close()                        # never collects the answer
+
+        time.sleep(6)                       # twice the window
+        kept = lab.talk("RECLAIM")
+        assert kept.startswith("KEPT COMPLETED_UNCLAIMED"), kept
+        assert os.path.exists(f"/proc/{kernel_pid}"), "an uncollected result was destroyed"
+        assert lab.talk("LOOKUP orphan").startswith("orphan ->"), lab.talk("LOOKUP orphan")
+    finally:
+        lab.stop()
+
+
+def test_stopping_refuses_while_the_kernel_is_busy():
+    """Deliberate release is still not permission to destroy running work."""
+    from mathematica_wstp.supervisor import lifecycle
+
+    lab = Lab().start()
+    try:
+        rid = lab.talk("SUBMIT slow2 t=60 Pause[6]; 1")
+        assert rid.startswith("E"), rid
+        time.sleep(1.5)
+        refused = lifecycle.stop(lab.sock)
+        assert refused.running, refused
+        assert "refused" in refused.detail, refused.detail
+        assert lab.proc.poll() is None, "it stopped anyway"
+
+        wait_terminal(lab, rid)
+        lab.talk(f"RESULT {rid}")           # collect it
+        stopped = lifecycle.stop(lab.sock)
+        assert stopped.running is False, stopped
+        assert lab.proc.wait(timeout=20) == 0, "did not exit cleanly on request"
     finally:
         lab.stop()
 
