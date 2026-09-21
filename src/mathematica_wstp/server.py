@@ -9,8 +9,11 @@ them in worker threads. That is what makes ``abort`` reachable: it arrives on a
 different thread while ``evaluate`` is still blocked on the link, and the WSTP
 message channel is designed to be written from exactly that position.
 
-Every tool returns a JSON string. Errors are values, not exceptions -- a tool
-that raises tells the model nothing it can act on.
+Every tool returns a structured result: the payload as a real object, plus a
+line of text a reader can scan. Errors take that same shape -- they are
+values, not exceptions, because a tool that raises tells the model nothing it
+can act on, and they are not encoded differently from successes, because a
+client should branch on the outcome and never on how it was serialised.
 """
 
 from __future__ import annotations
@@ -23,7 +26,7 @@ import sys
 from typing import Any, Literal
 
 from mcp.server.mcpserver import MCPServer
-from mcp.types import ImageContent
+from mcp.types import CallToolResult, ImageContent, TextContent
 
 from . import discovery, registry
 from . import render as render_mod
@@ -68,11 +71,62 @@ def _truncate(text: str, limit: int = MAX_OUTPUT_CHARS) -> tuple[str, bool]:
     return text[:limit] + f"\n... [truncated, {len(text) - limit} more chars]", True
 
 
-def _reply(payload: dict[str, Any]) -> str:
+def _encode(payload: dict[str, Any]) -> str:
+    """The JSON a client will receive. For measuring size, not for returning."""
     return json.dumps(payload, ensure_ascii=False, default=str)
 
 
-def _fail(error: str, **extra: Any) -> str:
+def _one_line(text: Any, limit: int) -> str:
+    flat = " ".join(str(text).split())
+    return flat if len(flat) <= limit else flat[:limit] + "..."
+
+
+def _summary(payload: dict[str, Any]) -> str:
+    """A readable line, derived from the payload and nothing else.
+
+    It can only name fields the payload actually has, so the summary and the
+    structured result beside it cannot come to disagree. The alternative --
+    composing a sentence about what the tool did -- is the failure this project
+    keeps finding, where a component's account of its work outlives the work.
+    """
+    if payload.get("success") is False:
+        return f"failed: {_one_line(payload.get('error') or 'no message reported', 200)}"
+    bits: list[str] = []
+    for key, value in payload.items():
+        if key == "success" or value is None or len(bits) >= 8:
+            continue
+        if isinstance(value, bool):
+            if value:
+                bits.append(key)
+        elif isinstance(value, (int, float)):
+            bits.append(f"{key}={value}")
+        elif isinstance(value, str):
+            if value.strip():
+                bits.append(f"{key}={_one_line(value, 160)}")
+        elif isinstance(value, dict) and value and all(
+                isinstance(v, int) and not isinstance(v, bool) for v in value.values()):
+            bits.append(f"{key} " + ", ".join(f"{k} {v}" for k, v in value.items()))
+        elif isinstance(value, (list, dict)):
+            bits.append(f"{key}: {len(value)}")
+    return "; ".join(bits) if bits else "ok"
+
+
+def _reply(payload: dict[str, Any], summary: str | None = None) -> CallToolResult:
+    """One response shape for every outcome.
+
+    The payload goes back as structured content -- a real object, not JSON
+    nested inside a JSON string -- and the text block carries a line a reader
+    can scan. is_error is deliberately left alone: a failure reported here is a
+    value the model can act on rather than a protocol-level error, which is
+    what it has always been.
+    """
+    return CallToolResult(
+        content=[TextContent(type="text", text=summary or _summary(payload))],
+        structured_content=payload,
+    )
+
+
+def _fail(error: str, **extra: Any) -> CallToolResult:
     return _reply({"success": False, "error": error, **extra})
 
 
@@ -85,7 +139,7 @@ def _fail(error: str, **extra: Any) -> str:
         "all its definitions survive, so you can retry a smaller piece."
     )
 )
-def evaluate(code: str, timeout: float = 60.0) -> str:
+def evaluate(code: str, timeout: float = 60.0) -> dict[str, Any]:
     result = session.evaluate_wl(code, timeout=timeout)
     notice = session.take_kernel_change_notice()
     if not result.success:
@@ -155,7 +209,11 @@ def evaluate(code: str, timeout: float = 60.0) -> str:
     if result.messages:
         payload["messages"] = result.messages
         payload["message_names"] = sorted({m["name"] for m in result.messages if m.get("name")})
-    return _reply(payload)
+    flags = [k for k in ("truncated", "kernel_replaced", "result_may_be_partial")
+             if payload.get(k)]
+    if result.messages:
+        flags.append(f"{len(result.messages)} message(s)")
+    return _reply(payload, text + (f"\n[{', '.join(flags)}]" if flags else ""))
 
 
 @server.tool(
@@ -172,7 +230,7 @@ def evaluate(code: str, timeout: float = 60.0) -> str:
         "to close and relaunch them as part of the abort."
     )
 )
-def abort(rebuild_parallel_kernels: bool = False) -> str:
+def abort(rebuild_parallel_kernels: bool = False) -> dict[str, Any]:
     return _reply(session.abort_current(rebuild_parallel_kernels=rebuild_parallel_kernels))
 
 
@@ -192,7 +250,7 @@ def abort(rebuild_parallel_kernels: bool = False) -> str:
 def kernel(
     action: Literal["state", "restart", "abort", "subkernels",
                     "close_subkernels", "reap"] = "state",
-) -> str:
+) -> dict[str, Any]:
     if action == "state":
         return _reply({"success": True, **session.kernel_status()})
     if action == "restart":
@@ -217,16 +275,22 @@ def kernel(
 
 
 @server.tool(description="Server, kernel and installation status, plus any orphaned kernels.")
-def status() -> str:
-    return _reply({
+def status() -> dict[str, Any]:
+    k = session.kernel_status()
+    payload = {
         "success": True,
         "transport": "WSTP",
-        "kernel": session.kernel_status(),
+        "kernel": k,
         "installation": discovery.summary(),
         "kernels_tracked": registry.registered_kernels(),
         "orphans": registry.orphan_report(),
         "notebooks": (get_headless_notebooks().list() or {}).get("notebooks", []),
-    })
+    }
+    where = (f"K{k.get('generation')}, pid {k.get('pid')}, {k.get('link_health')}"
+             if k.get("alive") else "no kernel running")
+    return _reply(payload, "WSTP {} -- {} subkernel(s), {} notebook(s) open, {} orphan(s)".format(
+        where, len(k.get("subkernels") or []),
+        len(payload["notebooks"]), len(payload["orphans"])))
 
 
 # --- notebooks -------------------------------------------------------------
@@ -243,7 +307,7 @@ def notebooks(
     path: str | None = None,
     title: str = "Untitled",
     notebook: str | None = None,
-) -> str:
+) -> dict[str, Any]:
     nb = get_headless_notebooks()
     if action == "open":
         if not path:
@@ -284,7 +348,7 @@ def cells(
     style: str = "",
     notebook: str | None = None,
     defines: str | None = None,
-) -> str:
+) -> dict[str, Any]:
     if defines:
         # Where a symbol came from is a question about the document, not the
         # kernel: the kernel holds the value but nothing about the cell that
@@ -295,9 +359,9 @@ def cells(
         offset=offset, limit=limit, include_content=include_content,
         style=style, notebook=notebook,
     )
-    reply = _reply(payload)
-    if len(reply) <= MAX_REPLY_CHARS:
-        return reply
+    size = len(_encode(payload))
+    if size <= MAX_REPLY_CHARS:
+        return _reply(payload)
     # evaluate_cells degrades to a summary when a range is too big; this used to
     # blow the caller's token limit with a raw error instead, so asking "what is
     # in this notebook?" the obvious way returned nothing at all. Drop content
@@ -308,14 +372,14 @@ def cells(
             style=style, notebook=notebook,
         )
         trimmed["content_omitted"] = True
-        trimmed["note"] = (f"Content dropped: the full reply was {len(reply)} chars. "
+        trimmed["note"] = (f"Content dropped: the full reply was {size} chars. "
                            "Ask for a narrower range to see content.")
-        reply = _reply(trimmed)
-        if len(reply) <= MAX_REPLY_CHARS:
-            return reply
+        size = len(_encode(trimmed))
+        if size <= MAX_REPLY_CHARS:
+            return _reply(trimmed)
         payload = trimmed
     kept = payload.get("cells") or []
-    room = max(1, len(kept) * MAX_REPLY_CHARS // max(len(reply), 1) - 1)
+    room = max(1, len(kept) * MAX_REPLY_CHARS // max(size, 1) - 1)
     payload["cells"] = kept[:room]
     payload["truncated"] = True
     payload["note"] = (f"Showing {room} of {len(kept)} cells; the rest did not fit. "
@@ -447,7 +511,7 @@ def evaluate_cells(
     detail: Literal["auto", "full", "summary"] = "auto",
     write_outputs: bool = False,
     notebook: str | None = None,
-) -> str:
+) -> dict[str, Any]:
     nb = get_headless_notebooks()
     if index is not None:
         if write_outputs:
@@ -467,9 +531,8 @@ def evaluate_cells(
                                 write_outputs=write_outputs)
     if detail == "summary":
         return _reply(_condense_range(payload))
-    full = _reply(payload)
-    if detail == "full" or len(full) <= MAX_REPLY_CHARS:
-        return full
+    if detail == "full" or len(_encode(payload)) <= MAX_REPLY_CHARS:
+        return _reply(payload)
     # Measure the real thing rather than guessing from the cell count: a
     # hundred quiet cells are small, five noisy ones are not.
     return _reply(_condense_range(payload))
@@ -484,7 +547,7 @@ def edit_cells(
     position: str = "end",
     anchor: int | None = None,
     notebook: str | None = None,
-) -> str:
+) -> dict[str, Any]:
     nb = get_headless_notebooks()
     if action == "write":
         return _reply(nb.write_cell(content, style=style, position=position,
@@ -581,7 +644,7 @@ def vars(
     pattern: str | None = None,
     include_system: bool = False,
     full: bool = False,
-) -> str:
+) -> dict[str, Any]:
     if action == "list":
         ctx = '"Global`*"' if not include_system else '"System`*"'
         if pattern:
@@ -668,7 +731,7 @@ def vars(
         "fixed setup sequence; not a substitute for one compound Wolfram expression."
     )
 )
-def batch(ops: list[dict[str, Any]], stop_on_error: bool = True) -> str:
+def batch(ops: list[dict[str, Any]], stop_on_error: bool = True) -> dict[str, Any]:
     dispatch = _batchable()
     results: list[dict[str, Any]] = []
     for i, op in enumerate(ops):
@@ -680,9 +743,10 @@ def batch(ops: list[dict[str, Any]], stop_on_error: bool = True) -> str:
         else:
             try:
                 raw = fn(**(op.get("args") or op.get("params") or {}))
-                # render can hand back an image block rather than JSON text.
+                # render can hand back an image block instead of a result.
                 entry = {"op": i, "tool": tool_name,
-                         "result": json.loads(raw) if isinstance(raw, str) else "<image>"}
+                         "result": raw.structured_content
+                                   if isinstance(raw, CallToolResult) else "<image>"}
             except Exception as exc:
                 entry = {"op": i, "tool": tool_name, "success": False,
                          "error": f"{type(exc).__name__}: {exc}"}
@@ -710,7 +774,7 @@ def read_notebook_file(
     mode: Literal["outline", "markdown", "wolfram", "plain", "json"] = "outline",
     limit: int = 200,
     offset: int = 0,
-) -> str:
+) -> dict[str, Any]:
     nb = get_headless_notebooks()
     # open() de-duplicates by path, so a file the caller already has open comes
     # back as THEIR session id, not a scratch one. Closing that in the finally
@@ -778,7 +842,7 @@ def read_notebook_file(
     )
 )
 def verify_derivation(steps: list[str], timeout: float = 120.0,
-                      assumptions: str = "") -> str:
+                      assumptions: str = "") -> dict[str, Any]:
     if len(steps) < 2:
         return _fail("give at least two steps to compare")
     checks: list[dict[str, Any]] = []
@@ -954,7 +1018,7 @@ _GUIDE: dict[str, str] = {
                  "notebooks | performance.")
 )
 def guide(topic: Literal["workflow", "abort", "errors", "notebooks", "state", "parallel",
-                         "performance"] = "workflow") -> str:
+                         "performance"] = "workflow") -> dict[str, Any]:
     return _reply({"success": True, "topic": topic,
                    "guidance": _GUIDE.get(topic, _GUIDE["workflow"]),
                    "topics": sorted(_GUIDE)})

@@ -41,10 +41,18 @@ PARAMS = StdioServerParameters(
 
 
 def _payload(result) -> dict:
-    """Unwrap a tool result into the dict the tool returned."""
+    """The dict the tool returned -- structured, so nothing is reparsed."""
+    payload = result.structured_content
+    if not isinstance(payload, dict):
+        raise AssertionError(f"no structured content in {result!r}")
+    return payload
+
+
+def _text(result) -> str:
+    """The human-readable line that travels beside the structured payload."""
     for block in result.content:
         if getattr(block, "type", None) == "text":
-            return json.loads(block.text)
+            return block.text
     raise AssertionError(f"no text content in {result!r}")
 
 
@@ -62,6 +70,52 @@ async def run_checks() -> list[tuple[str, bool, str]]:
             expected = {"evaluate", "abort", "kernel", "status",
                         "notebooks", "cells", "evaluate_cells", "edit_cells"}
             check("tools registered", expected <= tools, f"missing {expected - tools}")
+
+            # --- the response contract -------------------------------------
+            # What this replaces: the payload arrived as JSON nested inside a
+            # JSON string, inside a synthesised {"result": ...} envelope, so a
+            # client parsed twice to reach any field. These assert the SHAPE.
+            # Values are covered everywhere else in this file; shape was not,
+            # which is how the double encoding survived this long.
+            raw = await sess.call_tool("status", {})
+            check("a success returns an object, not a JSON string",
+                  isinstance(raw.structured_content, dict),
+                  type(raw.structured_content).__name__)
+            check("and it is not wrapped in a synthesised 'result' field",
+                  isinstance(raw.structured_content, dict)
+                  and "result" not in raw.structured_content
+                  and raw.structured_content.get("success") is True,
+                  str(raw.structured_content)[:200])
+            check("its fields are usable without reparsing anything",
+                  isinstance(raw.structured_content.get("kernel"), dict)
+                  and isinstance(raw.structured_content.get("orphans"), list),
+                  str(raw.structured_content)[:200])
+            line = _text(raw)
+            check("the text block is a readable line, not the payload again",
+                  line.startswith("WSTP") and len(line) < 300 and not line.lstrip().startswith("{"),
+                  line[:200])
+            missing = [f for f in ("transport", "kernel", "installation",
+                                   "kernels_tracked", "orphans", "notebooks")
+                       if f not in (raw.structured_content or {})]
+            check("no diagnostic field was lost in the change", not missing, f"missing {missing}")
+
+            # A failure takes the same shape. Having to branch on the encoding
+            # as well as on the outcome is exactly what is being removed.
+            bad = await sess.call_tool("notebooks", {"action": "open"})
+            check("a failure is structured the same way as a success",
+                  isinstance(bad.structured_content, dict)
+                  and bad.structured_content.get("success") is False,
+                  str(bad.structured_content)[:200])
+            check("a failure still carries its error message",
+                  "requires a path" in str((bad.structured_content or {}).get("error", "")),
+                  str(bad.structured_content)[:200])
+            check("a failure reads as one line of text too",
+                  _text(bad).startswith("failed:"), _text(bad)[:200])
+            # Representation changed; protocol meaning did not. A failure here
+            # has always been a value the model can act on, never a protocol
+            # error, and nothing above should have quietly made it one.
+            check("a reported failure is still not a protocol-level error",
+                  bad.is_error is False, str(bad.is_error))
 
             r = _payload(await sess.call_tool("evaluate", {"code": "1+1"}))
             check("evaluate 1+1", r.get("output", "").strip() == "2", str(r))
@@ -335,8 +389,7 @@ def check_ending_a_session_takes_the_whole_tree_down() -> list[tuple[str, bool, 
                 return reply
 
     def tool(name: str, args: dict) -> dict:
-        return json.loads(rpc("tools/call", {"name": name, "arguments": args})
-                          ["result"]["content"][0]["text"])
+        return rpc("tools/call", {"name": name, "arguments": args})["result"]["structuredContent"]
 
     try:
         rpc("initialize", {"protocolVersion": "2024-11-05", "capabilities": {},
@@ -434,7 +487,7 @@ def check_sigterm_takes_the_whole_tree_down() -> list[tuple[str, bool, str]]:
         rpc("tools/call", {"name": "evaluate",
                            "arguments": {"code": "Length[LaunchKernels[2]]", "timeout": 300}})
         reply = rpc("tools/call", {"name": "status", "arguments": {}})
-        state = json.loads(reply["result"]["content"][0]["text"])
+        state = reply["result"]["structuredContent"]
         master = state["kernel"]["pid"]
         helpers = list(state["kernel"].get("subkernels") or [])
         out.append(("sigterm test set up a kernel with helpers", bool(helpers),
@@ -513,8 +566,7 @@ def check_an_aborting_cell_does_not_take_the_session_down() -> list[tuple[str, b
                 return reply
 
     def tool(name: str, args: dict) -> dict:
-        return json.loads(rpc("tools/call", {"name": name, "arguments": args})
-                          ["result"]["content"][0]["text"])
+        return rpc("tools/call", {"name": name, "arguments": args})["result"]["structuredContent"]
 
     try:
         rpc("initialize", {"protocolVersion": "2024-11-05", "capabilities": {},
@@ -626,8 +678,7 @@ def check_write_outputs_makes_an_exported_record_faithful() -> list[tuple[str, b
                 return reply
 
     def tool(name: str, args: dict) -> dict:
-        return json.loads(rpc("tools/call", {"name": name, "arguments": args})
-                          ["result"]["content"][0]["text"])
+        return rpc("tools/call", {"name": name, "arguments": args})["result"]["structuredContent"]
 
     try:
         rpc("initialize", {"protocolVersion": "2024-11-05", "capabilities": {},
@@ -715,8 +766,7 @@ def check_reading_a_file_does_not_close_the_session_on_it() -> list[tuple[str, b
                 return reply
 
     def tool(name: str, args: dict) -> dict:
-        return json.loads(rpc("tools/call", {"name": name, "arguments": args})
-                          ["result"]["content"][0]["text"])
+        return rpc("tools/call", {"name": name, "arguments": args})["result"]["structuredContent"]
 
     try:
         rpc("initialize", {"protocolVersion": "2024-11-05", "capabilities": {},
@@ -817,8 +867,7 @@ def check_abort_stops_a_range_not_just_one_cell() -> list[tuple[str, bool, str]]
         raise RuntimeError("timed out waiting for a reply")
 
     def tool(name: str, args: dict) -> dict:
-        return json.loads(wait(send("tools/call", {"name": name, "arguments": args}))
-                          ["result"]["content"][0]["text"])
+        return wait(send("tools/call", {"name": name, "arguments": args}))["result"]["structuredContent"]
 
     try:
         wait(send("initialize", {"protocolVersion": "2024-11-05", "capabilities": {},
@@ -831,7 +880,7 @@ def check_abort_stops_a_range_not_just_one_cell() -> list[tuple[str, bool, str]]
                                   "arguments": {"from_": 0, "to": 7, "timeout": 300}})
         time.sleep(5.0)
         tool("abort", {})
-        reply = json.loads(wait(mid)["result"]["content"][0]["text"])
+        reply = wait(mid)["result"]["structuredContent"]
         elapsed = time.time() - started
 
         results = reply.get("results") or []
@@ -901,8 +950,7 @@ def check_cells_can_find_where_a_symbol_is_assigned() -> list[tuple[str, bool, s
                 return reply
 
     def tool(name: str, args: dict) -> dict:
-        return json.loads(rpc("tools/call", {"name": name, "arguments": args})
-                          ["result"]["content"][0]["text"])
+        return rpc("tools/call", {"name": name, "arguments": args})["result"]["structuredContent"]
 
     try:
         rpc("initialize", {"protocolVersion": "2024-11-05", "capabilities": {},
@@ -1000,8 +1048,7 @@ def check_cell_labels_count_statements_not_cells() -> list[tuple[str, bool, str]
                 return reply
 
     def tool(name: str, args: dict) -> dict:
-        return json.loads(rpc("tools/call", {"name": name, "arguments": args})
-                          ["result"]["content"][0]["text"])
+        return rpc("tools/call", {"name": name, "arguments": args})["result"]["structuredContent"]
 
     try:
         rpc("initialize", {"protocolVersion": "2024-11-05", "capabilities": {},
@@ -1090,8 +1137,7 @@ def check_verify_catches_misnumbered_labels_without_a_reference() -> list[tuple[
                 return reply
 
     def tool(name: str, args: dict) -> dict:
-        return json.loads(rpc("tools/call", {"name": name, "arguments": args})
-                          ["result"]["content"][0]["text"])
+        return rpc("tools/call", {"name": name, "arguments": args})["result"]["structuredContent"]
 
     try:
         rpc("initialize", {"protocolVersion": "2024-11-05", "capabilities": {},
@@ -1216,8 +1262,7 @@ def check_overlapping_spans_cannot_renumber_silently() -> list[tuple[str, bool, 
                     return reply
 
         def tool(name, args):
-            return json.loads(rpc("tools/call", {"name": name, "arguments": args})
-                              ["result"]["content"][0]["text"])
+            return rpc("tools/call", {"name": name, "arguments": args})["result"]["structuredContent"]
 
         try:
             rpc("initialize", {"protocolVersion": "2024-11-05", "capabilities": {},
@@ -1312,8 +1357,7 @@ def check_the_subkernel_pool_can_be_released_without_losing_state() -> list[tupl
                 return reply
 
     def tool(name, args):
-        return json.loads(rpc("tools/call", {"name": name, "arguments": args})
-                          ["result"]["content"][0]["text"])
+        return rpc("tools/call", {"name": name, "arguments": args})["result"]["structuredContent"]
 
     try:
         rpc("initialize", {"protocolVersion": "2024-11-05", "capabilities": {},
@@ -1397,8 +1441,7 @@ def check_a_span_that_skips_an_unrun_cell_says_so() -> list[tuple[str, bool, str
                 return reply
 
     def tool(name, args):
-        return json.loads(rpc("tools/call", {"name": name, "arguments": args})
-                          ["result"]["content"][0]["text"])
+        return rpc("tools/call", {"name": name, "arguments": args})["result"]["structuredContent"]
 
     try:
         rpc("initialize", {"protocolVersion": "2024-11-05", "capabilities": {},
@@ -1447,6 +1490,83 @@ def check_a_span_that_skips_an_unrun_cell_says_so() -> list[tuple[str, bool, str
     return out
 
 
+def check_an_oversized_cell_listing_degrades_instead_of_breaking() -> list[tuple[str, bool, str]]:
+    """cells() must shed content when a listing is too large to return.
+
+    This path was written but never executed by a test, and a refactor of the
+    size accounting left it referring to a variable that no longer existed --
+    it would have raised NameError on the first notebook big enough to reach
+    it, which is precisely the case it exists to handle. Force it with a small
+    reply budget rather than a huge notebook.
+    """
+    import subprocess
+    import tempfile
+
+    out: list[tuple[str, bool, str]] = []
+    body = "x" * 400
+    src = tempfile.NamedTemporaryFile("w", suffix=".nb", delete=False)
+    src.write("Notebook[{"
+              + ",".join('Cell[BoxData["c%d = \"%s\""], "Input"]' % (i, body)
+                         for i in range(40))
+              + "}]")
+    src.close()
+
+    srv = subprocess.Popen(
+        [PARAMS.command, *PARAMS.args], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL, text=True, bufsize=1, cwd=ROOT,
+        env={**PARAMS.env, "MATHEMATICA_WSTP_MAX_REPLY": "1500"})
+    counter = [0]
+
+    def rpc(method: str, params=None, notify: bool = False):
+        msg: dict = {"jsonrpc": "2.0", "method": method}
+        if params is not None:
+            msg["params"] = params
+        if not notify:
+            counter[0] += 1
+            msg["id"] = counter[0]
+        srv.stdin.write(json.dumps(msg) + "\n")
+        srv.stdin.flush()
+        if notify:
+            return None
+        while True:
+            line = srv.stdout.readline()
+            if not line:
+                raise RuntimeError("server closed the pipe")
+            reply = json.loads(line)
+            if reply.get("id") == counter[0]:
+                return reply
+
+    try:
+        rpc("initialize", {"protocolVersion": "2024-11-05", "capabilities": {},
+                           "clientInfo": {"name": "degrade-test", "version": "0"}})
+        rpc("notifications/initialized", {}, notify=True)
+        rpc("tools/call", {"name": "notebooks",
+                           "arguments": {"action": "open", "path": src.name}})
+        reply = rpc("tools/call", {"name": "cells",
+                                   "arguments": {"limit": 40, "include_content": True}})
+        result = reply.get("result") or {}
+        payload = result.get("structuredContent")
+        out.append(("an oversized listing still returns a result",
+                    isinstance(payload, dict), str(reply)[:300]))
+        payload = payload or {}
+        out.append(("it is not reported as an error",
+                    result.get("isError") is not True, str(result)[:200]))
+        out.append(("it sheds content rather than failing",
+                    payload.get("content_omitted") is True or payload.get("truncated") is True,
+                    str(payload)[:300]))
+        out.append(("and says how big the full reply would have been",
+                    "chars" in str(payload.get("note", "")) or payload.get("truncated") is True,
+                    str(payload.get("note"))[:200]))
+    finally:
+        try:
+            srv.stdin.close()
+        except Exception:
+            pass
+        srv.wait(timeout=20)
+        os.unlink(src.name)
+    return out
+
+
 def main() -> int:
     results = asyncio.run(run_checks())
     results += check_ending_a_session_takes_the_whole_tree_down()
@@ -1461,6 +1581,7 @@ def main() -> int:
     results += check_the_subkernel_pool_can_be_released_without_losing_state()
     results += check_a_span_that_skips_an_unrun_cell_says_so()
     results += check_summary_mode_keeps_the_index_bookkeeping()
+    results += check_an_oversized_cell_listing_degrades_instead_of_breaking()
     results += check_sigterm_takes_the_whole_tree_down()
     failures = 0
     for name, ok, detail in results:
