@@ -73,6 +73,10 @@ class Evaluator(Protocol):
                      idempotency_key: str | None = None,
                      correlation: dict[str, str] | None = None) -> Execution: ...
 
+    def evaluate_text(self, code: str, timeout: float = 60): ...
+
+    def evaluate_json(self, code: str, timeout: float = 60): ...
+
 
 class _DirectExecution:
     """The one evaluation this process is running, behind a handle."""
@@ -171,9 +175,36 @@ class DirectSessionEvaluator:
         # was recognised when it was simply run again.
         return _DirectExecution(f"D{next(self._ids)}", f"Normal[{code}]", timeout)
 
+    def evaluate_text(self, code: str, timeout: float = 60):
+        from . import session
+
+        return session.evaluate_wl(code, timeout=timeout)
+
+    def evaluate_json(self, code: str, timeout: float = 60):
+        from . import session
+
+        return session.evaluate_wl_json(code, timeout=timeout)
+
 
 _evaluator: Evaluator | None = None
 _lock = threading.Lock()
+
+
+def evaluate_text(code: str, timeout: float = 60):
+    """Evaluate for text in whichever kernel the active backend owns.
+
+    This exists because ``evaluate`` and ``vars`` used to reach ``session``
+    directly, past the seam. With a supervisor selected they went on talking to
+    this process's own kernel while notebook replay talked to the supervisor's,
+    so the two held different definitions -- a symbol defined through one was
+    simply absent from the other, with nothing to say why.
+    """
+    return get_evaluator().evaluate_text(code, timeout=timeout)
+
+
+def evaluate_json(code: str, timeout: float = 60):
+    """Evaluate an Association-yielding expression in the active backend."""
+    return get_evaluator().evaluate_json(code, timeout=timeout)
 
 
 def get_evaluator() -> Evaluator:

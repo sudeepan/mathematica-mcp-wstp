@@ -783,6 +783,116 @@ def test_the_work_survives_the_death_of_the_server_that_asked_for_it():
         lab.stop()
 
 
+def test_evaluate_and_replay_reach_the_same_kernel():
+    """The divergence this closes: two doors onto two different kernels.
+
+    ``evaluate`` and ``vars`` used to reach the session directly, past the
+    evaluator seam. With a supervisor selected they went on talking to this
+    process's own kernel while notebook replay talked to the supervisor's, so a
+    symbol defined through one was simply absent from the other and nothing in
+    either reply said why.
+
+    Checked by identity, not by assertion: both paths are asked which operating
+    system process they are running in.
+    """
+    import uuid as _uuid
+
+    from mathematica_wstp import evaluator, notebooks, supervisor
+
+    lab = Lab().start()
+    nb_path = os.path.join(tempfile.gettempdir(), f"same-{_uuid.uuid4().hex[:8]}.nb")
+    replay_dir = tempfile.mkdtemp(prefix="same-m-")
+    os.environ["MATHEMATICA_WSTP_REPLAY_DIR"] = replay_dir
+    try:
+        supervisor.use(lab.sock)
+
+        # 1. evaluate() now lands in the supervisor's kernel.
+        got = evaluator.evaluate_text("$ProcessID", timeout=60)
+        assert got.success, got
+        assert int(got.text.strip()) == lab.kernel_pid, (got.text, lab.kernel_pid)
+
+        # 2. A symbol defined that way is visible to a replay -- the same
+        #    kernel, so the same definitions.
+        defined = evaluator.evaluate_text("sharedSymbol = 4242", timeout=60)
+        assert defined.success, defined
+
+        nb = notebooks.get_headless_notebooks()
+        made = nb.create(title="Same", path=nb_path)
+        nbid = made["id"]
+        assert nb.write_cell("sharedSymbol", style="Input", notebook=nbid).get("success")
+        replay = nb.replay_cells(notebook=nbid, timeout=60)
+        assert replay["success"], replay
+        assert replay["cells"][0]["output"].strip() == "4242", replay["cells"][0]
+
+        # 3. And the structured path reaches it too.
+        listed = evaluator.evaluate_json(
+            '<|"here" -> $ProcessID|>', timeout=60)
+        assert listed.get("here") == lab.kernel_pid, listed
+
+        # 4. Putting it back is not a one-way door.
+        supervisor.use_direct()
+        own = evaluator.evaluate_text("$ProcessID", timeout=60)
+        assert own.success, own
+        assert int(own.text.strip()) != lab.kernel_pid, "use_direct did not move it back"
+    finally:
+        from mathematica_wstp.evaluator import set_evaluator
+        set_evaluator(None)
+        os.environ.pop("MATHEMATICA_WSTP_REPLAY_DIR", None)
+        shutil.rmtree(replay_dir, ignore_errors=True)
+        with contextlib.suppress(OSError):
+            os.unlink(nb_path)
+        lab.stop()
+
+
+def test_both_backends_report_an_evaluation_the_same_way():
+    """A caller must not be able to tell which kernel answered.
+
+    Same expressions, both backends, compared field by field. Prints and
+    message text are the part at risk: the supervisor's own result line carries
+    only a count and a list of names, so this checks the in-kernel capture
+    actually recovers what the direct path reads off the transport.
+    """
+    from mathematica_wstp import evaluator, supervisor
+    from mathematica_wstp.evaluator import DirectSessionEvaluator, set_evaluator
+
+    cases = [
+        ("2 + 2", "4"),
+        ('StringLength["\\[Gamma]"]', "1"),
+        ("Total[Range[100]]", "5050"),
+    ]
+    lab = Lab().start()
+    try:
+        set_evaluator(DirectSessionEvaluator())
+        direct = {c: evaluator.evaluate_text(c, timeout=60) for c, _ in cases}
+        direct_print = evaluator.evaluate_text('Print["one"]; Print["two"]; 7', timeout=60)
+        direct_msg = evaluator.evaluate_text("1/0", timeout=60)
+
+        supervisor.use(lab.sock)
+        supervised = {c: evaluator.evaluate_text(c, timeout=60) for c, _ in cases}
+        sup_print = evaluator.evaluate_text('Print["one"]; Print["two"]; 7', timeout=60)
+        sup_msg = evaluator.evaluate_text("1/0", timeout=60)
+
+        for code, expected in cases:
+            a, b = direct[code], supervised[code]
+            assert a.success and b.success, (code, a, b)
+            assert a.text.strip() == expected, (code, a.text)
+            assert b.text.strip() == expected, (code, b.text)
+
+        # Printed output, in full, on both.
+        assert direct_print.prints == ["one", "two"], direct_print.prints
+        assert sup_print.prints == ["one", "two"], sup_print.prints
+        assert direct_print.text.strip() == sup_print.text.strip() == "7"
+
+        # And a message, with its name, on both.
+        assert direct_msg.messages, direct_msg
+        assert sup_msg.messages, "the supervisor path lost the message entirely"
+        assert any("infy" in str(m).lower() for m in direct_msg.messages), direct_msg.messages
+        assert any("infy" in str(m).lower() for m in sup_msg.messages), sup_msg.messages
+    finally:
+        set_evaluator(None)
+        lab.stop()
+
+
 def _main() -> int:
     tests = [(n, o) for n, o in sorted(globals().items())
              if n.startswith("test_") and callable(o)]

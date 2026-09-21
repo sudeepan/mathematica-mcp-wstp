@@ -29,6 +29,7 @@ from mcp.server.mcpserver import MCPServer
 from mcp.types import CallToolResult, ImageContent, TextContent
 
 from . import discovery, registry
+from .evaluator import evaluate_json, evaluate_text
 from . import render as render_mod
 from . import session
 from .notebooks import get_headless_notebooks
@@ -140,7 +141,7 @@ def _fail(error: str, **extra: Any) -> CallToolResult:
     )
 )
 def evaluate(code: str, timeout: float = 60.0) -> dict[str, Any]:
-    result = session.evaluate_wl(code, timeout=timeout)
+    result = evaluate_text(code, timeout=timeout)
     notice = session.take_kernel_change_notice()
     if not result.success:
         payload: dict[str, Any] = {
@@ -657,7 +658,7 @@ def vars(
             "<|\"name\" -> s, \"defined\" -> (ToExpression[s, InputForm, ValueQ]), "
             "\"bytes\" -> ToExpression[s, InputForm, ByteCount]|>, HoldFirst] /@ Take[ns, UpTo[200]])|>]"
         )
-        result = session.evaluate_wl_json(code, timeout=60)
+        result = evaluate_json(code, timeout=60)
         return _reply(result)
 
     if action == "get":
@@ -668,7 +669,7 @@ def vars(
         # an expression it cannot read anyway -- a replay's accumulated result is
         # routinely millions of leaves. Size and shape answer the real question
         # ("did this get defined, and is it the right magnitude?") without that.
-        probe = session.evaluate_wl_json(
+        probe = evaluate_json(
             "Module[{v = " + name + "}, <|"
             "\"bytes\" -> ByteCount[v], \"leaves\" -> LeafCount[v], "
             "\"head\" -> ToString[Head[v]], "
@@ -687,7 +688,7 @@ def vars(
                     f"need (Length[{name}], a Part of it, a Count); pass full=True "
                     "only if you really need the whole expression."),
             })
-        out = session.evaluate_wl(f"{name}", timeout=60)
+        out = evaluate_text(f"{name}", timeout=60)
         if not out.success:
             return _fail(out.error)
         text, truncated = _truncate(out.text)
@@ -698,21 +699,21 @@ def vars(
     if action == "set":
         if not name or value is None:
             return _fail("set requires both name and value")
-        out = session.evaluate_wl(f"{name} = ({value})", timeout=60)
+        out = evaluate_text(f"{name} = ({value})", timeout=60)
         return _reply({"success": out.success, "name": name,
                        "value": _truncate(out.text)[0], "error": out.error or None})
 
     if action == "clear":
         if not name:
             return _fail("clear requires a name")
-        out = session.evaluate_wl(f'Quiet[Clear[{name}]]; ValueQ[{name}]', timeout=60)
+        out = evaluate_text(f'Quiet[Clear[{name}]]; ValueQ[{name}]', timeout=60)
         return _reply({"success": out.success, "cleared": name,
                        "still_defined": out.text.strip() == "True"})
 
     if action == "clear_all":
         # Global` only. Clearing System` would break the kernel, and "clear
         # everything" almost always means "clear what I defined".
-        out = session.evaluate_wl(
+        out = evaluate_text(
             'Module[{n = Length[Names["Global`*"]]}, '
             'Quiet[ClearAll["Global`*"]]; {n, Length[Names["Global`*"]]}]', timeout=120)
         return _reply({"success": out.success, "result": out.text,
@@ -1090,7 +1091,7 @@ def verify_derivation(steps: list[str], timeout: float = 120.0,
         assume = f", Assumptions -> ({assumptions})" if assumptions else ""
         code = (f"TimeConstrained[TrueQ[FullSimplify[({a}) - ({b}) == 0{assume}]], "
                 f"{max(5.0, timeout / max(1, len(steps)))}, $TimedOut]")
-        out = session.evaluate_wl(code, timeout=timeout)
+        out = evaluate_text(code, timeout=timeout)
         verdict = out.text.strip() if out.success else "$Failed"
         entry = {"step": i + 1, "from": a[:120], "to": b[:120]}
         if verdict == "True":

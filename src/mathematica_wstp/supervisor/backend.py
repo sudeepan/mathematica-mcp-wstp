@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import json
 import socket
 import time
 import uuid
@@ -31,7 +32,77 @@ from .core import default_socket_path
 
 __all__ = ["SupervisorEvaluator", "SupervisorUnavailable", "connect"]
 
+
+def _lines(text) -> list[str]:
+    """Printed output as the direct path reports it: one entry per line."""
+    if not text or not isinstance(text, str):
+        return []
+    return [ln for ln in text.splitlines() if ln.strip()]
+
 TERMINAL_STATES = ("COMPLETED", "ABORTED", "TIMED_OUT", "FAILED", "CANCELLED")
+
+
+# Evaluating for TEXT in a kernel we do not own needs the value, anything
+# printed, and any message -- and the supervisor's own result line carries only
+# a count of prints and a list of message NAMES. Reading that would quietly
+# give a caller less than the direct path does for the same expression.
+#
+# So the capture happens in the kernel instead, over the bytes path that
+# already exists. $Output and $Messages are redirected to separate files, which
+# is what keeps printed output and message text distinguishable; $MessageList
+# supplies the names. CheckAbort is there for the same reason the notebook
+# helper has it: an Abort[] raised inside the expression would otherwise escape
+# the wrapper and leave the transport reading a bare symbol where a ByteArray
+# should be.
+# The wire protocol is one message per line, and both halves of this can
+# contain newlines: the wrapper because it is long, and the caller's code
+# because people write multi-line expressions. Flattening whitespace would
+# corrupt a string literal that legitimately spans lines, so the code is
+# base64-encoded and reassembled in the kernel instead. The wrapper itself is
+# collapsed to one line, which is safe because it contains no string literal
+# whose spacing matters.
+_CAPTURE = """Module[{mcpRes, mcpMsgs = {}, mcpOutF, mcpMsgF, mcpOutS, mcpMsgS,
+   mcpPrinted = "", mcpMsgText = "", mcpAborted = False, mcpTag},
+  mcpTag = ToString[$ProcessID] <> "-" <> ToString[RandomInteger[10^9]];
+  mcpOutF = FileNameJoin[{$TemporaryDirectory, "mcp-out-" <> mcpTag <> ".txt"}];
+  mcpMsgF = FileNameJoin[{$TemporaryDirectory, "mcp-msg-" <> mcpTag <> ".txt"}];
+  mcpOutS = Quiet[Check[OpenWrite[mcpOutF, FormatType -> OutputForm], $Failed]];
+  mcpMsgS = Quiet[Check[OpenWrite[mcpMsgF, FormatType -> OutputForm], $Failed]];
+  Block[{$MessageList = {}},
+    mcpRes = CheckAbort[
+      Block[{$Output = If[mcpOutS === $Failed, $Output, {mcpOutS}],
+             $Messages = If[mcpMsgS === $Failed, $Messages, {mcpMsgS}]},
+        ToExpression[ByteArrayToString[BaseDecode["%s"]]]],
+      $MCPEvalAborted];
+    mcpMsgs = $MessageList];
+  If[mcpOutS =!= $Failed, Quiet[Close[mcpOutS]];
+    mcpPrinted = Quiet[Check[Import[mcpOutF, "Text"], ""]];
+    Quiet[DeleteFile[mcpOutF]]];
+  If[mcpMsgS =!= $Failed, Quiet[Close[mcpMsgS]];
+    mcpMsgText = Quiet[Check[Import[mcpMsgF, "Text"], ""]];
+    Quiet[DeleteFile[mcpMsgF]]];
+  If[!StringQ[mcpPrinted], mcpPrinted = ""];
+  If[!StringQ[mcpMsgText], mcpMsgText = ""];
+  mcpAborted = (mcpRes === $MCPEvalAborted);
+  ExportByteArray[<|
+    "text" -> If[mcpAborted, "", Quiet[Check[ToString[mcpRes, InputForm], "$Failed"]]],
+    "printed" -> mcpPrinted,
+    "message_text" -> mcpMsgText,
+    "message_names" -> (mcpMsgs /. {HoldForm[mcpM_] :> Quiet[Check[ToString[Unevaluated[mcpM], InputForm], "?"]]}),
+    "aborted" -> mcpAborted|>, "RawJSON", "Compact" -> True]]"""
+
+_CAPTURE_ONE_LINE = " ".join(_CAPTURE.split())
+
+
+def capture_expression(code: str) -> str:
+    """Wrap an expression so its value, prints and messages all come back.
+
+    One line, because the protocol is line-based, and with the caller's code
+    encoded so that a multi-line expression -- or a string literal containing a
+    newline -- survives the trip intact.
+    """
+    encoded = base64.b64encode(code.encode("utf-8")).decode("ascii")
+    return _CAPTURE_ONE_LINE % encoded
 
 
 class SupervisorUnavailable(RuntimeError):
@@ -143,6 +214,69 @@ class SupervisorEvaluator:
         if not request_id.startswith("E"):
             raise SupervisorUnavailable(f"submission refused: {reply}")
         return _SupervisorExecution(self, request_id)
+
+    def evaluate_text(self, code: str, timeout: float = 60):
+        """Evaluate for InputForm text, in the supervisor's kernel.
+
+        Returns the same ``WLResult`` the direct path returns, so a caller
+        cannot tell which kernel answered except by asking. The capture happens
+        in the kernel rather than being read off the supervisor's result line,
+        which carries only a print count and message names.
+        """
+        from ..session import WLResult
+
+        try:
+            handle = self.submit_bytes(capture_expression(code), timeout=timeout)
+            result = handle.wait(timeout + 30)
+        except SupervisorUnavailable as exc:
+            return WLResult(success=False, error=str(exc), execution_method="supervisor")
+        if result.outcome == "TIMED_OUT":
+            return WLResult(success=False, error=result.detail or "timed out",
+                            timed_out=True, execution_method="supervisor")
+        if not result.success or not result.data:
+            return WLResult(success=False, execution_method="supervisor",
+                            error=result.detail or f"evaluation {result.outcome}",
+                            aborted=result.outcome == "ABORTED")
+        try:
+            payload = json.loads(result.data.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as exc:
+            return WLResult(success=False, execution_method="supervisor",
+                            error=f"could not read the reply: {exc}")
+        # An abort inside the expression is the expression's outcome, not a
+        # transport failure, and it must not be reported as a clean value.
+        if payload.get("aborted"):
+            return WLResult(success=False, aborted=True, execution_method="supervisor",
+                            error="the evaluation was aborted",
+                            prints=_lines(payload.get("printed")))
+        messages = []
+        text = " ".join((payload.get("message_text") or "").split())
+        for name in payload.get("message_names") or []:
+            symbol, _, tag = str(name).partition("::")
+            messages.append({"symbol": symbol, "tag": tag, "name": str(name),
+                             "text": text or str(name)})
+        return WLResult(success=True, text=payload.get("text", ""),
+                        prints=_lines(payload.get("printed")),
+                        messages=messages, execution_method="supervisor",
+                        extra={"backend": "supervisor",
+                               "request_id": result.request_id,
+                               "evaluation_token": result.token})
+
+    def evaluate_json(self, code: str, timeout: float = 60):
+        """Evaluate an expression yielding an Association, decoded as data."""
+        try:
+            handle = self.submit_bytes(
+                f'ExportByteArray[{code}, "RawJSON", "Compact" -> True]', timeout=timeout)
+            result = handle.wait(timeout + 30)
+        except SupervisorUnavailable as exc:
+            return {"success": False, "error": str(exc)}
+        if not result.success or not result.data:
+            return {"success": False, "timed_out": result.timed_out,
+                    "error": result.detail or f"evaluation {result.outcome}"}
+        try:
+            payload = json.loads(result.data.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as exc:
+            return {"success": False, "error": f"could not read the reply: {exc}"}
+        return payload if isinstance(payload, dict) else {"success": True, "value": payload}
 
     def lookup(self, idempotency_key: str) -> str | None:
         """What became of a key, without submitting anything.
