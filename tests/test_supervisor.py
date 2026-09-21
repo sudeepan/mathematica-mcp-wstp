@@ -434,6 +434,118 @@ def test_stopping_refuses_while_the_kernel_is_busy():
         lab.stop()
 
 
+def test_selecting_the_backend_never_starts_one():
+    """Choosing where work runs must not leave a process on the machine.
+
+    The whole reason starting is a separate act is that a supervisor outlives
+    its caller. A backend selection that spawned one would mean an ordinary
+    call could leave a kernel running after everything that knew about it was
+    gone.
+    """
+    from mathematica_wstp import supervisor
+    from mathematica_wstp.evaluator import get_evaluator
+
+    missing = os.path.join(tempfile.mkdtemp(), "absent.sock")
+    before = get_evaluator().name
+    try:
+        supervisor.use(missing)
+        raise AssertionError("it selected a backend that is not there")
+    except supervisor.SupervisorUnavailable as exc:
+        assert "Start one deliberately" in str(exc), str(exc)
+    assert not os.path.exists(missing), "selecting a backend started a supervisor"
+    assert get_evaluator().name == before, "the backend changed despite refusing"
+
+
+def test_notebook_cells_run_in_the_supervisors_kernel():
+    """The milestone's payoff, checked from outside both processes.
+
+    Not "the evaluator reports supervisor" -- that is the component describing
+    itself. The cells are made to record which operating-system process
+    evaluated them, and that pid is compared against the supervisor's kernel
+    and against this process's own.
+    """
+    import uuid as _uuid
+
+    from mathematica_wstp import notebooks, session, supervisor
+    from mathematica_wstp.evaluator import set_evaluator
+
+    lab = Lab().start()
+    nb_path = os.path.join(tempfile.gettempdir(), f"sup-nb-{_uuid.uuid4().hex[:8]}.nb")
+    replay_dir = tempfile.mkdtemp(prefix="sup-nb-m-")
+    os.environ["MATHEMATICA_WSTP_REPLAY_DIR"] = replay_dir
+    previous = None
+    try:
+        # Order matters, and the test has to respect the fact rather than
+        # demonstrate the mistake: the document lives in whichever kernel opened
+        # it, so the backend is chosen first.
+        previous = supervisor.use(lab.sock)
+        assert previous.name == "supervisor", previous.name
+
+        nb = notebooks.get_headless_notebooks()
+        made = nb.create(title="Supervised", path=nb_path)
+        assert made.get("success"), made
+        nbid = made["id"]
+        # $ProcessID is the kernel's own answer to "who am I", so the notebook
+        # layer cannot fake it on the supervisor's behalf.
+        for source in ("whoami = $ProcessID", "sup1 = 6*7"):
+            assert nb.write_cell(source, style="Input", notebook=nbid).get("success")
+
+        replay = nb.replay_cells(notebook=nbid, timeout=60)
+        assert replay["success"], replay
+        cells = replay["cells"]
+        reported = cells[0].get("output", "").strip()
+        assert reported.isdigit(), f"no pid came back: {cells[0]}"
+
+        assert int(reported) == lab.kernel_pid, \
+            f"cells ran in {reported}, supervisor kernel is {lab.kernel_pid}"
+        assert int(reported) != os.getpid(), "cells ran in the test process"
+        if session.has_kernel():
+            own = session.get_kernel(start=False).pid
+            assert int(reported) != own, f"cells ran in this process's own kernel {own}"
+
+        # Identity issued elsewhere, and answerable there afterwards.
+        assert all(c.get("request_id") for c in cells), cells
+        for child in cells:
+            found = previous.lookup(f"{replay['run']}.{child['child']}")
+            assert found and child["request_id"] in found, (child, found)
+    finally:
+        set_evaluator(None)
+        os.environ.pop("MATHEMATICA_WSTP_REPLAY_DIR", None)
+        shutil.rmtree(replay_dir, ignore_errors=True)
+        with contextlib.suppress(OSError):
+            os.unlink(nb_path)
+        lab.stop()
+
+
+def test_a_caller_giving_up_does_not_abandon_the_evaluation():
+    """A wait expiring is the caller's patience ending, not the science.
+
+    With the direct backend there is nothing to distinguish the two: the
+    evaluation belongs to the process that is giving up. Here the request stays
+    in the ledger under the key its caller chose, and is collectable afterwards
+    -- which is the entire difference the supervisor buys.
+    """
+    from mathematica_wstp.supervisor.backend import SupervisorEvaluator
+
+    lab = Lab().start()
+    try:
+        evaluator = SupervisorEvaluator(lab.sock)
+        handle = evaluator.submit_bytes("(Pause[6]; ByteArray[{1}])",
+                                        timeout=60, idempotency_key="patience")
+        gave_up = handle.wait(timeout=1.5)
+        assert gave_up.outcome == "TIMED_OUT", gave_up
+        assert "still recorded" in gave_up.detail, gave_up.detail
+
+        # Nothing was aborted on the way out.
+        assert lab.talk("STATUS").startswith("BUSY"), lab.talk("STATUS")
+        # And the answer can still be collected, by the name the caller chose.
+        assert wait_terminal(lab, handle.request_id, timeout=60)
+        found = evaluator.lookup("patience")
+        assert found and handle.request_id in found, found
+    finally:
+        lab.stop()
+
+
 def _main() -> int:
     tests = [(n, o) for n, o in sorted(globals().items())
              if n.startswith("test_") and callable(o)]

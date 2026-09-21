@@ -882,6 +882,114 @@ def replay(
     return _reply(_condense_replay(payload))
 
 
+@server.tool(
+    description=(
+        "A kernel owned by a separate process, so it outlives this one. "
+        "actions: status | start | stop | use | use_direct | lookup.\n"
+        "WHY: this server's own kernel dies with it -- measured, about a second "
+        "after its owning client is killed. A cell that runs for hours or days "
+        "is therefore only as safe as this process. A supervisor owns the "
+        "kernel instead, keeps a ledger of every request, and can be asked "
+        "afterwards what became of one.\n"
+        "'start' launches one deliberately; nothing starts it implicitly, and "
+        "'use' refuses rather than starting one. 'use' points NOTEBOOK "
+        "execution at it -- evaluate() and vars() keep talking to this "
+        "process's own kernel, so while a supervisor is selected those and "
+        "notebook replay are two different kernels with different definitions. "
+        "'lookup' asks what became of an idempotency key without submitting "
+        "anything, which is how a client that lost its answer recovers.\n"
+        "'stop' and the idle reclaim both refuse while work is in flight or a "
+        "result has not been collected."
+    )
+)
+def supervisor(
+    action: Literal["status", "start", "stop", "use", "use_direct", "lookup"] = "status",
+    socket_path: str | None = None,
+    key: str | None = None,
+) -> dict[str, Any]:
+    from .evaluator import get_evaluator
+    from .supervisor import SupervisorUnavailable, lifecycle
+    from .supervisor import use as use_supervisor
+    from .supervisor import use_direct as use_own
+
+    def described(info) -> dict[str, Any]:
+        return {"success": True, "running": info.running, "socket": info.socket_path,
+                "pid": info.pid, "session": info.session,
+                "kernel_state": info.kernel_state, "stale_socket": info.stale_socket,
+                "detail": info.detail, "backend_in_use": get_evaluator().name}
+
+    if action == "status":
+        return _reply(described(lifecycle.probe(socket_path)))
+
+    if action == "start":
+        info = lifecycle.start(
+            lifecycle.SupervisorConfig.from_env() if socket_path is None
+            else _config_for(socket_path))
+        payload = described(info)
+        if not info.running:
+            payload["success"] = False
+            payload["error"] = f"the supervisor did not come up: {info.detail}"
+        return _reply(payload)
+
+    if action == "stop":
+        info = lifecycle.stop(socket_path)
+        payload = described(info)
+        if info.running:
+            payload["success"] = False
+            payload["error"] = f"not stopped: {info.detail}"
+        return _reply(payload)
+
+    if action == "use":
+        try:
+            evaluator = use_supervisor(socket_path)
+        except SupervisorUnavailable as exc:
+            return _fail(str(exc))
+        stranded = getattr(evaluator, "stranded_notebooks", [])
+        payload = {
+            "success": True, "backend_in_use": evaluator.name,
+            "socket": evaluator.socket_path,
+            "note": ("Notebook execution now runs in the supervisor's kernel. "
+                     "evaluate() and vars() still use this process's own kernel, "
+                     "so the two hold different definitions."),
+        }
+        if stranded:
+            # A notebook lives in the kernel that opened it. Saying so here is
+            # the difference between a caller reopening it and a caller reading
+            # "no such session" later and not knowing why.
+            payload["stranded_notebooks"] = stranded
+            payload["action_required"] = (
+                f"{len(stranded)} notebook(s) were opened in the previous kernel and "
+                "are not reachable from this one. Reopen them before using them.")
+        return _reply(payload)
+
+    if action == "use_direct":
+        return _reply({"success": True, "backend_in_use": use_own().name,
+                       "note": "Notebook execution is back in this process's kernel."})
+
+    if action == "lookup":
+        if not key:
+            return _fail("lookup requires a key (the idempotency key you submitted under)")
+        try:
+            from .supervisor.backend import connect
+            found = connect(socket_path).lookup(key)
+        except SupervisorUnavailable as exc:
+            return _fail(str(exc))
+        if found is None:
+            return _reply({"success": True, "key": key, "found": False,
+                           "note": "never admitted; nothing ran under this key"})
+        return _reply({"success": True, "key": key, "found": True, "record": found})
+
+    return _fail(f"unknown action: {action}")
+
+
+def _config_for(socket_path: str):
+    from .supervisor import SupervisorConfig
+
+    base = SupervisorConfig.from_env()
+    base.sock = socket_path
+    return base
+
+
 # --- reading a notebook without opening a session --------------------------
 
 @server.tool(
@@ -1160,7 +1268,7 @@ _BATCH_EXCLUDED = {"batch"}
 def _batchable() -> dict[str, Any]:
     names = ("evaluate", "abort", "kernel", "status", "notebooks", "cells",
              "evaluate_cells", "edit_cells", "render", "vars", "guide",
-             "verify_derivation", "read_notebook_file", "replay")
+             "verify_derivation", "read_notebook_file", "replay", "supervisor")
     return {n: globals()[n] for n in names if n not in _BATCH_EXCLUDED}
 
 
