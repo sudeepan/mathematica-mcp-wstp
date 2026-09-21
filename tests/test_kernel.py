@@ -18,11 +18,13 @@ from __future__ import annotations
 
 import contextlib
 import os
+import shutil
 import signal
 import tempfile
 import sys
 import threading
 import time
+from datetime import datetime
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
@@ -1263,6 +1265,131 @@ def test_subkernels_are_tracked_and_reaped():
         time.sleep(0.2)
     survivors = [p for p in pids if registry.pid_alive(p)]
     assert not survivors, f"subkernels leaked: {survivors}"
+
+
+def test_a_deadline_is_created_at_submission_not_at_planning():
+    """A planned child has a budget; only a submitted one has a deadline.
+
+    A child can sit PLANNED for hours behind earlier cells. A deadline written
+    when the run was planned would be computed from a clock that had not
+    started, and would read -- to whoever is trying to work out days later
+    whether a computation should still be alive -- exactly like one that had.
+    That is the shape of false record this layer exists to refuse.
+    """
+    import uuid as _uuid
+
+    from mathematica_wstp.replay_manifest import (
+        ReplayManifest, past_deadline, utc_stamp)
+
+    replay_dir = os.path.join(tempfile.gettempdir(), f"deadline-m-{_uuid.uuid4().hex[:8]}")
+    os.environ["MATHEMATICA_WSTP_REPLAY_DIR"] = replay_dir
+    try:
+        plan = [{"ordinal": n, "child_id": f"c{n}", "idempotency_key": f"R1.c{n}",
+                 "input_digest": None} for n in (1, 2)]
+        manifest = ReplayManifest.create("/tmp/whatever.nb", "hnb1", "R1", plan,
+                                         execution_timeout_seconds=259200)
+
+        # Read from disk, not from the object we just built: the record that
+        # matters is the one a different process would find.
+        fresh = ReplayManifest.load(manifest.path)
+        for child in fresh.data["children"]:
+            assert child["state"] == "PLANNED", child
+            assert child["execution_timeout_seconds"] == 259200, child
+            assert child["submitted_at_utc"] is None, child
+            assert child["execution_deadline_utc"] is None, child
+
+        manifest.submit(1)
+        fresh = ReplayManifest.load(manifest.path)
+        first, second = fresh.data["children"]
+
+        assert first["state"] == "SUBMITTED", first
+        assert first["submitted_at_utc"], first
+        assert first["execution_deadline_utc"], first
+        # The deadline is the budget applied to the submission time, and a
+        # three-day allowance must survive as three days rather than be
+        # silently clamped somewhere on the way to disk.
+        started = datetime.fromisoformat(first["submitted_at_utc"])
+        expires = datetime.fromisoformat(first["execution_deadline_utc"])
+        assert (expires - started).total_seconds() == 259200, (started, expires)
+
+        # The child that was never handed over still has no deadline.
+        assert second["state"] == "PLANNED", second
+        assert second["execution_deadline_utc"] is None, second
+
+        # And the policy is visible without walking the children.
+        assert fresh.summary()["execution_timeout_seconds"] == 259200, fresh.summary()
+
+        # Compared as instants, not as strings.
+        assert past_deadline(utc_stamp(time.time() - 60)) is True
+        assert past_deadline(utc_stamp(time.time() + 60)) is False
+        assert past_deadline(None) is None
+        assert past_deadline("not a timestamp") is None
+    finally:
+        os.environ.pop("MATHEMATICA_WSTP_REPLAY_DIR", None)
+        shutil.rmtree(replay_dir, ignore_errors=True)
+
+
+def test_a_replay_says_what_timeout_it_ran_under():
+    """The effective budget must not stay an invisible default.
+
+    Three entry points carry three different defaults. A notebook whose cells
+    need minutes, replayed under a default of seconds, reports timed-out cells
+    -- which reads as the science failing rather than as the caller having
+    inherited a number nobody chose. So every path says which budget was in
+    force, and reconciliation carries it alongside the state it explains.
+    """
+    import uuid as _uuid
+
+    from mathematica_wstp import notebooks
+    from mathematica_wstp.replay_manifest import ReplayManifest
+
+    path = os.path.join(tempfile.gettempdir(), f"budget-{_uuid.uuid4().hex[:8]}.nb")
+    replay_dir = os.path.join(tempfile.gettempdir(), f"budget-m-{_uuid.uuid4().hex[:8]}")
+    os.environ["MATHEMATICA_WSTP_REPLAY_DIR"] = replay_dir
+    try:
+        nb = notebooks.get_headless_notebooks()
+        made = nb.create(title="Budget", path=path)
+        assert made.get("success"), made
+        nbid = made["id"]
+        for source in ("b1 = 1", "b2 = 2"):
+            assert nb.write_cell(source, style="Input", notebook=nbid).get("success")
+
+        replay = nb.replay_cells(notebook=nbid, timeout=45)
+        assert replay["success"], replay
+        assert replay["summary"]["execution_timeout_seconds"] == 45, replay["summary"]
+
+        # Every child records it, durably.
+        fresh = ReplayManifest.load(replay["manifest"])
+        for child in fresh.data["children"]:
+            assert child["execution_timeout_seconds"] == 45, child
+            assert child["submitted_at_utc"], child
+            assert child["execution_deadline_utc"], child
+
+        # The span path announces its own budget too -- that is the one an
+        # agent reaches today.
+        span = nb.evaluate_range(0, -1, notebook=nbid, timeout=90)
+        assert span.get("execution_timeout_seconds") == 90, span
+
+        one = nb.evaluate_cell(0, notebook=nbid, timeout=30)
+        assert one.get("execution_timeout_seconds") == 30, one
+
+        # Reconciliation keeps the policy beside the state. A STILL_RUNNING
+        # verdict that cannot say until when is not actionable.
+        manifest = ReplayManifest.load(replay["manifest"])
+        manifest.submit(2)
+        seen = nb.reconcile_replay(
+            replay["manifest"], notebook=nbid,
+            evaluator_lookup=lambda key: f"{key} -> E7 state=RUNNING token=K1/V2/E7")
+        running = [c for c in seen["children"] if c["verdict"] == "STILL_RUNNING"]
+        assert len(running) == 1, seen["children"]
+        assert running[0]["execution_timeout_seconds"] == 45, running[0]
+        assert running[0]["submitted_at_utc"], running[0]
+        assert running[0]["past_deadline"] is False, running[0]
+    finally:
+        os.environ.pop("MATHEMATICA_WSTP_REPLAY_DIR", None)
+        shutil.rmtree(replay_dir, ignore_errors=True)
+        with contextlib.suppress(OSError):
+            os.unlink(path)
 
 
 # --- standalone runner -----------------------------------------------------

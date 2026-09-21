@@ -22,6 +22,14 @@ different facts and must not be collapsed:
 
 A saved-to-disk state belongs above this and is not claimed here: the notebook
 file is only written when something saves it.
+
+Each child also carries the execution policy it was planned under. The timeout
+is known when the run is planned; the absolute deadline is not, because a child
+may wait hours behind earlier cells before anything starts its clock. So the
+deadline is stamped at the PLANNED -> SUBMITTED transition and nowhere else. A
+deadline written at planning time would be a statement about a clock that had
+not started, which is the kind of plausible-but-false record this whole layer
+exists to avoid.
 """
 
 from __future__ import annotations
@@ -31,10 +39,36 @@ import json
 import os
 import tempfile
 import time
+from datetime import datetime, timezone
 from typing import Any
 
 SCHEMA = "replay-manifest-v1"
 DEFAULT_DIRNAME = ".mcp-replays"
+
+
+def utc_stamp(when: float) -> str:
+    """An absolute time in a form that needs no interpretation to read.
+
+    ``created`` below is a bare epoch float and stays one: nothing reads it but
+    code. These fields are for whoever is trying to work out, possibly days
+    later, whether a computation should still be running.
+    """
+    return datetime.fromtimestamp(when, timezone.utc).isoformat(timespec="seconds")
+
+
+def past_deadline(stamp: str | None) -> bool | None:
+    """Has an absolute deadline already passed? None when there isn't one.
+
+    Compared as instants rather than as strings: two stamps that mean the same
+    moment can be written differently, and a lexicographic comparison would
+    quietly be wrong exactly then.
+    """
+    if not stamp:
+        return None
+    try:
+        return datetime.fromisoformat(stamp) < datetime.now(timezone.utc)
+    except ValueError:
+        return None
 
 
 def manifest_dir(notebook_path: str) -> str:
@@ -82,8 +116,16 @@ class ReplayManifest:
 
     @classmethod
     def create(cls, notebook_path: str, notebook_id: str, run_id: str,
-               plan: list[dict[str, Any]], notebook_digest: str | None = None) -> ReplayManifest:
-        """Persist the plan. Returns only once it is on disk and fsynced."""
+               plan: list[dict[str, Any]], notebook_digest: str | None = None,
+               execution_timeout_seconds: int | None = None) -> ReplayManifest:
+        """Persist the plan. Returns only once it is on disk and fsynced.
+
+        ``execution_timeout_seconds`` is the per-cell budget this run was
+        launched with. It is recorded per child rather than once for the run so
+        that reconciliation reads the policy from the same record as the state
+        it is judging, and so a future run with per-child budgets needs no
+        second source of truth.
+        """
         path = os.path.join(manifest_dir(notebook_path), f"{run_id}.json")
         data = {
             "schema": SCHEMA,
@@ -98,6 +140,10 @@ class ReplayManifest:
                  "idempotency_key": item["idempotency_key"],
                  "input_digest": item.get("input_digest"),
                  "state": "PLANNED",
+                 "execution_timeout_seconds": execution_timeout_seconds,
+                 # Assigned at SUBMITTED, not here. See the module docstring.
+                 "submitted_at_utc": None,
+                 "execution_deadline_utc": None,
                  "request_id": None,
                  "evaluation_token": None,
                  "backend": None,
@@ -130,6 +176,23 @@ class ReplayManifest:
             if entry["ordinal"] == ordinal:
                 return entry
         return None
+
+    def submit(self, ordinal: int) -> None:
+        """Record that a child has been handed to an evaluator, and start its clock.
+
+        Separate from ``mark`` because this is the one transition that creates
+        an absolute deadline, and it must not be reachable by accident from
+        anywhere else.
+        """
+        entry = self.child(ordinal)
+        if entry is None:
+            return
+        now = time.time()
+        budget = entry.get("execution_timeout_seconds")
+        entry["state"] = "SUBMITTED"
+        entry["submitted_at_utc"] = utc_stamp(now)
+        entry["execution_deadline_utc"] = utc_stamp(now + budget) if budget else None
+        _write_atomically(self.path, self.data)
 
     def mark(self, ordinal: int, **fields: Any) -> None:
         """Record what is now known about one child, durably."""
@@ -169,5 +232,10 @@ class ReplayManifest:
         states: dict[str, int] = {}
         for entry in self.data["children"]:
             states[entry["state"]] = states.get(entry["state"], 0) + 1
+        budgets = sorted({c.get("execution_timeout_seconds")
+                          for c in self.data["children"]} - {None})
         return {"run_id": self.run_id, "path": self.path,
-                "children": len(self.data["children"]), "states": states}
+                "children": len(self.data["children"]), "states": states,
+                # Derived rather than stored: a second copy of the policy is a
+                # second thing that can be wrong.
+                "execution_timeout_seconds": budgets[0] if len(budgets) == 1 else budgets}

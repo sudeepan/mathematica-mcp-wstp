@@ -65,6 +65,20 @@ class _Session:
     created: bool = False  # True when opened via create rather than from disk
 
 
+def _with_timeout_policy(reply: dict[str, Any], timeout: int) -> dict[str, Any]:
+    """Say which per-cell budget a call actually ran under.
+
+    Three entry points have three different defaults, and none of them used to
+    announce the one in force. A notebook whose cells need minutes, replayed
+    under a default of seconds, reports timed-out cells -- which reads as the
+    science failing rather than as the caller having inherited a number they
+    never chose. ``setdefault`` so a helper that reports its own budget wins.
+    """
+    if isinstance(reply, dict):
+        reply.setdefault("execution_timeout_seconds", int(timeout))
+    return reply
+
+
 @dataclass
 class HeadlessNotebooks:
     """Front-end-free notebook sessions backed by the persistent kernel."""
@@ -354,9 +368,10 @@ class HeadlessNotebooks:
         notebook_id = self._resolve(notebook)
         if notebook_id is None:
             return self._no_session(notebook)
-        return self._call_with_session(
+        reply = self._call_with_session(
             "MCPEvaluateCell", notebook_id, int(index), int(timeout), timeout=timeout + 15
         )
+        return _with_timeout_policy(reply, timeout)
 
     def verify_against(self, reference: str, notebook: str | None = None,
                        timeout: int = 300) -> dict[str, Any]:
@@ -401,7 +416,7 @@ class HeadlessNotebooks:
             os.unlink(sentinel)
         _session.set_abort_sentinel(sentinel)
         try:
-            return self._call_with_session(
+            reply = self._call_with_session(
                 "MCPEvaluateRange",
                 notebook_id,
                 int(start),
@@ -412,6 +427,7 @@ class HeadlessNotebooks:
                 sentinel,
                 timeout=timeout * span + 30,
             )
+            return _with_timeout_policy(reply, timeout)
         finally:
             _session.set_abort_sentinel(None)
             with contextlib.suppress(OSError):
@@ -485,7 +501,8 @@ class HeadlessNotebooks:
         manifest = None
         try:
             manifest = ReplayManifest.create(
-                self._sessions[notebook_id].path, notebook_id, run_id, plan)
+                self._sessions[notebook_id].path, notebook_id, run_id, plan,
+                execution_timeout_seconds=int(timeout))
         except OSError as exc:
             logger.warning("could not persist the replay manifest: %s", exc)
 
@@ -512,7 +529,10 @@ class HeadlessNotebooks:
         for ordinal in range(first, upper + 1):
             child = f"c{ordinal}"
             if manifest:
-                manifest.mark(ordinal, state="SUBMITTED")
+                # submit(), not mark(state=...): this transition is where the
+                # absolute deadline comes from, and it exists in one place so a
+                # child cannot acquire a deadline without a submission time.
+                manifest.submit(ordinal)
             reply = self._call_with_session(
                 "MCPEvaluateInput", notebook_id, int(ordinal), int(timeout),
                 bool(write_outputs), sentinel,
@@ -576,6 +596,12 @@ class HeadlessNotebooks:
             "summary": {"inputs": total, "attempted": len(cells), "executed": executed,
                         "skipped": skipped, "failed": failed,
                         "stopped_at_ordinal": stopped_at,
+                        # The budget every cell ran under. A caller that did not
+                        # pass one inherited a default, and the point of saying
+                        # so here is that it stops being invisible: a notebook
+                        # with hour-long cells replayed under the default would
+                        # otherwise look like a notebook of failing cells.
+                        "execution_timeout_seconds": int(timeout),
                         "seconds": round(time.time() - started, 2)},
             "cells": cells,
         }
@@ -611,7 +637,7 @@ class HeadlessNotebooks:
         dependency graph the notebook layer cannot know otherwise. The completed
         prefix is preserved rather than discarded: what ran, ran.
         """
-        from .replay_manifest import ReplayManifest
+        from .replay_manifest import ReplayManifest, past_deadline
 
         try:
             manifest = ReplayManifest.load(manifest_path)
@@ -658,7 +684,14 @@ class HeadlessNotebooks:
             ordinal = entry["ordinal"]
             record = {"ordinal": ordinal, "child_id": entry["child_id"],
                       "recorded_state": entry["state"],
-                      "idempotency_key": entry["idempotency_key"]}
+                      "idempotency_key": entry["idempotency_key"],
+                      # The policy travels with the state it explains. Without
+                      # it a STILL_RUNNING verdict says a computation is alive
+                      # but not until when, which is the one thing a caller
+                      # deciding whether to wait actually needs.
+                      "execution_timeout_seconds": entry.get("execution_timeout_seconds"),
+                      "submitted_at_utc": entry.get("submitted_at_utc"),
+                      "execution_deadline_utc": entry.get("execution_deadline_utc")}
             now = current.get(ordinal)
             if source_check != "done":
                 pass                                   # cannot judge the source yet
@@ -698,6 +731,13 @@ class HeadlessNotebooks:
                     # does not abort other people's science on its own.
                     record["verdict"] = "STILL_RUNNING"
                     record["found"] = found
+                    # Reported, never acted on. Whether a computation past its
+                    # deadline should be abandoned is the caller's decision;
+                    # this layer does not end other people's science on a clock
+                    # it merely wrote down.
+                    expired = past_deadline(entry.get("execution_deadline_utc"))
+                    if expired is not None:
+                        record["past_deadline"] = expired
                 elif found:
                     record["verdict"] = "RECOVERED"
                     record["found"] = found
