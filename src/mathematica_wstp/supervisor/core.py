@@ -848,6 +848,19 @@ def recover_quarantined_kernel(rid):
 
 
 def kernel_state():
+    # Asked first, because every other answer presupposes it. A kernel killed
+    # from outside -- by an operator, by the OOM killer, by a signal to its
+    # process group -- leaves every recorded state untouched, so readiness
+    # still says READY and a running request still says RUNNING. Measured: a
+    # kernel reduced to a zombie was reported READY, IDLE and RESPONSIVE, which
+    # is precisely the accurate-in-form, false-in-substance report this layer
+    # exists to refuse.
+    if kern[0] is None:
+        return "NO_KERNEL"
+    if _dead(kern[0].pid):
+        running = [i for i, e in ledger.items() if e["state"] == "RUNNING"]
+        lost = f" lost={running[0]}" if running else ""
+        return f"DEAD pid={kern[0].pid} generation=K{kernel_gen[0]}{lost}"
     if faulted[0]:
         return f"FAULTED {faulted[0]}"
     for i, e in ledger.items():
@@ -1037,6 +1050,16 @@ def serve(conn):
                            f"clients={clients[0] - 1}")
             elif cmd == "READINESS":
                 with lock:
+                    # Readiness is recorded when something happens TO the
+                    # kernel. Nothing happens to this record when the kernel
+                    # simply ceases to exist, so the process is checked here
+                    # rather than trusted from the last thing we wrote down.
+                    if kern[0] is not None and _dead(kern[0].pid):
+                        if readiness[0] != "DEAD":
+                            readiness[0] = "DEAD"
+                            health_note[0] = "the kernel process is gone"
+                            event("KERNEL_FOUND_DEAD", pid=kern[0].pid,
+                                  generation=f"K{kernel_gen[0]}")
                     res = f"{readiness[0]} generation=K{kernel_gen[0]} pid={kern[0].pid}" + (
                         f" note={health_note[0]}" if health_note[0] else "")
             elif cmd == "SESSION":
@@ -1173,6 +1196,11 @@ def reclaimable(now: float | None = None, discount_clients: int = 0) -> str:
     """
     now = now if now is not None else time.time()
     state = kernel_state()
+    if state.startswith("DEAD") or state.startswith("NO_KERNEL"):
+        # Nothing to protect and nothing to wait for. Holding a supervisor
+        # whose kernel is gone keeps a socket alive that answers every question
+        # with a corpse.
+        return ""
     if not state.startswith("IDLE"):
         return state.split()[0]
     # ``discount_clients`` is how a client asks about a laboratory without its

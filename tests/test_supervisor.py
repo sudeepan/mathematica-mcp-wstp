@@ -893,6 +893,126 @@ def test_both_backends_report_an_evaluation_the_same_way():
         lab.stop()
 
 
+def test_a_dead_kernel_is_not_reported_as_ready():
+    """The failure this catches was observed, not imagined.
+
+    A supervisor's kernel was killed from outside -- a signal to its process
+    group -- and afterwards the supervisor reported READY, IDLE and
+    RESPONSIVE about a process that had become a zombie. Nothing happens to a
+    recorded readiness when a process simply ceases to exist, so the record
+    stayed true to the last thing that happened TO the kernel and false about
+    the kernel.
+    """
+    lab = Lab().start()
+    try:
+        assert lab.talk("READINESS").startswith("READY"), lab.talk("READINESS")
+        assert lab.talk("STATUS").startswith("IDLE"), lab.talk("STATUS")
+
+        # Kill it the way an operator, the OOM killer or a stray signal would:
+        # from outside, with the supervisor never told.
+        os.kill(lab.kernel_pid, signal.SIGKILL)
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            try:
+                st = open(f"/proc/{lab.kernel_pid}/stat").read()
+                if st[st.rindex(")") + 2:].split()[0] == "Z":
+                    break
+            except OSError:
+                break
+            time.sleep(0.2)
+
+        readiness, status = lab.talk("READINESS"), lab.talk("STATUS")
+        assert readiness.startswith("DEAD"), f"a dead kernel reported as: {readiness}"
+        assert status.startswith("DEAD"), f"a dead kernel reported as: {status}"
+        assert "gone" in readiness, readiness
+        # And it is recorded, not merely answered when asked.
+        assert any("KERNEL_FOUND_DEAD" in ln for ln in lab.audit_lines()), lab.audit_lines()[-3:]
+    finally:
+        lab.stop()
+
+
+def test_a_supervisor_whose_kernel_died_does_not_hold_itself_open():
+    """A laboratory with no kernel has nothing to protect.
+
+    The reclaim rule refuses to release anything that is not IDLE, which was
+    right for every state it had been taught about and wrong for this one: a
+    supervisor whose kernel is gone would have been held indefinitely,
+    answering every question with a corpse.
+    """
+    lab = Lab().start(SUP_RECLAIM_AFTER="2", SUP_RECLAIM_CHECK_EVERY="1")
+    try:
+        os.kill(lab.kernel_pid, signal.SIGKILL)
+        # The property is that it lets go, so wait for that rather than for a
+        # particular intermediate answer: the first version of this asked
+        # RECLAIM two seconds in and got a connection refused, because the
+        # reaper had already done its job and gone.
+        deadline = time.monotonic() + 40
+        while time.monotonic() < deadline:
+            if lab.proc.poll() is not None:
+                break
+            with contextlib.suppress(OSError):
+                if lab.talk("RECLAIM").startswith("RECLAIMABLE"):
+                    pass          # seen mid-flight; it will exit on the next tick
+            time.sleep(0.5)
+        assert lab.proc.poll() is not None, "the supervisor outlived its kernel indefinitely"
+        lines = lab.audit_lines()
+        assert any("SUPERVISOR_DOWN" in ln for ln in lines), lines[-3:]
+    finally:
+        lab.stop()
+
+
+def test_a_run_can_be_aborted_by_a_client_that_did_not_start_it():
+    """The capability whose absence made a real run unstoppable.
+
+    A replay was started, its client died, and the evaluation continued with
+    nobody able to stop it: abort() and kernel(action="abort") reach this
+    process's kernel and reported success about an idle one, while the handle
+    that could have aborted the real evaluation belonged to a replay loop that
+    had already gone. Naming the evaluation through the supervisor is what
+    makes it reachable.
+    """
+    from mathematica_wstp.supervisor.backend import SupervisorEvaluator
+
+    lab = Lab().start()
+    try:
+        evaluator = SupervisorEvaluator(lab.sock)
+        assert evaluator.running() is None, evaluator.running()
+        assert evaluator.abort_running().startswith("REFUSED"), \
+            "an abort at an idle kernel must be refused, not delivered"
+
+        # Submit, then throw away the handle entirely -- this is the situation
+        # after a replay loop has died.
+        evaluator.submit_bytes("(Pause[120]; ByteArray[{1}])", timeout=600,
+                               idempotency_key="unstoppable")
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            if lab.talk("STATUS").startswith("BUSY"):
+                break
+            time.sleep(0.2)
+        else:
+            raise AssertionError("the evaluation never reached the kernel")
+
+        # A different client object, holding nothing, finds it and stops it.
+        stranger = SupervisorEvaluator(lab.sock)
+        found = stranger.running()
+        assert found and found["token"], found
+        outcome = stranger.abort_running()
+        assert outcome.startswith("ABORT_ISSUED"), outcome
+
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            if not lab.talk("STATUS").startswith("BUSY"):
+                break
+            time.sleep(0.5)
+        assert not lab.talk("STATUS").startswith("BUSY"), lab.talk("STATUS")
+        # The kernel survived being interrupted; only the evaluation ended.
+        assert os.path.exists(f"/proc/{lab.kernel_pid}"), "the abort took the kernel with it"
+        assert lab.talk("READINESS").startswith(("READY", "HEALTH_UNVERIFIED")), \
+            lab.talk("READINESS")
+    finally:
+        lab.stop()
+
+
 def _main() -> int:
     tests = [(n, o) for n, o in sorted(globals().items())
              if n.startswith("test_") and callable(o)]

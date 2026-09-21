@@ -278,6 +278,38 @@ class SupervisorEvaluator:
             return {"success": False, "error": f"could not read the reply: {exc}"}
         return payload if isinstance(payload, dict) else {"success": True, "value": payload}
 
+    def running(self) -> dict[str, str] | None:
+        """The evaluation in the kernel right now, if there is one.
+
+        A client that did not submit the work still has to be able to find it.
+        Without this the only way to name a running evaluation was to be
+        holding the handle that started it, which is exactly what a client that
+        reconnected, or one whose replay loop has died, does not have.
+        """
+        state = self.talk("STATUS")
+        if not state.startswith("BUSY"):
+            return None
+        parts = state.split()
+        return {"state": parts[0], "request_id": parts[1] if len(parts) > 1 else "",
+                "token": _field(state, "token") or "",
+                "elapsed": _field(state, "elapsed") or "",
+                "abort": _field(state, "abort") or "", "detail": state}
+
+    def abort_running(self) -> str:
+        """Interrupt whatever this laboratory is evaluating, by its token.
+
+        Still scoped to a token -- the token is looked up rather than supplied,
+        so this cannot become "abort whatever is running by the time the
+        message arrives". If nothing is running it refuses, because an abort
+        delivered to an idle kernel leaves an interrupt pending and wedges it.
+        """
+        current = self.running()
+        if current is None:
+            return "REFUSED nothing is running"
+        if not current["token"] or current["token"] == "none":
+            return f"REFUSED {current['request_id']} has no token; it never activated"
+        return self.talk(f"ABORT {current['token']}")
+
     def lookup(self, idempotency_key: str) -> str | None:
         """What became of a key, without submitting anything.
 

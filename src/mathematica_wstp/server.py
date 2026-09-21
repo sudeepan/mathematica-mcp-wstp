@@ -902,13 +902,19 @@ def replay(
         "process's own kernel, so while a supervisor is selected those and "
         "notebook replay are two different kernels with different definitions. "
         "'lookup' asks what became of an idempotency key without submitting "
-        "anything, which is how a client that lost its answer recovers.\n"
+        "anything, which is how a client that lost its answer recovers. "
+        "'running' names the evaluation in the supervisor's kernel and 'abort' "
+        "interrupts it by its token -- USE THESE, not abort() or "
+        "kernel(action='abort'), which reach THIS process's kernel and will "
+        "cheerfully report success about an idle one while the supervised run "
+        "continues.\n"
         "'stop' and the idle reclaim both refuse while work is in flight or a "
         "result has not been collected."
     )
 )
 def supervisor(
-    action: Literal["status", "start", "stop", "use", "use_direct", "lookup"] = "status",
+    action: Literal["status", "start", "stop", "use", "use_direct", "lookup",
+                    "running", "abort"] = "status",
     socket_path: str | None = None,
     key: str | None = None,
 ) -> dict[str, Any]:
@@ -970,6 +976,38 @@ def supervisor(
     if action == "use_direct":
         return _reply({"success": True, "backend_in_use": use_own().name,
                        "note": "Notebook execution is back in this process's kernel."})
+
+    if action in ("running", "abort"):
+        # abort() and kernel(action="abort") reach THIS process's kernel. When
+        # a supervisor owns the kernel they are aimed at the wrong one and
+        # report success about an idle kernel, which is how a run became
+        # unstoppable: the handle that could abort it belonged to a replay loop
+        # that had already gone.
+        try:
+            from .supervisor.backend import connect
+            backend = connect(socket_path)
+            current = backend.running()
+        except SupervisorUnavailable as exc:
+            return _fail(str(exc))
+        if action == "running":
+            if current is None:
+                return _reply({"success": True, "running": False,
+                               "note": "the supervisor's kernel is not evaluating anything"})
+            return _reply({"success": True, "running": True, **current})
+        if current is None:
+            return _fail("nothing is running in the supervisor's kernel",
+                         hint="an abort sent to an idle kernel leaves an interrupt "
+                              "pending and wedges it, so this refuses instead")
+        outcome = backend.abort_running()
+        return _reply({
+            "success": outcome.startswith("ABORT_ISSUED"),
+            "request_id": current["request_id"], "token": current["token"],
+            "outcome": outcome, "state_before": current["detail"],
+            "note": ("Issued, not confirmed. Read supervisor(action='status') to see "
+                     "whether it landed: an evaluation blocked on parallel subkernels "
+                     "may not answer an abort at all, and the reply will say "
+                     "abort=UNCONFIRMED rather than pretend otherwise."),
+        })
 
     if action == "lookup":
         if not key:
