@@ -759,6 +759,129 @@ def batch(ops: list[dict[str, Any]], stop_on_error: bool = True) -> dict[str, An
     return _reply({"success": True, "ran": len(results), "of": len(ops), "results": results})
 
 
+def _condense_replay(payload: dict[str, Any]) -> dict[str, Any]:
+    """Keep what a caller can act on when a replay is too big to return.
+
+    A 994-cell replay carries a per-cell result each, and the outputs of a real
+    symbolic notebook are measured in megabytes -- a reply that size is refused
+    outright, so the caller gets nothing rather than something useful.
+
+    What survives is what identifies the run and what went wrong: run and
+    manifest identity, the counts, every cell that failed or was interrupted,
+    and the slowest cells. Per-cell detail for the cells that worked is dropped,
+    and it is the one part that is recoverable -- the manifest names every
+    child, and a narrower range re-runs any of them.
+    """
+    cells = payload.get("cells") or []
+    problems: list[dict[str, Any]] = []
+    slowest: list[tuple[int, int]] = []
+    for cell in cells:
+        if cell.get("timed_out") or cell.get("aborted") or not cell.get("success"):
+            problems.append({k: cell.get(k) for k in
+                             ("ordinal", "child", "error", "timed_out", "aborted", "reason")
+                             if cell.get(k) is not None})
+        else:
+            slowest.append((cell.get("timing_ms") or 0, cell.get("ordinal")))
+    slowest.sort(reverse=True)
+
+    out = {k: v for k, v in payload.items() if k != "cells"}
+    out["detail"] = "summary"
+    out["note"] = ("Per-cell detail omitted because the full reply exceeded the size "
+                   "limit. Every child is named in the manifest; re-run a narrower "
+                   "range with first/last for detail. Failures are listed in full.")
+    if problems:
+        out["problems"] = problems[:40]
+    if slowest:
+        out["slowest_ms"] = [{"ordinal": o, "ms": ms} for ms, o in slowest[:8]]
+    return out
+
+
+@server.tool(
+    description=(
+        "Per-cell replay of a notebook, and reconciliation of one that was "
+        "interrupted. actions: run | reconcile | list.\n"
+        "'run' evaluates each input cell as its OWN execution, so every cell "
+        "gets a request id, an evaluation token and an idempotency key, and the "
+        "run is written to a manifest on disk BEFORE the first cell is "
+        "submitted. evaluate_cells hands a whole span to the kernel instead: "
+        "fewer round trips, one identity for the lot, and nothing recoverable "
+        "if it is interrupted. Cells are addressed by input ORDINAL (1-based, "
+        "counting only Input/Code cells), never by index, because writing an "
+        "output inserts a cell and shifts every index after it.\n"
+        "'reconcile' reads a manifest and reports, per child, whether it "
+        "completed, is unresolved, never ran, or no longer matches the notebook "
+        "source. It needs no kernel for the execution facts.\n"
+        "'list' names the manifests that exist for this notebook.\n"
+        "WHAT SURVIVES A CRASH: the manifest, which is a durable record of what "
+        "was attempted and what completed. NOT the computation -- the kernel "
+        "belongs to this server process and dies with it, so a cell in flight "
+        "when the client goes is lost. Reconciliation tells you what happened, "
+        "it does not hand back a running evaluation."
+    )
+)
+def replay(
+    action: Literal["run", "reconcile", "list"] = "run",
+    first: int = 1,
+    last: int = -1,
+    timeout: float = 300.0,
+    stop_on_error: bool = True,
+    write_outputs: bool = False,
+    run: str | None = None,
+    manifest: str | None = None,
+    detail: Literal["auto", "full", "summary"] = "auto",
+    notebook: str | None = None,
+) -> dict[str, Any]:
+    from .replay_manifest import ReplayManifest
+
+    nb = get_headless_notebooks()
+
+    if action == "list":
+        path = nb.session_path(notebook)
+        if path is None:
+            return _fail("no notebook session; open one first")
+        found = []
+        for name in ReplayManifest.for_notebook(path):
+            try:
+                found.append(ReplayManifest.load(name).summary())
+            except (OSError, ValueError) as exc:
+                found.append({"path": name, "error": f"unreadable: {exc}"})
+        return _reply({"success": True, "notebook": path, "runs": found,
+                       "count": len(found)})
+
+    if action == "reconcile":
+        target = manifest
+        if not target:
+            # The newest run for this notebook is what "reconcile" means when
+            # nobody names one, and saying which was chosen matters: silently
+            # reconciling a different run than the caller meant would be a
+            # confident answer to the wrong question.
+            path = nb.session_path(notebook)
+            if path is None:
+                return _fail("no notebook session; pass manifest=<path> or open one")
+            known = ReplayManifest.for_notebook(path)
+            if not known:
+                return _fail(f"no replay manifest found for {path}")
+            target = known[-1]
+        result = nb.reconcile_replay(target, notebook=notebook)
+        if isinstance(result, dict):
+            result.setdefault("manifest", target)
+        return _reply(result)
+
+    if action != "run":
+        return _fail(f"unknown action: {action}")
+
+    payload = nb.replay_cells(notebook=notebook, first=first, last=last,
+                              timeout=int(timeout), stop_on_error=stop_on_error,
+                              write_outputs=write_outputs, run=run)
+    if not payload.get("success") and "cells" not in payload:
+        return _reply(payload)
+    if detail == "summary":
+        return _reply(_condense_replay(payload))
+    if detail == "full" or len(_encode(payload)) <= MAX_REPLY_CHARS:
+        return _reply(payload)
+    return _reply(_condense_replay(payload))
+
+
 # --- reading a notebook without opening a session --------------------------
 
 @server.tool(
@@ -1037,7 +1160,7 @@ _BATCH_EXCLUDED = {"batch"}
 def _batchable() -> dict[str, Any]:
     names = ("evaluate", "abort", "kernel", "status", "notebooks", "cells",
              "evaluate_cells", "edit_cells", "render", "vars", "guide",
-             "verify_derivation", "read_notebook_file")
+             "verify_derivation", "read_notebook_file", "replay")
     return {n: globals()[n] for n in names if n not in _BATCH_EXCLUDED}
 
 

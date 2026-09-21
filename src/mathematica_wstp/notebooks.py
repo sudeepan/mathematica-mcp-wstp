@@ -326,6 +326,19 @@ class HeadlessNotebooks:
                 out["unregistered"] = stray
         return out
 
+    def session_path(self, notebook: str | None = None) -> str | None:
+        """The file a session is bound to, without asking the kernel anything.
+
+        Listing or reconciling a replay has to work while the kernel is busy
+        with the very run being asked about, so this deliberately costs no
+        round trip. ``info`` answers the same question but needs the kernel.
+        """
+        notebook_id = self._resolve(notebook)
+        if notebook_id is None:
+            return None
+        with _registry_lock:
+            return self._sessions[notebook_id].path
+
     def info(self, notebook: str | None = None) -> dict[str, Any]:
         notebook_id = self._resolve(notebook)
         if notebook_id is None:

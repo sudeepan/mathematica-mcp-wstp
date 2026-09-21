@@ -1567,6 +1567,221 @@ def check_an_oversized_cell_listing_degrades_instead_of_breaking() -> list[tuple
     return out
 
 
+def check_per_cell_replay_is_reachable_from_the_protocol() -> list[tuple[str, bool, str]]:
+    """The per-cell architecture must be usable by an agent, not only by a script.
+
+    Every guarantee Phases A-D established -- per-cell identity, the durable
+    manifest, reconciliation after a client dies, source-divergence detection
+    -- lived on a Python method with no tool registration. An agent talking to
+    this server reached the span path and nothing else, so the architecture
+    that was validated was not the one anybody would actually use. These
+    checks cross the protocol boundary, because reachability from inside the
+    process is exactly what was never in doubt.
+    """
+    import subprocess
+    import tempfile
+
+    out: list[tuple[str, bool, str]] = []
+    replay_dir = tempfile.mkdtemp(prefix="mcp-replay-")
+    src = tempfile.NamedTemporaryFile("w", suffix=".nb", delete=False)
+    src.write("Notebook[{"
+              + ",".join('Cell[BoxData["r%d = %d"], "Input"]' % (i, i) for i in (1, 2, 3))
+              + "}]")
+    src.close()
+
+    srv = subprocess.Popen(
+        [PARAMS.command, *PARAMS.args], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL, text=True, bufsize=1, cwd=ROOT,
+        env={**PARAMS.env, "MATHEMATICA_WSTP_REPLAY_DIR": replay_dir})
+    counter = [0]
+
+    def rpc(method: str, params=None, notify: bool = False):
+        msg: dict = {"jsonrpc": "2.0", "method": method}
+        if params is not None:
+            msg["params"] = params
+        if not notify:
+            counter[0] += 1
+            msg["id"] = counter[0]
+        srv.stdin.write(json.dumps(msg) + "\n")
+        srv.stdin.flush()
+        if notify:
+            return None
+        while True:
+            line = srv.stdout.readline()
+            if not line:
+                raise RuntimeError("server closed the pipe")
+            reply = json.loads(line)
+            if reply.get("id") == counter[0]:
+                return reply
+
+    def tool(name: str, args: dict) -> dict:
+        return rpc("tools/call", {"name": name, "arguments": args})["result"]["structuredContent"]
+
+    try:
+        rpc("initialize", {"protocolVersion": "2024-11-05", "capabilities": {},
+                           "clientInfo": {"name": "replay-tool", "version": "0"}})
+        rpc("notifications/initialized", {}, notify=True)
+
+        listed = rpc("tools/list", {})["result"]["tools"]
+        names = {t["name"] for t in listed}
+        out.append(("replay is a registered tool", "replay" in names, sorted(names)))
+        described = next((t for t in listed if t["name"] == "replay"), {})
+        text = described.get("description", "")
+        # A tool that implied an in-flight computation survives a client death
+        # would be making the one promise the direct backend cannot keep.
+        out.append(("its description says the manifest survives a crash",
+                    "manifest" in text and "durable record" in text, text[:160]))
+        out.append(("and that the computation does not",
+                    "NOT the computation" in text, text[:160]))
+
+        tool("notebooks", {"action": "open", "path": src.name})
+        ran = tool("replay", {"action": "run"})
+        out.append(("a replay runs over the protocol", ran.get("success") is True, str(ran)[:250]))
+        out.append(("it returns the run identity", bool(ran.get("run")), str(ran)[:200]))
+        out.append(("it returns the manifest location",
+                    bool(ran.get("manifest")) and os.path.exists(ran.get("manifest") or ""),
+                    str(ran.get("manifest"))))
+        # The MCP default must match the other notebook tool, not the Python
+        # default underneath it.
+        out.append(("it announces the effective timeout, and it is the MCP default",
+                    (ran.get("summary") or {}).get("execution_timeout_seconds") == 300,
+                    str(ran.get("summary"))))
+        cells = ran.get("cells") or []
+        out.append(("every cell carries its own execution identity",
+                    len(cells) == 3 and all(c.get("request_id") for c in cells),
+                    str(cells)[:250]))
+        out.append(("and its own ordinal and child id",
+                    [c.get("ordinal") for c in cells] == [1, 2, 3]
+                    and [c.get("child") for c in cells] == ["c1", "c2", "c3"],
+                    str(cells)[:250]))
+
+        listing = tool("replay", {"action": "list"})
+        out.append(("the run can be found again by listing",
+                    listing.get("count") == 1
+                    and listing["runs"][0]["run_id"] == ran.get("run"),
+                    str(listing)[:250]))
+        out.append(("and the listing carries the policy it ran under",
+                    listing["runs"][0].get("execution_timeout_seconds") == 300,
+                    str(listing)[:250]))
+
+        # Reconciling without naming a manifest must pick the newest run and
+        # say which, rather than silently answering about a different one.
+        seen = tool("replay", {"action": "reconcile"})
+        out.append(("reconcile finds the newest run when none is named",
+                    seen.get("success") is True and seen.get("manifest") == ran.get("manifest"),
+                    str(seen)[:250]))
+        out.append(("and reports every child as complete",
+                    [c["verdict"] for c in seen.get("children", [])] == ["COMPLETE"] * 3,
+                    str(seen.get("children"))[:250]))
+
+        # Source divergence must be caught through the protocol too.
+        tool("edit_cells", {"action": "delete", "index": 0})
+        diverged = tool("replay", {"action": "reconcile"})
+        verdicts = [c["verdict"] for c in diverged.get("children", [])]
+        out.append(("an edited notebook is reported as diverged, not replayed over",
+                    "SOURCE_DIVERGED" in verdicts or "SOURCE_MISSING" in verdicts,
+                    str(verdicts)))
+        out.append(("and the run is blocked rather than left runnable",
+                    bool(diverged.get("blocked")), str(diverged.get("blocked"))))
+    finally:
+        try:
+            srv.stdin.close()
+        except Exception:
+            pass
+        srv.wait(timeout=30)
+        os.unlink(src.name)
+        import shutil
+        shutil.rmtree(replay_dir, ignore_errors=True)
+    return out
+
+
+def check_an_oversized_replay_keeps_what_identifies_the_run() -> list[tuple[str, bool, str]]:
+    """A replay too big to return must shed detail, never identity.
+
+    A real 994-cell replay carries megabytes of symbolic output. The part that
+    must survive shedding is the part that cannot be recomputed from the reply:
+    which run this was, where its manifest is, and what went wrong. Per-cell
+    output of the cells that worked is the one part a narrower re-run recovers.
+
+    Forced with a small reply budget rather than a large notebook, because the
+    branch is what is under test, not the size of anyone's document.
+    """
+    import subprocess
+    import tempfile
+
+    out: list[tuple[str, bool, str]] = []
+    replay_dir = tempfile.mkdtemp(prefix="mcp-replay-big-")
+    src = tempfile.NamedTemporaryFile("w", suffix=".nb", delete=False)
+    src.write("Notebook[{"
+              + ",".join('Cell[BoxData["s%d = StringRepeat[\"y\", 400]"], "Input"]' % i
+                         for i in range(12))
+              + "}]")
+    src.close()
+
+    srv = subprocess.Popen(
+        [PARAMS.command, *PARAMS.args], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL, text=True, bufsize=1, cwd=ROOT,
+        env={**PARAMS.env, "MATHEMATICA_WSTP_REPLAY_DIR": replay_dir,
+             "MATHEMATICA_WSTP_MAX_REPLY": "1200"})
+    counter = [0]
+
+    def rpc(method: str, params=None, notify: bool = False):
+        msg: dict = {"jsonrpc": "2.0", "method": method}
+        if params is not None:
+            msg["params"] = params
+        if not notify:
+            counter[0] += 1
+            msg["id"] = counter[0]
+        srv.stdin.write(json.dumps(msg) + "\n")
+        srv.stdin.flush()
+        if notify:
+            return None
+        while True:
+            line = srv.stdout.readline()
+            if not line:
+                raise RuntimeError("server closed the pipe")
+            reply = json.loads(line)
+            if reply.get("id") == counter[0]:
+                return reply
+
+    try:
+        rpc("initialize", {"protocolVersion": "2024-11-05", "capabilities": {},
+                           "clientInfo": {"name": "replay-big", "version": "0"}})
+        rpc("notifications/initialized", {}, notify=True)
+        rpc("tools/call", {"name": "notebooks",
+                           "arguments": {"action": "open", "path": src.name}})
+        raw = rpc("tools/call", {"name": "replay", "arguments": {"action": "run"}})
+        result = raw.get("result") or {}
+        payload = result.get("structuredContent")
+        out.append(("an oversized replay still returns a result",
+                    isinstance(payload, dict), str(raw)[:250]))
+        out.append(("it is not reported as an error",
+                    result.get("isError") is not True, str(result)[:200]))
+        payload = payload or {}
+        out.append(("it sheds per-cell detail", payload.get("detail") == "summary",
+                    str(payload)[:250]))
+        out.append(("but keeps the run identity", bool(payload.get("run")), str(payload)[:200]))
+        out.append(("and the manifest, which is how the detail is recovered",
+                    bool(payload.get("manifest"))
+                    and os.path.exists(payload.get("manifest") or ""),
+                    str(payload.get("manifest"))))
+        out.append(("and the budget it ran under",
+                    (payload.get("summary") or {}).get("execution_timeout_seconds") == 300,
+                    str(payload.get("summary"))))
+        out.append(("and says how to get the detail back",
+                    "manifest" in str(payload.get("note", "")), str(payload.get("note"))[:200]))
+    finally:
+        try:
+            srv.stdin.close()
+        except Exception:
+            pass
+        srv.wait(timeout=30)
+        os.unlink(src.name)
+        import shutil
+        shutil.rmtree(replay_dir, ignore_errors=True)
+    return out
+
+
 def main() -> int:
     results = asyncio.run(run_checks())
     results += check_ending_a_session_takes_the_whole_tree_down()
@@ -1581,6 +1796,8 @@ def main() -> int:
     results += check_the_subkernel_pool_can_be_released_without_losing_state()
     results += check_a_span_that_skips_an_unrun_cell_says_so()
     results += check_summary_mode_keeps_the_index_bookkeeping()
+    results += check_per_cell_replay_is_reachable_from_the_protocol()
+    results += check_an_oversized_replay_keeps_what_identifies_the_run()
     results += check_an_oversized_cell_listing_degrades_instead_of_breaking()
     results += check_sigterm_takes_the_whole_tree_down()
     failures = 0
