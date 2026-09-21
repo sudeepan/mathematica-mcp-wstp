@@ -1,59 +1,177 @@
 # Replaying a notebook
 
-A notebook here is a `.nb` file on disk, not a window. The server opens it,
-evaluates its cells in order in a persistent kernel, and can write the results
-back into the document.
+A notebook here is a `.nb` file on disk that becomes a **live document in a
+kernel session** when opened. Evaluating cells changes that in-memory document.
+Nothing reaches the `.nb` on disk until you explicitly save it.
 
-## Two ways to run one
+That distinction is central to replay and reconciliation.
 
-`evaluate_cells` hands a span of cells to the kernel and gets one answer back.
-Fewer round trips, and the right choice when nobody needs to know what happened
-cell by cell.
+## Two ways to run notebook cells
 
-`replay` runs each cell as its own execution. That costs a round trip per cell
-and buys a request id, an evaluation token and an idempotency key for each one,
-plus a manifest written to disk *before* the first cell runs. An interrupted
-replay can then be resumed rather than restarted, which on a notebook that
-takes an hour is the difference between losing a minute and losing the hour.
+### `evaluate_cells`: one span-level execution
 
-Cells are addressed by **ordinal** - 1-based, counting only `Input` and `Code`
-cells - never by index. Writing an output inserts a cell and shifts every index
-after it.
+`evaluate_cells` hands a span to the kernel and gets one span-level answer back.
+It is the simpler choice when you want stateful replay but do not need durable
+identity for every individual cell.
+
+### `replay`: one execution per executable cell
+
+`replay` runs each `Input` or `Code` cell as its own execution. Each child gets:
+
+- a replay child id;
+- a request id / execution token from the selected backend;
+- an idempotency key;
+- source identity;
+- timeout policy;
+- output provenance.
+
+Before the first child is submitted, the replay plan is persisted to a sidecar
+**manifest**. That makes the run itself recoverable even if the client that
+created it disappears.
+
+For long, interruptible or auditable work, prefer `replay`.
+
+## Ordinal means "the nth executable cell"
+
+Replay does **not** identify a cell by raw notebook index.
+
+An **ordinal** is 1-based and counts only `Input` and `Code` cells:
+
+```text
+ordinal 1 = first Input/Code cell
+ordinal 2 = second Input/Code cell
+...
+```
+
+Why? Writing an output inserts a new cell. Every later raw index can move, while
+"the seventh input cell" remains the seventh input cell.
+
+This is not terminology for its own sake; it prevents a replay from silently
+evaluating the wrong cell after write-back changes the document.
 
 ## Cells are evaluated as written
 
-A notebook here is a `.nb` on disk. Cells are evaluated from their original
-stored boxes and located by position in the notebook expression. They are never
-rebuilt, and never retyped from a rendered preview: retyping is a transcription
-step whose failure mode is silent non-evaluation, and round-tripping through a
-box-to-text converter is what corrupts `\[Gamma]` and its relatives.
+Executable cells are evaluated from their stored notebook content. They are not
+retyped from a rendered preview.
 
-Only `Input` and `Code` cells run. Prose and stored output are reported as
-skipped and counted separately, so a replay's success figure means what it says.
+Only `Input` and `Code` cells execute. Prose and stored output are skipped and
+counted separately.
 
-## Messages and printed output are never dropped
+That preserves notebook fidelity and keeps a replay's execution count meaningful.
 
-`Print` output and every Wolfram message arrive alongside the result:
+## Messages and printed output are part of the record
+
+`Print` output and Wolfram messages are returned alongside the value:
 
 ```json
-{ "output": "{1, 2}[[5]]",
-  "messages": [{"name": "Part::partw", "text": "Part 5 of {1, 2} does not exist."}] }
+{
+  "output": "{1, 2}[[5]]",
+  "messages": [
+    {"name": "Part::partw", "text": "Part 5 of {1, 2} does not exist."}
+  ]
+}
 ```
 
-A plausible-looking answer with a message attached is usually the message's
-fault. Discarding them is the worst failure mode available, because the answer
-still looks fine.
+A plausible result with a message attached can be more important than a clean
+status flag. Do not discard messages merely because a value was returned.
+
+## What the manifest does — and does not do
+
+The manifest records the intended replay and each child's progress on disk
+before execution can outrun the record.
+
+It is not the notebook file.
+
+Three states must stay separate:
+
+```text
+session-resident
+    output exists in the live notebook document in the kernel
+
+persisted manifest
+    replay identity/progress exists on disk
+
+saved notebook
+    the .nb file itself contains the current document
+```
+
+Per-cell write-back makes progress visible in the live session. If the kernel
+survives client loss under the supervisor, that session-resident progress can be
+recovered. It is not file durability until `notebooks(action="save", ...)`
+succeeds.
+
+## Output provenance
+
+A replay does not infer that an output belongs to a child merely because it is
+located under the same input. The output is tagged so reconciliation can identify
+which replay child wrote it even after other outputs are deleted and positions
+shift.
+
+That lets reconciliation distinguish:
+
+```text
+execution completed, output present
+execution completed, output missing or overwritten
+execution never completed
+```
+
+## Source divergence
+
+The replay records source identity for each executable cell. On reconciliation,
+the current notebook source is checked against the planned source.
+
+If a cell was edited underneath an existing run, the run does **not** silently
+continue as though it were the same scientific program. The divergence is
+reported and automatic continuation of that replay is blocked.
+
+For a stateful notebook this is important: one changed definition may alter every
+later cell.
+
+## Reconciliation
+
+After an interruption or reconnect:
+
+```text
+replay(action="reconcile")
+```
+
+can distinguish states such as:
+
+```text
+COMPLETE
+STILL_RUNNING
+NEVER_SUBMITTED
+source diverged
+output present / missing
+```
+
+With the supervisor, execution facts come from its ledger even if the kernel is
+currently busy with the evaluation being reconciled.
+
+The reconnecting client does not need to reproduce the old waiting MCP call. It
+recovers the run from the manifest and looks up the existing execution.
+
+## Direct versus supervised replay
+
+The replay machinery works with either backend, but lifetime guarantees differ.
+
+**Direct backend:** the current process owns the kernel. If that owner dies, the
+kernel dies with it.
+
+**Supervisor backend:** a separate process owns the kernel. If the MCP client
+dies, an in-flight cell can keep running and a later client can reconcile it.
+
+Choose the backend before opening the notebook. A live notebook session belongs
+to the kernel that opened it.
 
 ## Starting a fresh agent on an unfamiliar notebook
 
-Someone meeting this for the first time, on a notebook nobody has replayed
-before, mostly needs telling what *not* to do. This is the prompt we use: paste
-it into a new session and replace `PATH`.
+Paste the following into a fresh session and replace `PATH`.
 
 ---
 
 You have a Mathematica MCP server (`mathematica-wstp`). Its tool descriptions
-and `guide(topic=...)` are accurate - read them rather than guessing. Never use
+and `guide(topic=...)` are accurate; read them instead of guessing. Never use
 `wolframscript` or shell commands for Mathematica work.
 
 Task: replay the notebook at **PATH**.
@@ -63,53 +181,69 @@ Task: replay the notebook at **PATH**.
 1. Work on a **copy**. Never write the original `.nb`.
 2. `read_notebook_file(path, mode="wolfram")` and scan every code cell for side
    effects that leave the machine: `Export`, `Put`, `Save`, `DumpSave`,
-   `DeleteFile`, `CreateDirectory`, `Run`, `SetDirectory`, anything writing a
-   file. **List them with their ordinals and stop.** I will tell you which are
-   safe. A live `Export` that silently overwrites a reference file is the
-   failure mode I care most about.
-3. Report the input-cell count and whether the notebook loads packages.
+   `DeleteFile`, `CreateDirectory`, `Run`, `SetDirectory`, or anything else
+   that writes a file. **List them with their ordinals and stop.** I will tell
+   you which are safe.
+3. Report the executable-cell count and whether the notebook loads packages.
+4. If the work is expected to outlive this client/session, ask whether to use
+   the supervisor **before opening the notebook**.
 
 ### Running
 
-- Use `replay(action="run")`, not `evaluate_cells`, unless I say otherwise: it
-  gives each cell its own identity and writes a manifest to disk before the
-  first cell, so an interrupted run is resumable.
-- Address cells by **ordinal** (1-based, counting only Input/Code cells), never
-  by index. Writing outputs inserts cells and shifts every later index.
+- Use `replay(action="run")`, not `evaluate_cells`, unless I say otherwise.
+  `replay` gives each executable cell its own identity and persists a manifest
+  before the first cell is submitted.
+- Address executable cells by **ordinal**: 1-based, counting only `Input` and
+  `Code` cells.
 - The per-cell timeout defaults to 300 s. If any cell plausibly needs longer,
-  tell me your estimate and the value you propose, and wait for my answer.
+  tell me the timeout you propose and wait for my answer.
+- Report the run id / manifest path when the replay begins.
 
 ### When something goes wrong
 
-This is the part I care about. **Never abandon a run silently, and never report
-one as finished when it is not.**
+Never abandon a run silently and never report one as finished when it is not.
 
-Tell me, in this order: which ordinal, what the reply actually said, whether
-the kernel survived (read the reply's `kernel` field - do not infer it), and
-the manifest path.
+Tell me, in this order:
 
-Keep these apart; they are different facts and collapsing them wastes my time:
+1. the ordinal;
+2. what the reply actually said;
+3. whether the kernel survived (use the reported state; do not infer it);
+4. the manifest path;
+5. whether reconciliation reports the child as complete, still running, never
+   submitted, or divergent.
 
-    the cell hit the timeout
-    the cell failed
-    the cell was aborted
-    the kernel died
-    nothing could be established
+Keep these apart:
 
-A timeout is **not** evidence that a cell needs more time - it may be a
-runaway. Say which you think it is and why, before proposing a larger number.
+```text
+the cell hit its timeout
+the cell failed
+the cell was aborted
+the kernel died
+the client disappeared but the computation is still running
+nothing could be established
+```
 
-To resume: `replay(action="reconcile")` reports what completed, what is still
-running, and what never started. Restart from the next ordinal. Do **not**
-re-run from cell 1 to "reset" - that can cost hours.
+A timeout is not proof that a cell merely needed more time. It may be runaway
+work. Explain why before increasing the timeout.
 
-`success: true` means no exception and no timeout. It does not mean the work
-happened. If a cell was meant to produce a file or define a symbol, check that
-it did.
+To resume after interruption, use:
+
+```text
+replay(action="reconcile")
+```
+
+Do not restart from ordinal 1 merely to "reset" the run.
+
+`success: true` means the tool call did not report an exception/timeout. It does
+not prove the intended scientific side effect occurred. If a cell was meant to
+write a file or define a symbol, verify that artifact/state.
 
 ### Don't
 
-- Restart the kernel to clear a problem. It destroys every definition; use
-  `abort()` to interrupt a runaway instead.
+- Restart the kernel just to clear a slow calculation; a restart destroys every
+  in-memory definition.
+- Switch execution backend after opening the notebook and expect the session to
+  follow you.
+- Treat a manifest as proof that notebook outputs were saved to disk.
 - Report a conclusion you could not establish. "I cannot tell from here" is a
-  useful answer; a confident wrong one is not.
+  useful answer.

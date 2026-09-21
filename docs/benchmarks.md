@@ -1,6 +1,12 @@
 # What things cost
 
-Measured, not estimated. Mathematica 15.0.1, Linux-x86-64, warm kernel.
+The numbers below are **measured, not illustrative**. They were taken with
+Mathematica 15.0.1 on Linux-x86-64 with a warm kernel.
+
+The point of the table is not to promise one universal overhead. The notebook
+replay measurements show the opposite: a microbenchmark can measure the
+implementation correctly while completely missing the scaling regime of the
+real document.
 
 ## Round trips
 
@@ -14,13 +20,13 @@ Measured, not estimated. Mathematica 15.0.1, Linux-x86-64, warm kernel.
 | Headless front end, cold start | 1.8 s |
 | Kernel shutdown with its subkernel tree closed | 0.27 s |
 
-Splitting work across several calls costs essentially nothing.
+Splitting ordinary work across several calls is cheap at the transport level.
 
 ## Per-cell replay
 
-`replay` gives every cell its own identity and a resumable manifest, at the
-price of a round trip each. What that costs depends on the notebook, and the
-spread is the interesting part:
+`replay` gives every executable cell its own identity and a resumable manifest.
+That requires one execution boundary per cell. The measured cost depends strongly
+on notebook size:
 
 | notebook | per cell |
 |---|---|
@@ -28,16 +34,17 @@ spread is the interesting part:
 | adversarial, many outputs | 47 ms |
 | real 994-cell physics notebook | 284 ms (median) |
 
-The overhead is nearly flat while kernel work per cell ranges from 10 ms to
-134 s, which is the signature of a fixed cost that scales with *document size*
-rather than with the work being done. A microbenchmark on a small notebook
-measures the implementation correctly and still tells you almost nothing about
-the regime you will actually run in.
+On the real notebook, orchestration overhead is nearly flat while kernel work
+per cell ranges from 10 ms to 134 s. That is the signature of a cost dominated
+by document handling rather than by the symbolic work itself.
+
+The lesson is deliberate: **do not extrapolate a small-notebook benchmark to a
+large scientific notebook.**
 
 ## On the real workload
 
-275 cells of a two-loop symbolic physics notebook, recomputed rather than
-loaded from cached results.
+The controlled workload contains 275 executable cells from a two-loop symbolic
+physics notebook, recomputed rather than loaded from cached results.
 
 | | span | per-cell | per-cell, supervised |
 |---|---|---|---|
@@ -46,11 +53,11 @@ loaded from cached results.
 | orchestration | ~1.2 s | 75.4 s | 83.0 s |
 
 Kernel time agrees to within 0.2% across all three, which is how we know the
-same work was done rather than a cheaper variant of it. The per-cell path costs
-about 18% more wall time than handing the whole span to the kernel; putting the
-kernel in its own process adds a further 1.75%.
+paths performed the same scientific work rather than a cheaper variant. The
+per-cell path costs about 18% more wall time than handing the whole span to the
+kernel; putting the kernel in its own process adds a further 1.75%.
 
-What that buys:
+What the per-cell path buys:
 
 | | span | per-cell |
 |---|---|---|
@@ -64,3 +71,6 @@ What that buys:
 The outputs were identical in every comparison: 989 cells and 386 outputs on
 each side, 143 ordinals matching exactly, and all 15 differences
 `AbsoluteTiming` values.
+
+The performance comparison should therefore be read as a trade: additional
+orchestration buys an execution record that can be reconciled and audited.

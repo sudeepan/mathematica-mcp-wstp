@@ -1,15 +1,18 @@
 # Ways to get a wrong answer with no error
 
-Every entry is a mechanism of the Wolfram Language or of this server, not a
-quirk of any one package. They share one property: **nothing fails**. No
-exception, no message, no timeout — just a plausible result that is wrong.
+This document is the negative specification for the project: cases where the
+system can return something plausible even though the intended scientific work
+did not happen.
 
-Each was observed on real work. Where a concrete instance makes the mechanism
-easier to recognise it is named in brackets, but the mechanism is the point: if
-you are using different packages, you will meet the same traps wearing different
-clothes.
+The common rule is:
 
----
+> **A component's own report of what it did is not evidence that it did it.**
+
+Every entry below is a mechanism of the Wolfram Language or of this server, not
+a quirk of one package. Each was observed on real work. The detector or remedy
+therefore tries to cross the boundary of the component making the claim: inspect
+the artifact, the notebook document, the process tree, the manifest, or the
+other execution backend instead of trusting a summary about itself.
 
 ## 1. Naming a package's symbol in the call that loads the package
 
@@ -345,3 +348,54 @@ lifecycle, and cleanup is free. Use `Run["... &"]` only for something short
 enough that you would not mind it finishing unattended — and if a detached
 process must outlive its caller, record its pid, start time and command
 somewhere durable first, because nothing in this server will do it for you.
+
+
+## 18. Switching execution backends after opening a notebook
+
+A notebook session lives in the kernel that opened it. The direct backend and
+the supervisor backend do not share that live document.
+
+Switch the execution backend after opening the notebook and the next notebook
+call can fail with `"no such session"`. The dangerous interpretation is that the
+document was never opened or has been lost. In reality it may still exist,
+unchanged, in the other kernel.
+
+This is especially confusing because ordinary kernel-level operations can work
+perfectly on the newly selected backend while the notebook id refers to a
+session stranded in the old one.
+
+**Do:** choose the backend first, then open the notebook. When
+`supervisor(action="use")` or `supervisor(action="use_direct")` reports notebooks
+left behind, treat that as an ownership warning, not as evidence that the
+documents disappeared. Reopen the file deliberately in the backend you intend
+to use.
+
+## 19. Reconciling against a kernel that never held the live notebook
+
+Replay outputs are written first into the **live notebook document in the
+kernel**. They do not reach the `.nb` file merely because the replay reports
+write-back.
+
+If reconciliation runs against a different kernel, that kernel may rebuild a
+session by reopening the notebook file from disk. The file can be perfectly
+intact while lacking every session-resident output from the replay. A
+reconciler that mistakes that reconstructed document for the original live
+session can then report widespread source/output loss that never happened.
+
+This is a particularly bad failure mode because the answer is confident and
+internally consistent: it inspected a real notebook, just not the notebook
+session whose work it was supposed to judge.
+
+**Do:** distinguish three facts before declaring work missing:
+
+```text
+session-resident document
+persisted replay manifest
+saved .nb file
+```
+
+Reconnect to the backend/kernel that owns the live session when that session is
+supposed to have survived. If only the file survived, say explicitly that you
+are reconstructing from saved state rather than inspecting the original live
+document. Never treat absence from a reopened file as proof that the prior
+session never contained the output.
