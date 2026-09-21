@@ -18,6 +18,7 @@ Run: .venv/bin/python tests/test_supervisor.py
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import shutil
 import signal
@@ -615,6 +616,167 @@ def test_a_lost_child_is_resolved_by_the_ledger_not_by_guessing():
     finally:
         set_evaluator(None)
         os.environ.pop("MATHEMATICA_WSTP_REPLAY_DIR", None)
+        shutil.rmtree(replay_dir, ignore_errors=True)
+        with contextlib.suppress(OSError):
+            os.unlink(nb_path)
+        lab.stop()
+
+
+class Server:
+    """An MCP server subprocess, spoken to the way a client speaks to it."""
+
+    def __init__(self, sock: str, replay_dir: str):
+        self.proc = subprocess.Popen(
+            [PYTHON, "-u", "-m", "mathematica_wstp.server"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, bufsize=1, cwd=ROOT,
+            env={**os.environ, "PYTHONPATH": os.path.join(ROOT, "src"),
+                 "SUP_SOCK": sock, "MATHEMATICA_WSTP_REPLAY_DIR": replay_dir})
+        self.n = 0
+        self.rpc("initialize", {"protocolVersion": "2024-11-05", "capabilities": {},
+                                "clientInfo": {"name": "survive", "version": "0"}})
+        self.rpc("notifications/initialized", {}, notify=True)
+
+    def rpc(self, method: str, params=None, notify: bool = False):
+        msg: dict = {"jsonrpc": "2.0", "method": method}
+        if params is not None:
+            msg["params"] = params
+        if not notify:
+            self.n += 1
+            msg["id"] = self.n
+        self.proc.stdin.write(json.dumps(msg) + "\n")
+        self.proc.stdin.flush()
+        if notify:
+            return None
+        while True:
+            line = self.proc.stdout.readline()
+            if not line:
+                raise RuntimeError("server closed the pipe")
+            reply = json.loads(line)
+            if reply.get("id") == self.n:
+                return reply
+
+    def tool(self, name: str, args: dict) -> dict:
+        return self.rpc("tools/call", {"name": name, "arguments": args})["result"]["structuredContent"]
+
+    def send_tool(self, name: str, args: dict) -> None:
+        """Fire a call and deliberately do not wait for its reply."""
+        self.n += 1
+        self.proc.stdin.write(json.dumps(
+            {"jsonrpc": "2.0", "id": self.n, "method": "tools/call",
+             "params": {"name": name, "arguments": args}}) + "\n")
+        self.proc.stdin.flush()
+
+    def kill(self) -> None:
+        if self.proc.poll() is None:
+            self.proc.kill()
+            self.proc.wait(timeout=20)
+
+
+def test_the_work_survives_the_death_of_the_server_that_asked_for_it():
+    """The claim the whole arrangement exists to make, tested by killing it.
+
+    A replay is started through a real MCP server against a supervisor-owned
+    kernel, and the server is SIGKILLed while a cell is still running. Three
+    things then have to be true, and none of them is true of the direct
+    backend, where the kernel exits about a second after its owner:
+
+        the kernel is still alive and still working
+        the record of what was intended survived on disk
+        a NEW server can find out what happened, by the key the dead one chose
+
+    Nothing here asks a component about itself. The kernel is checked in
+    /proc, the evaluation state comes from the supervisor, and the second
+    server is a different process from the one that started the work.
+    """
+    import uuid as _uuid
+
+    lab = Lab().start()
+    replay_dir = tempfile.mkdtemp(prefix="survive-m-")
+    nb_path = os.path.join(tempfile.gettempdir(), f"survive-{_uuid.uuid4().hex[:8]}.nb")
+    with open(nb_path, "w") as fh:
+        # One quick cell, then one long enough to still be running when the
+        # server dies, then one that must NOT have run yet.
+        fh.write("Notebook[{"
+                 'Cell[BoxData["sv1 = 11"], "Input"],'
+                 'Cell[BoxData["sv2 = (Pause[20]; 22)"], "Input"],'
+                 'Cell[BoxData["sv3 = 33"], "Input"]}]')
+    first = Server(lab.sock, replay_dir)
+    second = None
+    try:
+        chosen = first.tool("supervisor", {"action": "use", "socket_path": lab.sock})
+        assert chosen.get("backend_in_use") == "supervisor", chosen
+        opened = first.tool("notebooks", {"action": "open", "path": nb_path})
+        assert opened.get("success"), opened
+
+        # Fire the replay and walk away from the reply.
+        first.send_tool("replay", {"action": "run", "timeout": 120})
+
+        # Wait for the LONG cell specifically. A bare "is the kernel busy"
+        # goes true while the replay is still listing cells, before a manifest
+        # exists and before any science has been submitted -- so killing on
+        # that signal tests nothing. The manifest saying child 2 is SUBMITTED
+        # is the first moment the long evaluation is genuinely in the kernel.
+        manifests: list[str] = []
+        deadline = time.monotonic() + 90
+        while time.monotonic() < deadline:
+            manifests = [os.path.join(replay_dir, f) for f in os.listdir(replay_dir)
+                         if f.endswith(".json")]
+            if manifests:
+                with open(manifests[0]) as fh:
+                    children = json.load(fh)["children"]
+                if any(c["ordinal"] == 2 and c["state"] == "SUBMITTED" for c in children):
+                    break
+            time.sleep(0.2)
+        else:
+            raise AssertionError(
+                f"the long cell never reached the kernel: {lab.talk('STATUS')} {manifests}")
+
+        # The record was on disk before anything was killed, which is the whole
+        # point of writing it before the first submission.
+        assert len(manifests) == 1, manifests
+        assert lab.talk("STATUS").startswith("BUSY"), lab.talk("STATUS")
+
+        first.kill()
+        time.sleep(3)
+
+        # 1. The kernel did not die with the client.
+        assert os.path.exists(f"/proc/{lab.kernel_pid}"), \
+            "the kernel died with the server that asked for the work"
+        # 2. And it is still doing the work, with nobody waiting for it.
+        state = lab.talk("STATUS")
+        assert state.startswith("BUSY"), f"the evaluation stopped when its client died: {state}"
+        assert "ORPHANED" in state, f"expected an orphaned evaluation, got {state}"
+
+        # 3. A new server, a different process, reconciles from the record the
+        #    dead one left behind.
+        second = Server(lab.sock, replay_dir)
+        second.tool("supervisor", {"action": "use", "socket_path": lab.sock})
+        seen = second.tool("replay", {"action": "reconcile", "manifest": manifests[0]})
+        assert seen.get("success"), seen
+        assert seen["execution_check"] == "done: supervisor", seen["execution_check"]
+
+        verdicts = [c["verdict"] for c in seen["children"]]
+        assert verdicts[0] == "COMPLETE", seen["children"][0]
+        # The cell that was running when the server died is found still
+        # running -- not lost, not failed, and not aborted on its behalf.
+        assert verdicts[1] == "STILL_RUNNING", seen["children"][1]
+        assert verdicts[2] == "NEVER_SUBMITTED", seen["children"][2]
+
+        # Let it finish, and confirm the answer was not merely held but real.
+        deadline = time.monotonic() + 90
+        while time.monotonic() < deadline:
+            if lab.talk("STATUS").startswith("IDLE") or "COMPLETED" in lab.talk("STATUS"):
+                break
+            time.sleep(1)
+        after = second.tool("replay", {"action": "reconcile", "manifest": manifests[0]})
+        recovered = after["children"][1]
+        assert recovered["verdict"] in ("RECOVERED", "COMPLETE"), recovered
+        assert "COMPLETED" in str(recovered.get("found", "")), recovered
+    finally:
+        first.kill()
+        if second is not None:
+            second.kill()
         shutil.rmtree(replay_dir, ignore_errors=True)
         with contextlib.suppress(OSError):
             os.unlink(nb_path)
