@@ -1392,6 +1392,49 @@ def test_a_replay_says_what_timeout_it_ran_under():
             os.unlink(path)
 
 
+def test_a_replayed_cell_records_what_it_actually_printed():
+    """A cell that prints one must not be recorded as printing "one".
+
+    OpenWrite defaults to InputForm, which quotes strings, so the replay's
+    account of a cell's printed output disagreed with the same Print seen
+    through evaluate() -- the document said the cell printed something it did
+    not. Checked against the other path rather than against a literal, because
+    the two agreeing is the property that matters.
+    """
+    import uuid as _uuid
+
+    from mathematica_wstp import evaluator, notebooks
+
+    path = os.path.join(tempfile.gettempdir(), f"printed-{_uuid.uuid4().hex[:8]}.nb")
+    replay_dir = os.path.join(tempfile.gettempdir(), f"printed-m-{_uuid.uuid4().hex[:8]}")
+    os.environ["MATHEMATICA_WSTP_REPLAY_DIR"] = replay_dir
+    source = 'Print["one"]; Print[2 + 2]; 7'
+    try:
+        nb = notebooks.get_headless_notebooks()
+        made = nb.create(title="Printed", path=path)
+        assert made.get("success"), made
+        nbid = made["id"]
+        assert nb.write_cell(source, style="Input", notebook=nbid).get("success")
+
+        cell = nb.replay_cells(notebook=nbid, timeout=60)["cells"][0]
+        printed = cell.get("printed") or ""
+        assert '"one"' not in printed, f"the record quotes what was printed: {printed!r}"
+        lines = [ln for ln in printed.splitlines() if ln.strip()]
+        assert lines == ["one", "4"], printed
+
+        # The same expression through the other path, which reads the
+        # transport's own text packets rather than a redirected stream.
+        direct = evaluator.evaluate_text(source, timeout=60)
+        assert direct.success, direct
+        assert direct.prints == lines, (direct.prints, lines)
+        assert cell.get("output", "").strip() == direct.text.strip() == "7"
+    finally:
+        os.environ.pop("MATHEMATICA_WSTP_REPLAY_DIR", None)
+        shutil.rmtree(replay_dir, ignore_errors=True)
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+
+
 # --- standalone runner -----------------------------------------------------
 
 def _main() -> int:

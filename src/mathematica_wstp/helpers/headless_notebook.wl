@@ -240,7 +240,11 @@ evalCell[c_, dir_String, path_String, timeout_] := Module[
   tmp = FileNameJoin[{$TemporaryDirectory, "mcp-print-" <> ToString[$ProcessID] <> "-" <> ToString[RandomInteger[10^9]] <> ".txt"}];
   t0 = AbsoluteTime[];
 
-  stream = Quiet[Check[OpenWrite[tmp], $Failed]];
+  (* OutputForm, not the OpenWrite default of InputForm: with the default a
+     cell that printed one was recorded as "one", quoted, so the replay's
+     account of what a cell printed differed from the same Print seen
+     through evaluate(). The record has to match what happened. *)
+  stream = Quiet[Check[OpenWrite[tmp, FormatType -> OutputForm], $Failed]];
   (* CheckAbort, not just TimeConstrained. TimeConstrained catches a cell that
      runs too long; it does NOT catch a cell that calls Abort[] itself, and an
      abort raised inside one cell propagates out of the whole Module and kills
