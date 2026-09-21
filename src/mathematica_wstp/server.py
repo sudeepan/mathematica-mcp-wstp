@@ -862,6 +862,10 @@ def replay(
             if not known:
                 return _fail(f"no replay manifest found for {path}")
             target = known[-1]
+        # No lookup is passed: reconcile_replay takes it from the active
+        # backend, so selecting a supervisor is the whole of what makes a
+        # SUBMITTED child resolvable. Passing one here would let this layer
+        # decide what counts as an execution record, which is not its call.
         result = nb.reconcile_replay(target, notebook=notebook)
         if isinstance(result, dict):
             result.setdefault("manifest", target)

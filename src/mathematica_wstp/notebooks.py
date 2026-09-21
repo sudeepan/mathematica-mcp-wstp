@@ -650,7 +650,19 @@ class HeadlessNotebooks:
         dependency graph the notebook layer cannot know otherwise. The completed
         prefix is preserved rather than discarded: what ran, ran.
         """
+        from .evaluator import get_evaluator
         from .replay_manifest import ReplayManifest, past_deadline
+
+        # A caller may pass its own lookup, but the usual case is that the
+        # backend already knows how to answer. The direct backend does not and
+        # cannot: its request ids are local bookkeeping, and if this process
+        # died there is nobody left to ask. So the absence of a lookup is a
+        # fact about the backend, and it is reported rather than hidden.
+        lookup_backend = "caller-supplied" if evaluator_lookup else None
+        if evaluator_lookup is None:
+            evaluator = get_evaluator()
+            evaluator_lookup = getattr(evaluator, "lookup", None)
+            lookup_backend = evaluator.name if evaluator_lookup else None
 
         try:
             manifest = ReplayManifest.load(manifest_path)
@@ -677,6 +689,27 @@ class HeadlessNotebooks:
                 current = {d["ordinal"]: d["digest"] for d in probe.get("digests", [])}
             else:
                 source_check = f"deferred: {str(probe.get('error'))[:120]}"
+
+        # A document with no inputs at all, for a run that planned some, is
+        # almost never a notebook whose cells were deleted. A session can be
+        # rebuilt in a fresh kernel by reopening the file, and a replay writes
+        # its outputs into the SESSION document -- nothing reaches disk until
+        # someone saves. So the likeliest reading is that this is a different
+        # document from the one the run was about.
+        #
+        # Measured: reconciling after switching backends rebuilt the session
+        # from an unsaved file and reported SOURCE_MISSING for every child of a
+        # notebook that was entirely intact. A confident wrong answer about
+        # whether the science still exists is worse than no answer, so this
+        # refuses to judge and says which two possibilities remain.
+        if source_check == "done" and not current and manifest.data["children"]:
+            source_check = (
+                "unavailable: the document presented has no input cells at all, while "
+                f"this run planned {len(manifest.data['children'])}. Either every cell "
+                "was deleted, or this is not the document that was replayed -- a session "
+                "reopened from an unsaved file looks exactly like this. Reopen the "
+                "notebook that was replayed, in the kernel that ran it, to judge the source.")
+            current = {}
 
         # What the document says about who wrote its outputs. An output cell on
         # its own proves only that something wrote one: a person, an earlier
@@ -754,10 +787,21 @@ class HeadlessNotebooks:
                 elif found:
                     record["verdict"] = "RECOVERED"
                     record["found"] = found
+                elif evaluator_lookup is None:
+                    # Nobody could be asked. Not the same fact as having asked
+                    # and found nothing, and collapsing the two would let a
+                    # caller read "we checked" out of a reply that never
+                    # checked anything.
+                    record["verdict"] = "UNRESOLVED"
+                    record["detail"] = (
+                        "submitted, and there is no execution record to consult: the "
+                        "backend in use keeps none that outlives this process. Whether "
+                        "it ran cannot be established from here or anywhere else.")
                 else:
                     record["verdict"] = "UNRESOLVED"
-                    record["detail"] = ("submitted, and no execution record was found for its key; "
-                                        "whether it ran cannot be established from here")
+                    record["detail"] = (
+                        f"submitted, and the {lookup_backend} ledger has no record under "
+                        "its key; it was asked, and the answer is that nothing ran")
             else:
                 record["verdict"] = "NEVER_SUBMITTED"
             children.append(record)
@@ -776,6 +820,14 @@ class HeadlessNotebooks:
             "manifest": manifest.path,
             "blocked": manifest.blocked,
             "source_check": source_check,
+            # Which of the two stages could actually be carried out. The source
+            # check needs a kernel holding the document; the execution check
+            # needs a ledger that outlived the client. They fail independently,
+            # and a reply that reported only the verdicts would leave a caller
+            # unable to tell "nothing ran" from "nothing could be asked".
+            "execution_check": (f"done: {lookup_backend}" if lookup_backend
+                                else "unavailable: the backend in use keeps no record "
+                                     "that outlives this process"),
             "resumable_from": (None if diverged else
                                next((c["ordinal"] for c in children
                                      if c["verdict"] in ("NEVER_SUBMITTED", "UNRESOLVED")), None)),

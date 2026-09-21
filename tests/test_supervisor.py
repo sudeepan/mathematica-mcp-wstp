@@ -546,6 +546,81 @@ def test_a_caller_giving_up_does_not_abandon_the_evaluation():
         lab.stop()
 
 
+def test_a_lost_child_is_resolved_by_the_ledger_not_by_guessing():
+    """What a reconnecting client can establish, and by what means.
+
+    The reconciling layer used to be handed a lookup function or nothing, and
+    the MCP path handed it nothing -- so a SUBMITTED child always came back
+    UNRESOLVED however much the supervisor knew. It now takes the lookup from
+    the backend in use, which makes selecting a supervisor the whole of what
+    turns an unanswerable question into an answered one.
+    """
+    import uuid as _uuid
+
+    from mathematica_wstp import notebooks, supervisor
+    from mathematica_wstp.evaluator import set_evaluator
+    from mathematica_wstp.replay_manifest import ReplayManifest
+
+    lab = Lab().start()
+    nb_path = os.path.join(tempfile.gettempdir(), f"lost-{_uuid.uuid4().hex[:8]}.nb")
+    replay_dir = tempfile.mkdtemp(prefix="lost-m-")
+    os.environ["MATHEMATICA_WSTP_REPLAY_DIR"] = replay_dir
+    try:
+        evaluator = supervisor.use(lab.sock)
+        nb = notebooks.get_headless_notebooks()
+        made = nb.create(title="Lost", path=nb_path)
+        assert made.get("success"), made
+        nbid = made["id"]
+        for source in ("L1 = 1", "L2 = 2", "L3 = 3"):
+            assert nb.write_cell(source, style="Input", notebook=nbid).get("success")
+
+        replay = nb.replay_cells(notebook=nbid, timeout=60)
+        assert replay["success"], replay
+
+        # Everything ran and everything is answerable, and the reply says by
+        # what means -- not merely that it worked.
+        done = nb.reconcile_replay(replay["manifest"], notebook=nbid)
+        assert done["execution_check"] == "done: supervisor", done["execution_check"]
+        assert [c["verdict"] for c in done["children"]] == ["COMPLETE"] * 3, done["children"]
+
+        # Now rewrite history as a client death would leave it: child 2 handed
+        # over, its answer never heard. The execution itself really did happen
+        # and the supervisor really does hold it, which is the point.
+        manifest = ReplayManifest.load(replay["manifest"])
+        real_request = manifest.child(2)["request_id"]
+        manifest.mark(2, state="SUBMITTED")
+
+        recovered = nb.reconcile_replay(replay["manifest"], notebook=nbid)
+        child = recovered["children"][1]
+        assert child["verdict"] == "RECOVERED", child
+        assert real_request in child["found"], (real_request, child["found"])
+        assert recovered["execution_check"] == "done: supervisor", recovered
+
+        # A key the supervisor never admitted is a different answer again: it
+        # was asked, and nothing ran.
+        manifest.mark(3, state="SUBMITTED", idempotency_key="never-admitted")
+        asked = nb.reconcile_replay(replay["manifest"], notebook=nbid)
+        third = asked["children"][2]
+        assert third["verdict"] == "UNRESOLVED", third
+        assert "it was asked" in third["detail"], third["detail"]
+
+        # And on the direct backend the same question cannot be put at all --
+        # which must not read like having asked and found nothing.
+        set_evaluator(None)
+        blind = nb.reconcile_replay(replay["manifest"])
+        assert blind["execution_check"].startswith("unavailable"), blind["execution_check"]
+        unresolved = [c for c in blind["children"] if c["verdict"] == "UNRESOLVED"]
+        assert unresolved, blind["children"]
+        assert "no execution record to consult" in unresolved[0]["detail"], unresolved[0]
+    finally:
+        set_evaluator(None)
+        os.environ.pop("MATHEMATICA_WSTP_REPLAY_DIR", None)
+        shutil.rmtree(replay_dir, ignore_errors=True)
+        with contextlib.suppress(OSError):
+            os.unlink(nb_path)
+        lab.stop()
+
+
 def _main() -> int:
     tests = [(n, o) for n, o in sorted(globals().items())
              if n.startswith("test_") and callable(o)]
