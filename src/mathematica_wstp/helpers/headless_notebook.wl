@@ -30,6 +30,7 @@ MCPCells::usage = "MCPCells[id, offset, limit, includeContent, style] lists cell
 MCPEvaluateCell::usage = "MCPEvaluateCell[id, index, timeout] evaluates one cell.";
 MCPEvaluateRange::usage = "MCPEvaluateRange[id, from, to, timeout, stopOnError] evaluates a span of cells.";
 MCPEvaluateInput::usage = "MCPEvaluateInput[id, ordinal, timeout, writeOutputs, sentinel] evaluates the nth input cell, counting from the top.";
+MCPFileDependencies::usage = "MCPFileDependencies[id] reports every file a notebook reads or writes, including from commented cells.";
 MCPInputDigests::usage = "MCPInputDigests[id] hashes the stored boxes of every input cell, by ordinal.";
 MCPOutputProvenance::usage = "MCPOutputProvenance[id] reports which replay child wrote each output cell.";
 MCPWriteCell::usage = "MCPWriteCell[id, content, style, position, anchor] inserts a cell.";
@@ -608,6 +609,79 @@ applyOutputEdits[nb_, edits_] := Module[{out = nb, moving},
    boxText is the project's inert boxes-to-text conversion: it does not go
    through ToExpression, so hashing a notebook cannot re-execute it, and both
    shapes above reduce to the same string. *)
+(* --- what a notebook reads and writes ------------------------------------
+
+   A notebook that loads a stored result looks exactly like one that computes
+   it: both leave a value in a symbol and both report success. The difference
+   is visible only in what the cells DO with the filesystem, and that has to be
+   established before running anything, because by the time a `Get` has
+   silently returned $Failed the damage is several cells downstream and looks
+   like a physics problem.
+
+   Parsed structurally rather than by matching text. A path is as often
+   FileNameJoin[{Directory[], "x.wl"}] as a bare string, and a regex that
+   handles the one and not the other misses exactly the round-trip pairs that
+   matter most.
+
+   Commented cells are included deliberately, and are the whole point: a
+   commented computation sitting directly above a live load is what "this
+   notebook ships in load mode" looks like. A fully-commented cell parses to
+   nothing, so the comment markers are stripped and the inside is parsed. *)
+
+fileOpHeads = Hold[Get, Import, Export, Put, PutAppend, DumpSave, Save,
+                   BinaryRead, ReadList, OpenRead, OpenWrite, DeleteFile];
+
+readHeadQ[h_] := MemberQ[{Get, Import, ReadList, BinaryRead, OpenRead}, h];
+writeHeadQ[h_] := MemberQ[{Export, Put, PutAppend, DumpSave, Save, OpenWrite,
+                           DeleteFile}, h];
+
+(* A literal path where one can be recovered, and an honest description where
+   it cannot. Reporting "unresolved" is far better than reporting a guess:
+   the caller can look, and a wrong filename silently mis-pairs a read with a
+   write. *)
+literalPath[s_String] := s;
+literalPath[FileNameJoin[parts_List]] :=
+  If[AllTrue[parts, StringQ], FileNameJoin[parts],
+     "<unresolved: " <> StringTake[ToString[FileNameJoin[parts], InputForm], UpTo[70]] <> ">"];
+literalPath[e_] := "<unresolved: " <> StringTake[ToString[e, InputForm], UpTo[70]] <> ">";
+
+strippedSource[text_String] := Module[{t = StringTrim[text]},
+  If[StringMatchQ[t, "(*" ~~ ___ ~~ "*)"],
+    {StringTrim[StringTake[t, {3, -3}]], True},
+    {t, False}]
+];
+
+fileOpsIn[text_String] := Module[{src, dead, held, ops},
+  {src, dead} = strippedSource[text];
+  held = Quiet[Check[ToExpression[src, InputForm, HoldComplete], $Failed]];
+  If[held === $Failed || held === Null, Return[{}]];
+  ops = Cases[held,
+    HoldPattern[h_Symbol[first_, ___]] /; (readHeadQ[h] || writeHeadQ[h]) :>
+      <|"head" -> ToString[h],
+        "kind" -> If[readHeadQ[h], "read", "write"],
+        "path" -> literalPath[Unevaluated[first]],
+        "commented" -> dead|>,
+    Infinity, Heads -> True];
+  DeleteDuplicates[ops]
+];
+
+MCPFileDependencies[id_String] :=
+  sessionOr[id, Module[{nb, cells, ordinal = 0, found = {}},
+    nb = $Sessions[id, "nb"];
+    cells = Extract[nb, sessionPos[id]];
+    Do[
+      If[executableQ[c],
+        ordinal++;
+        Module[{text = boxText[First[c] /. BoxData[b_] :> b], ops},
+          ops = fileOpsIn[text];
+          If[ops =!= {},
+            found = Join[found,
+              Map[Append[#, "ordinal" -> ordinal] &, ops]]]]],
+      {c, cells}];
+    ok[<|"id" -> id, "operations" -> found,
+        "executable_cells" -> ordinal|>]
+  ]];
+
 MCPInputDigests[id_String] :=
   sessionOr[id, Module[{nb, pos, ords, out = {}},
     nb = $Sessions[id, "nb"];

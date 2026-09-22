@@ -867,6 +867,68 @@ class HeadlessNotebooks:
             return self._no_session(notebook)
         return self._call_with_session("MCPWriteCell", notebook_id, content, style, position, int(anchor))
 
+    def file_dependencies(self, notebook: str | None = None,
+                          timeout: int = 120) -> dict[str, Any]:
+        """What this notebook reads and writes, before running any of it.
+
+        A notebook that loads a stored result is indistinguishable at runtime
+        from one that computes it: both leave a value in a symbol and both
+        report success. The difference shows only in the filesystem calls, and
+        by the time a ``Get`` has silently returned ``$Failed`` the symptom is
+        several cells downstream and looks like a failure of the science.
+
+        Commented cells are included, and carry the finding: a commented
+        computation directly above a live load is what a notebook shipped in
+        "load the stored answer" mode looks like.
+        """
+        notebook_id = self._resolve(notebook)
+        if notebook_id is None:
+            return self._no_session(notebook)
+        raw = self._call_with_session("MCPFileDependencies", notebook_id, timeout=timeout)
+        if not raw.get("success"):
+            return raw
+
+        ops = raw.get("operations") or []
+        files: dict[str, dict[str, Any]] = {}
+        for op in ops:
+            entry = files.setdefault(os.path.basename(str(op.get("path", ""))), {
+                "path": op.get("path"), "reads": [], "writes": [],
+                "commented_reads": [], "commented_writes": []})
+            bucket = ("commented_" if op.get("commented") else "") + \
+                     ("reads" if op.get("kind") == "read" else "writes")
+            entry[bucket].append(op.get("ordinal"))
+
+        for name, e in files.items():
+            live_r, live_w = e["reads"], e["writes"]
+            if live_r and live_w and min(live_w) < min(live_r):
+                e["verdict"] = "ROUND_TRIP"
+                e["detail"] = ("written then read back inside the run; breaking "
+                               "the write makes the read return $Failed silently")
+            elif live_r and e["commented_writes"] and not live_w:
+                e["verdict"] = "LOADS_A_STORED_RESULT"
+                e["detail"] = ("read live, while the cell that would produce it is "
+                               "commented out; the computation is usually the cell "
+                               "just above that commented write")
+            elif live_r and not live_w and not e["commented_writes"]:
+                e["verdict"] = "EXTERNAL_INPUT"
+                e["detail"] = "read but never written here; it must exist beforehand"
+            elif live_w and not live_r:
+                e["verdict"] = "WRITES_ONLY"
+                e["detail"] = "this run overwrites it; check it is not something you need"
+            else:
+                e["verdict"] = "MIXED"
+                e["detail"] = "read and written; inspect the ordinals"
+
+        unresolved = [op for op in ops if str(op.get("path", "")).startswith("<unresolved")]
+        return {"success": True, "headless": True, "id": notebook_id,
+                "executable_cells": raw.get("executable_cells"),
+                "files": files, "operations": ops,
+                "unresolved": len(unresolved),
+                "note": ("Paths that could not be resolved to a literal are reported "
+                         "as <unresolved: ...> rather than guessed. A relative path "
+                         "means whatever Directory[] is when that cell runs, which a "
+                         "SetDirectory earlier in the notebook may have changed.")}
+
     def replace_cell(self, index: int, content: str,
                      notebook: str | None = None) -> dict[str, Any]:
         """Change one cell's content in place, keeping its style and options."""

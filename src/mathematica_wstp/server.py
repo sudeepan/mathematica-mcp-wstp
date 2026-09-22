@@ -299,12 +299,21 @@ def status() -> dict[str, Any]:
 @server.tool(
     description=(
         "Notebook sessions over .nb files on disk. actions: open(path) | create(title,path) "
-        "| list | info | save(path) | close. Cells are evaluated from their original "
-        "stored boxes, so nothing is lost in translation."
+        "| list | info | save(path) | close | dependencies. Cells are evaluated from "
+        "their original stored boxes, so nothing is lost in translation.\n"
+        "'dependencies' reports every file the notebook reads or writes, COMMENTED "
+        "CELLS INCLUDED, and classifies each one: EXTERNAL_INPUT (must exist first), "
+        "ROUND_TRIP (written then read back - never skip the write), "
+        "LOADS_A_STORED_RESULT (read live while the cell that would compute it is "
+        "commented out), WRITES_ONLY (this run overwrites it). Run it before "
+        "evaluating an unfamiliar notebook: a cell that loads a stored answer looks "
+        "exactly like one that computes it, and a Get that silently returns $Failed "
+        "surfaces several cells later as a physics failure."
     )
 )
 def notebooks(
-    action: Literal["open", "create", "list", "info", "save", "close", "verify"] = "list",
+    action: Literal["open", "create", "list", "info", "save", "close", "verify",
+                    "dependencies"] = "list",
     path: str | None = None,
     title: str = "Untitled",
     notebook: str | None = None,
@@ -314,6 +323,12 @@ def notebooks(
         if not path:
             return _fail("open requires a path")
         return _reply(nb.open(path))
+    if action == "dependencies":
+        # Run this BEFORE evaluating an unfamiliar notebook. A cell that loads
+        # a stored result is indistinguishable at runtime from one that
+        # computes it, and a Get that silently fails shows up several cells
+        # later as physics that went wrong.
+        return _reply(nb.file_dependencies(notebook=notebook))
     if action == "verify":
         # No reference is not an error: a document built from scratch has none,
         # and that is exactly when the record has to stand on its own. Without a

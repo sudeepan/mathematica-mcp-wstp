@@ -1495,6 +1495,66 @@ def test_a_cell_inside_a_group_can_be_edited_in_place():
             os.unlink(path)
 
 
+def test_a_notebook_says_what_it_reads_and_writes_before_it_runs():
+    """A cell that loads a stored answer looks exactly like one that computes it.
+
+    Both leave a value in a symbol and both report success, so the difference
+    is visible only in what the cells do with the filesystem. This is the check
+    that has to happen before evaluating an unfamiliar notebook: a Get that
+    silently returns $Failed surfaces several cells later as physics that went
+    wrong, and the cause is by then invisible.
+
+    Commented cells carry the finding, so they are scanned too - a commented
+    write directly above a live read is what a notebook shipped in "load the
+    stored answer" mode looks like.
+    """
+    import uuid as _uuid
+
+    from mathematica_wstp import notebooks
+
+    path = os.path.join(tempfile.gettempdir(), f"deps-{_uuid.uuid4().hex[:8]}.nb")
+    cells = [
+        'x = Get["never-written.wl"]',                      # 1 external input
+        '(*Export["stored.wl", y]*)',                       # 2 commented producer
+        'y = Get["stored.wl"]',                             # 3 live load of it
+        'Export[FileNameJoin[{Directory[], "trip.wl"}], z]',  # 4 write ...
+        'w = Get[FileNameJoin[{Directory[], "trip.wl"}]]',    # 5 ... read back
+        'Export["output-only.wl", q]',                      # 6 pure write
+        'v = Get[someVariable]',                            # 7 unresolvable
+    ]
+    with open(path, "w") as fh:
+        fh.write("Notebook[{" + ",".join(
+            'Cell[BoxData["%s"], "Input"]' % c.replace('"', '\\"') for c in cells) + "}]")
+    try:
+        nb = notebooks.get_headless_notebooks()
+        opened = nb.open(path)
+        assert opened.get("success"), opened
+        report = nb.file_dependencies(notebook=opened["id"])
+        assert report.get("success"), report
+        files = report["files"]
+
+        assert files["never-written.wl"]["verdict"] == "EXTERNAL_INPUT", files
+        # The commented producer is what makes this a load rather than an input.
+        stored = files["stored.wl"]
+        assert stored["verdict"] == "LOADS_A_STORED_RESULT", stored
+        assert stored["commented_writes"] == [2] and stored["reads"] == [3], stored
+        # FileNameJoin, which a text search over the source would miss, and the
+        # case whose breakage is silent.
+        trip = files["trip.wl"]
+        assert trip["verdict"] == "ROUND_TRIP", trip
+        assert trip["writes"] == [4] and trip["reads"] == [5], trip
+        assert files["output-only.wl"]["verdict"] == "WRITES_ONLY", files
+
+        # A path it cannot resolve is reported as such, never guessed: a wrong
+        # filename silently mis-pairs a read with a write.
+        assert report["unresolved"] >= 1, report
+        assert any(str(o.get("path", "")).startswith("<unresolved")
+                   for o in report["operations"]), report["operations"]
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+
+
 # --- standalone runner -----------------------------------------------------
 
 def _main() -> int:
