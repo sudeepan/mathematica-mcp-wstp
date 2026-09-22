@@ -1,3 +1,7 @@
+*DISCLAIMER: The code is LLM generated, so there is always room for improvement. So treat this as a functional implementation of an architecture
+that enables one to use LLM agents in a fully headless containerised environment, that work with long-duration stateful Wolfram kernels for complex 
+research calculations that may even span days.*
+
 # Mathematica MCP over WSTP
 
 **Auditable execution for agent-driven symbolic computation in Mathematica.**
