@@ -1435,6 +1435,66 @@ def test_a_replayed_cell_records_what_it_actually_printed():
             os.unlink(path)
 
 
+def test_a_cell_inside_a_group_can_be_edited_in_place():
+    """The gap that made a real notebook unpreparable through the tools.
+
+    Insertion rewrites only the top-level cell list, and in a sectioned
+    notebook almost every cell is nested -- measured on a 995-cell document,
+    3 cells at the top level. So `write` could only ever append, `delete` was
+    the only thing that could reach a nested cell, and changing one cell meant
+    editing the file as text outside the server.
+
+    A replacement must also leave everything about the cell except its content
+    alone: its position, its style, and options like CellLabel that a later
+    verification pass reads.
+    """
+    import uuid as _uuid
+
+    from mathematica_wstp import notebooks
+
+    path = os.path.join(tempfile.gettempdir(), f"grouped-{_uuid.uuid4().hex[:8]}.nb")
+    # Two cells inside a group, which is what a section produces.
+    with open(path, "w") as fh:
+        fh.write('Notebook[{Cell[CellGroupData[{'
+                 'Cell[BoxData["gg1 = 1"], "Input", CellLabel -> "In[1]:="],'
+                 'Cell[BoxData["gg2 = 2"], "Input", CellLabel -> "In[2]:="]'
+                 '}, Open]]}]')
+    try:
+        nb = notebooks.get_headless_notebooks()
+        opened = nb.open(path)
+        assert opened.get("success"), opened
+        nbid = opened["id"]
+        before = nb.info(nbid)["cell_count"]
+
+        listing = nb.cells(notebook=nbid, limit=1000, include_content=True)["cells"]
+        target = [c for c in listing if "gg2" in (c.get("content") or "")][0]
+
+        result = nb.replace_cell(target["index"], "gg2 = 222", notebook=nbid)
+        assert result.get("success"), result
+        assert result["replaced"] == target["index"], result
+        assert result["style"] == "Input", result
+        assert result["options_kept"] >= 1, "the cell's options were dropped"
+
+        after = nb.cells(notebook=nbid, limit=1000, include_content=True)["cells"]
+        edited = [c for c in after if c["index"] == target["index"]][0]
+        assert "gg2 = 222" in (edited["content"] or ""), edited
+        assert edited["style"] == "Input", edited
+        # Nothing moved and nothing was added.
+        assert nb.info(nbid)["cell_count"] == before, "replacing changed the cell count"
+        assert [c["index"] for c in after] == [c["index"] for c in listing], "cells moved"
+        # The neighbour inside the same group is untouched.
+        other = [c for c in after if "gg1" in (c.get("content") or "")]
+        assert other and "gg1 = 1" in other[0]["content"], other
+
+        # And it refuses an index that is not there, rather than appending.
+        bad = nb.replace_cell(9999, "x = 1", notebook=nbid)
+        assert bad.get("success") is False, bad
+        assert nb.info(nbid)["cell_count"] == before, "a refused replace still changed the document"
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+
+
 # --- standalone runner -----------------------------------------------------
 
 def _main() -> int:

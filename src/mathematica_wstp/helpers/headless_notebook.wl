@@ -34,6 +34,7 @@ MCPInputDigests::usage = "MCPInputDigests[id] hashes the stored boxes of every i
 MCPOutputProvenance::usage = "MCPOutputProvenance[id] reports which replay child wrote each output cell.";
 MCPWriteCell::usage = "MCPWriteCell[id, content, style, position, anchor] inserts a cell.";
 MCPDeleteCell::usage = "MCPDeleteCell[id, index] removes a cell.";
+MCPReplaceCell::usage = "MCPReplaceCell[id, index, content] replaces one cell's content, keeping its style and options.";
 MCPSave::usage = "MCPSave[id, path] writes the session's notebook expression to disk.";
 MCPCreate::usage = "MCPCreate[id, path, title] starts an empty headless notebook.";
 MCPClose::usage = "MCPClose[id] discards a session.";
@@ -884,6 +885,40 @@ MCPWriteCell[id_String, content_String, style_String, position_String, anchor_In
     setNotebook[id, ReplacePart[nb, 1 -> updated]];
     $Sessions[id, "dirty"] = True;
     ok[<|"id" -> id, "inserted_at" -> at, "cell_count" -> Length[leafPositions[$Sessions[id, "nb"]]]|>]
+  ]];
+
+(* Replacing a cell's CONTENT, leaving its position, style and options alone.
+
+   Insertion cannot reach a nested cell -- MCPWriteCell rewrites only the
+   top-level list, because splicing into a CellGroupData needs the group's own
+   position -- and in a sectioned notebook almost every cell is nested. That
+   left no way to change an existing cell at all: a notebook had to be edited
+   as text outside the server, which is exactly the round trip this layer
+   exists to avoid.
+
+   Addressing is by the same leaf index `delete` uses, so a cell that can be
+   deleted can be replaced. The style and every option are carried across from
+   the cell being replaced rather than re-specified, so an edit cannot silently
+   restyle a cell or drop its CellLabel. *)
+MCPReplaceCell[id_String, index_Integer, content_String] :=
+  sessionOr[id, Module[{nb, pos, target, style, options, replacement},
+    nb = $Sessions[id, "nb"];
+    pos = leafPositions[nb];
+    If[index < 0 || index >= Length[pos],
+      Return[err["Cell index out of range", <|"index" -> index, "total" -> Length[pos]|>]]
+    ];
+    target = Extract[nb, pos[[index + 1]]];
+    If[Head[target] =!= Cell,
+      Return[err["Not a cell", <|"index" -> index, "head" -> ToString[Head[target]]|>]]
+    ];
+    style = If[Length[target] >= 2, target[[2]], "Input"];
+    options = If[Length[target] >= 3, Drop[List @@ target, 2], {}];
+    replacement = Cell[BoxData[content], style, Sequence @@ options];
+    setNotebook[id, ReplacePart[nb, pos[[index + 1]] -> replacement]];
+    $Sessions[id, "dirty"] = True;
+    ok[<|"id" -> id, "replaced" -> index, "style" -> ToString[style],
+        "options_kept" -> Length[options],
+        "cell_count" -> Length[leafPositions[$Sessions[id, "nb"]]]|>]
   ]];
 
 MCPDeleteCell[id_String, index_Integer] :=

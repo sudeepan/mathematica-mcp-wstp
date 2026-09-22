@@ -539,9 +539,19 @@ def evaluate_cells(
     return _reply(_condense_range(payload))
 
 
-@server.tool(description="Insert or delete a cell. actions: write(content,style,position) | delete(index).")
+@server.tool(
+    description=(
+        "Change the cells of an open notebook. actions: write(content,style,position) "
+        "| replace(index,content) | delete(index).\n"
+        "'replace' changes one cell's content in place and keeps its style and every "
+        "option, addressed by the same index 'delete' takes. Use it to edit an "
+        "existing cell: 'write' can only APPEND in a notebook whose cells sit inside "
+        "section groups, which is most real notebooks, because insertion rewrites "
+        "the top-level cell list only and will not splice into a group."
+    )
+)
 def edit_cells(
-    action: Literal["write", "delete"],
+    action: Literal["write", "replace", "delete"],
     content: str = "",
     style: str = "Input",
     index: int | None = None,
@@ -553,6 +563,12 @@ def edit_cells(
     if action == "write":
         return _reply(nb.write_cell(content, style=style, position=position,
                                     anchor=anchor, notebook=notebook))
+    if action == "replace":
+        if index is None:
+            return _fail("replace requires an index")
+        if not content:
+            return _fail("replace requires content")
+        return _reply(nb.replace_cell(index, content, notebook=notebook))
     if action == "delete":
         if index is None:
             return _fail("delete requires an index")

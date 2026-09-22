@@ -867,6 +867,14 @@ class HeadlessNotebooks:
             return self._no_session(notebook)
         return self._call_with_session("MCPWriteCell", notebook_id, content, style, position, int(anchor))
 
+    def replace_cell(self, index: int, content: str,
+                     notebook: str | None = None) -> dict[str, Any]:
+        """Change one cell's content in place, keeping its style and options."""
+        notebook_id = self._resolve(notebook)
+        if notebook_id is None:
+            return self._no_session(notebook)
+        return self._call_with_session("MCPReplaceCell", notebook_id, int(index), content)
+
     def delete_cell(self, index: int, notebook: str | None = None) -> dict[str, Any]:
         notebook_id = self._resolve(notebook)
         if notebook_id is None:
