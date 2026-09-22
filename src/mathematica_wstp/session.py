@@ -220,12 +220,20 @@ def restart_kernel() -> dict[str, Any]:
         }
 
 
-def close_kernel() -> None:
+def close_kernel() -> dict[str, Any]:
     global _kernel
     with _kernel_lock:
-        if _kernel is not None:
-            _kernel.close()
-            _kernel = None
+        if _kernel is None:
+            return {"success": True, "stopped_pid": None,
+                    "note": "no kernel was running"}
+        pid = _kernel.pid
+        subkernels = _kernel.observe_subkernels()
+        _kernel.close()
+        _kernel = None
+        leaked = [p for p in subkernels if registry.pid_alive(p)]
+        return {"success": True, "stopped_pid": pid,
+                "subkernels_closed": len(subkernels) - len(leaked),
+                "subkernels_leaked": leaked}
 
 
 ABORT_PROBE_TIMEOUT = 5.0

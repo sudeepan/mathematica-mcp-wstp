@@ -239,21 +239,26 @@ def abort(rebuild_parallel_kernels: bool = False) -> dict[str, Any]:
 
 @server.tool(
     description=(
-        "Kernel administration. actions: state | restart | abort | subkernels | "
+        "Kernel administration. actions: state | restart | stop | abort | subkernels | "
         "close_subkernels | reap. "
         "'restart' clears ALL definitions and closes subkernels properly; prefer "
         "abort() for a merely slow evaluation. "
+        "'stop' shuts the kernel down without starting a replacement -- the next "
+        "evaluate() call starts a fresh one on demand. Use it to release memory "
+        "when you are done computing. "
         "'close_subkernels' releases the parallel pool WITHOUT touching the master "
         "kernel or any definition in it -- an idle 20-way pool costs gigabytes, so "
         "offer it to the user once a parallel computation is finished."
     )
 )
 def kernel(
-    action: Literal["state", "restart", "abort", "subkernels",
+    action: Literal["state", "restart", "stop", "abort", "subkernels",
                     "close_subkernels", "reap"] = "state",
 ) -> dict[str, Any]:
     if action == "state":
         return _reply({"success": True, **session.kernel_status()})
+    if action == "stop":
+        return _reply(session.close_kernel())
     if action == "restart":
         return _reply(session.restart_kernel())
     if action == "abort":

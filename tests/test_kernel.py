@@ -1555,6 +1555,24 @@ def test_a_notebook_says_what_it_reads_and_writes_before_it_runs():
             os.unlink(path)
 
 
+def test_a_stopped_kernel_does_not_start_a_replacement():
+    """stop shuts the kernel down and leaves the slot empty until the next
+    evaluate() call needs one.
+    """
+    from mathematica_wstp import session as sess
+
+    sess.get_kernel()
+    result = sess.close_kernel()
+    assert result["success"]
+    assert result["stopped_pid"] is not None
+    assert not sess.has_kernel()
+
+    fresh = sess.evaluate_wl("1+1", timeout=10)
+    assert fresh.text.strip() == "2"
+    assert sess.has_kernel()
+    sess.close_kernel()
+
+
 # --- standalone runner -----------------------------------------------------
 
 def _main() -> int:
