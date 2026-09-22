@@ -865,7 +865,7 @@ class HeadlessNotebooks:
         notebook_id = self._resolve(notebook)
         if notebook_id is None:
             return self._no_session(notebook)
-        return self._call_with_session("MCPWriteCell", notebook_id, content, style, position, int(anchor))
+        return self._call_with_session("MCPWriteCell", notebook_id, content, style, position, int(anchor or 0))
 
     def file_dependencies(self, notebook: str | None = None,
                           timeout: int = 120) -> dict[str, Any]:
