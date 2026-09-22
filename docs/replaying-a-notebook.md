@@ -179,14 +179,14 @@ Task: replay the notebook at **PATH**.
 ### Before evaluating anything
 
 1. Work on a **copy**. Never write the original `.nb`.
-2. `read_notebook_file(path, mode="wolfram")` and scan every code cell for side
-   effects that leave the machine: `Export`, `Put`, `Save`, `DumpSave`,
-   `DeleteFile`, `CreateDirectory`, `Run`, `SetDirectory`, or anything else
-   that writes a file. **List them with their ordinals and stop.** I will tell
-   you which are safe.
-3. Report the executable-cell count and whether the notebook loads packages.
-4. If the work is expected to outlive this client/session, ask whether to use
-   the supervisor **before opening the notebook**.
+2. If the work may run for hours or must survive a dropped session, start the
+   **supervisor** before opening anything - it keeps the kernel alive if this
+   session dies.
+3. Open the copy and run `notebooks(action="dependencies")`. It scans every
+   code cell for file reads and writes (`Export`, `Put`, `DumpSave`, etc.) and
+   classifies each one. **List the results and stop.** I will tell you which
+   side effects are safe.
+4. Report the executable-cell count and whether the notebook loads packages.
 
 ### Running
 

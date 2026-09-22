@@ -126,11 +126,21 @@ A notebook can contain hundreds of prose/output cells around a much smaller
 number of executable cells. Judge replay progress by executable cells, not total
 cells.
 
+Before replaying an unfamiliar notebook, run
+`notebooks(action="dependencies")` to discover which files it reads and writes.
+The tool classifies each one (external input, round-trip data, stored result,
+write-only output) so you can tell the user which side effects to expect
+without reading every cell by hand.
+
 Stored boxes are the source of execution. Do not retype a rendered preview into
 Wolfram Language and assume it is equivalent.
 
 `cells(defines=...)` is the fastest way to answer "where was this symbol
 assigned?" without paging through the whole document.
+
+To modify a cell in place - for example, commenting out an `Export` or changing
+a parameter - use `edit_cells(action="replace")`. It replaces the cell's
+content at its current position without inserting or deleting.
 
 ## Indices move; ordinals do not
 
@@ -266,6 +276,18 @@ After interrupting parallel work, remember that a successful transport probe
 does not prove the algebra or distributed definitions are coherent. Rebuilding
 the parallel pool is a precaution the user can choose.
 
+## Releasing the kernel when done
+
+When you are finished computing and want to free all kernel memory:
+
+```text
+kernel(action="stop")
+```
+
+This shuts the kernel down without starting a replacement. The next
+`evaluate()` call starts a fresh one on demand. Use it to release memory at
+the end of a session rather than leaving a large kernel resident.
+
 ## External processes
 
 Managed processes and shell-detached processes have different lifetimes.
@@ -330,7 +352,7 @@ non-standard page size.
 Before a serious replay:
 
 ```text
-1. inspect the notebook for external side effects
+1. run notebooks(action="dependencies") to find side effects
 2. choose direct vs supervisor ownership
 3. open the notebook in that backend
 4. choose replay vs span deliberately

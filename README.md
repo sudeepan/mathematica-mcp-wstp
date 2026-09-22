@@ -194,9 +194,10 @@ do not need durable per-cell identity.
 `replay` addresses executable cells by **ordinal**, not raw notebook index.
 Writing outputs mutates the document, so indices move during the run.
 
-Before replaying an unfamiliar notebook, scan for external side effects such as
-`Export`, `Put`, `DumpSave`, `Run`, or `SetDirectory`. The fresh-agent procedure
-in [`docs/replaying-a-notebook.md`](docs/replaying-a-notebook.md) is designed for
+Before replaying an unfamiliar notebook, run
+`notebooks(action="dependencies")` to discover which files it reads and writes
+and classify them automatically. The fresh-agent procedure in
+[`docs/replaying-a-notebook.md`](docs/replaying-a-notebook.md) is designed for
 exactly this case.
 
 ## Work that lasts hours or days
@@ -228,13 +229,13 @@ Sixteen consolidated tools rather than a wide flat surface:
 |------|---------|
 | `evaluate` | Run Wolfram Language in the persistent kernel |
 | `abort` | Interrupt the running evaluation, keeping all state |
-| `kernel` | `state`, `restart`, `abort`, `subkernels`, `reap` |
+| `kernel` | `state`, `restart`, `stop`, `abort`, `subkernels`, `close_subkernels`, `reap` |
 | `status` | Kernel, installation and tracked-process health |
-| `notebooks` | `open`, `create`, `list`, `info`, `save`, `close` |
+| `notebooks` | `open`, `create`, `list`, `info`, `save`, `close`, `dependencies`, `verify` |
 | `cells` | List or read cells of an open notebook |
 | `evaluate_cells` | Replay a span of cells, state carrying between them |
 | `replay` | Per-cell replay with identity and a resumable manifest |
-| `edit_cells` | Insert or delete a cell |
+| `edit_cells` | Insert, replace or delete a cell |
 | `render` | Typeset an expression, rasterise a cell, export a notebook |
 | `vars` | Inspect, set or clear the kernel's `Global`` symbols |
 | `supervisor` | A kernel in its own process, outliving this one |
@@ -267,7 +268,7 @@ contains → this server.**
 | [`docs/replaying-a-notebook.md`](docs/replaying-a-notebook.md) | You are replaying a notebook or onboarding a fresh agent |
 | [`docs/long-running-work.md`](docs/long-running-work.md) | A cell may run for hours/days or must survive a dropped client |
 | [`docs/architecture.md`](docs/architecture.md) | You want the execution, replay and supervisor model |
-| [`docs/pitfalls.md`](docs/pitfalls.md) | You want the **nineteen** observed ways a plausible result can still be wrong |
+| [`docs/pitfalls.md`](docs/pitfalls.md) | You want the observed ways a plausible result can still be wrong |
 | [`docs/benchmarks.md`](docs/benchmarks.md) | You want measured costs and trade-offs |
 
 `guide(topic=...)` carries the short form inside the server:
