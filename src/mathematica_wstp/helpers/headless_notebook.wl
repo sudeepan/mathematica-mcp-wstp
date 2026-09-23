@@ -47,6 +47,7 @@ MCPVerifyAgainst::usage = "MCPVerifyAgainst[id, refPath] compares the session's 
 MCPExportMarkdown::usage = "MCPExportMarkdown[id, path, texMath] writes the session notebook as all-text Markdown (no rasterised outputs).";
 MCPExportNotebook::usage = "MCPExportNotebook[id, path, openGroups] writes the session notebook through the front end (PDF, PNG, ...).";
 MCPFrontEndAvailable::usage = "MCPFrontEndAvailable[] reports whether a headless front end can be started.";
+MCPFinalize::usage = "MCPFinalize[id, path] saves, then runs NotebookEvaluate via UsingFrontEnd so cells get native In[n]/Out[n] labels.";
 MCPBindNotebookDirectory::usage = "MCPBindNotebookDirectory[dir, path] makes NotebookDirectory[] and friends resolve without a front end.";
 
 Begin["`Private`"];
@@ -1697,6 +1698,50 @@ MCPExportNotebook[id_String, path_String, openGroups_: True,
       ]
     ]
   ];
+
+
+(* -- finalize: NotebookEvaluate with native In/Out labels -------------- *)
+
+MCPFinalize[id_String, path_String] := Module[
+  {session, nbExpr, tmpPath, nbo, evalResult, savedPath},
+
+  session = Lookup[$Sessions, id, Missing["KeyAbsent", id]];
+  If[MissingQ[session],
+    Return[err["No such headless notebook session: " <> id]]];
+
+  (* Save the current state to disk first *)
+  nbExpr = session["notebook"];
+  If[path === "",
+    Return[err["finalize requires a disk path"]]];
+  savedPath = path;
+  Export[savedPath, nbExpr, "NB"];
+  If[!FileExistsQ[savedPath],
+    Return[err["failed to write notebook to " <> savedPath]]];
+
+  (* Open in the front end and evaluate *)
+  Quiet[Check[
+    UsingFrontEnd[Module[{},
+      nbo = NotebookOpen[savedPath, Visible -> False];
+      If[Head[nbo] =!= NotebookObject,
+        Return[err["NotebookOpen failed inside UsingFrontEnd"]]];
+
+      evalResult = NotebookEvaluate[nbo, InsertResults -> True];
+      NotebookSave[nbo];
+      NotebookClose[nbo];
+
+      (* Reload the finalized notebook back into the session *)
+      session["notebook"] = Import[savedPath, "NB"];
+
+      ok[<|
+        "id" -> id,
+        "path" -> savedPath,
+        "finalized" -> True,
+        "note" -> "NotebookEvaluate ran all cells with InsertResults->True; the notebook on disk now has native In[n]/Out[n] labels"
+      |>]
+    ]],
+    err["NotebookEvaluate failed: " <> ToString[$MessageList]]
+  ], {FrontEndObject::notavail}]
+];
 
 
 End[];

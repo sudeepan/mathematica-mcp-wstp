@@ -85,6 +85,7 @@ class HeadlessNotebooks:
 
     _sessions: dict[str, _Session] = field(default_factory=dict)
     _counter: int = 0
+    _recording_target: str | None = field(default=None, repr=False)
 
     # -- plumbing ---------------------------------------------------------
 
@@ -854,6 +855,12 @@ class HeadlessNotebooks:
             return self._no_session(notebook)
         return self._call_with_session("MCPFindDefining", notebook_id, symbol, timeout=60)
 
+    _RECORDING_LOCKED = {
+        "success": False,
+        "error": "notebook is recording; only evaluate() can write to it",
+        "headless": True,
+    }
+
     def write_cell(
         self,
         content: str,
@@ -865,6 +872,8 @@ class HeadlessNotebooks:
         notebook_id = self._resolve(notebook)
         if notebook_id is None:
             return self._no_session(notebook)
+        if notebook_id == self._recording_target:
+            return dict(self._RECORDING_LOCKED)
         return self._call_with_session("MCPWriteCell", notebook_id, content, style, position, int(anchor or 0))
 
     def file_dependencies(self, notebook: str | None = None,
@@ -935,12 +944,16 @@ class HeadlessNotebooks:
         notebook_id = self._resolve(notebook)
         if notebook_id is None:
             return self._no_session(notebook)
+        if notebook_id == self._recording_target:
+            return dict(self._RECORDING_LOCKED)
         return self._call_with_session("MCPReplaceCell", notebook_id, int(index), content)
 
     def delete_cell(self, index: int, notebook: str | None = None) -> dict[str, Any]:
         notebook_id = self._resolve(notebook)
         if notebook_id is None:
             return self._no_session(notebook)
+        if notebook_id == self._recording_target:
+            return dict(self._RECORDING_LOCKED)
         return self._call_with_session("MCPDeleteCell", notebook_id, int(index))
 
     def execute_in_notebook(
@@ -958,6 +971,8 @@ class HeadlessNotebooks:
         notebook_id = self._resolve(notebook)
         if notebook_id is None:
             return self._no_session(notebook)
+        if notebook_id == self._recording_target:
+            return dict(self._RECORDING_LOCKED)
         written = self._call_with_session("MCPWriteCell", notebook_id, code, style, "End", 0)
         if not written.get("success"):
             return written
@@ -980,6 +995,81 @@ class HeadlessNotebooks:
                 if notebook_id in self._sessions:
                     self._sessions[notebook_id].path = result["path"]
         return result
+
+    # -- recording --------------------------------------------------------
+
+    def start_recording(self, notebook: str | None = None) -> dict[str, Any]:
+        """Start recording every evaluate() call into a notebook."""
+        notebook_id = self._resolve(notebook)
+        if notebook_id is None:
+            return self._no_session(notebook)
+        self._recording_target = notebook_id
+        with _registry_lock:
+            sess = self._sessions.get(notebook_id)
+        return {
+            "success": True,
+            "recording": True,
+            "notebook": notebook_id,
+            "path": sess.path if sess else "",
+            "headless": True,
+        }
+
+    def stop_recording(self) -> dict[str, Any]:
+        was = self._recording_target
+        self._recording_target = None
+        return {
+            "success": True,
+            "recording": False,
+            "was_recording": was,
+            "headless": True,
+        }
+
+    @property
+    def recording(self) -> str | None:
+        return self._recording_target
+
+    def record_input(self, code: str, style: str = "Input") -> dict[str, Any] | None:
+        """Write a cell into the recording notebook, if one is active.
+
+        Returns None when recording is off, the write result otherwise.
+        Bypasses write_cell() so the recording lock cannot block it.
+        Failures are logged but never block the caller's evaluation.
+        """
+        target = self._recording_target
+        if target is None:
+            return None
+        try:
+            return self._call_with_session(
+                "MCPWriteCell", target, code, style, "End", 0)
+        except Exception:
+            logger.warning("recording cell write failed", exc_info=True)
+            return {"success": False, "error": "recording write failed"}
+
+    def finalize(self, notebook: str | None = None,
+                 timeout: int = 600) -> dict[str, Any]:
+        """Run NotebookEvaluate on the recorded notebook in a fresh kernel.
+
+        Saves the notebook to disk first, then evaluates it via UsingFrontEnd
+        so every cell gets native In[n]/Out[n] labels.
+        """
+        notebook_id = self._resolve(notebook)
+        if notebook_id is None:
+            return self._no_session(notebook)
+
+        saved = self.save(notebook=notebook_id)
+        if not saved.get("success"):
+            return saved
+        nb_path = saved.get("path", "")
+        if not nb_path:
+            return {
+                "success": False,
+                "error": "notebook has no disk path; save it first",
+                "headless": True,
+            }
+
+        return self._call_with_session(
+            "MCPFinalize", notebook_id, nb_path, timeout=timeout,
+        )
 
     # -- errors -----------------------------------------------------------
 

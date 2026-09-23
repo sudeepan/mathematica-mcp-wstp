@@ -255,6 +255,72 @@ Check `written_by`. `frontend` means a real notebook file was written. `put`
 means the kernel wrote a bare expression dump; that may round-trip through the
 kernel while still being unsuitable as a desktop notebook.
 
+## Recording every evaluation into a notebook
+
+Every `evaluate()` call can be automatically written as a cell into an open
+notebook. This gives a complete, auditable record of what the kernel ran.
+
+Start recording when you create or open the target notebook:
+
+```text
+notebooks(action="create", title="Computation Log", path="/tmp/log.nb", record=True)
+```
+
+Or start it later on an already-open notebook:
+
+```text
+notebooks(action="record", notebook="hnb1")
+```
+
+From that point on, every `evaluate(code)` call writes `code` as a cell
+into the recording notebook before the kernel evaluates it. The recording
+happens silently; a `recorded: true` flag in the evaluate reply confirms it.
+
+### The recording lock
+
+While recording is active, `write_cell`, `edit_cells`, `execute_in_notebook`
+are **blocked** on the recording notebook. The only write path is `evaluate()`.
+This is enforced in code, not by convention.
+
+### Cell styles
+
+By default, recorded cells are Input cells. Pass `style` to `evaluate()` to
+write a different cell style:
+
+```text
+evaluate("Diagrams", style="Chapter")
+evaluate("Common setup", style="Section")
+evaluate("GraphGen[1]")
+```
+
+The style string passes through to the notebook unchanged. The kernel still
+evaluates the code (a section title evaluates to the string itself), and the
+notebook gets a Chapter, Section, or Subsection cell instead of an Input cell.
+
+### Stopping
+
+```text
+notebooks(action="stop_recording")
+```
+
+Closing the recording notebook also stops recording. Once stopped, the lock
+lifts and `write_cell`/`edit_cells` work again on that notebook.
+
+### Finalizing
+
+Once the prototyping session is complete and the recording notebook contains
+all the cells, `finalize` re-runs them via `NotebookEvaluate` so every
+cell gets native In[n]/Out[n] labels:
+
+```text
+notebooks(action="finalize")
+```
+
+This saves the notebook to disk, opens it in the offscreen front end, runs
+`NotebookEvaluate[nb, InsertResults -> True]`, and saves the result. The
+notebook on disk is then a self-contained document a human can open in
+Mathematica and see exactly what was computed.
+
 ## Parallel work
 
 A finished parallel computation can leave a large subkernel pool resident even
@@ -362,6 +428,17 @@ Before a serious replay:
 8. reconcile rather than guess after interruption
 9. verify the notebook record
 10. save explicitly when file durability matters
+```
+
+For a from-scratch computation:
+
+```text
+1. notebooks(action="create", ..., record=True) to start a recording notebook
+2. evaluate("Chapter Title", style="Chapter") for structure
+3. evaluate(code) for computation - every call is recorded
+4. write_cell/edit_cells are BLOCKED on the recording notebook
+5. notebooks(action="save") to persist the record
+6. notebooks(action="finalize") to re-run with native In/Out labels
 ```
 
 For the observed failure modes behind these rules, read

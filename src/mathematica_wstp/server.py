@@ -137,10 +137,18 @@ def _fail(error: str, **extra: Any) -> CallToolResult:
     description=(
         "Evaluate Wolfram Language code in the persistent kernel. State carries "
         "between calls. On timeout the evaluation is ABORTED but the kernel and "
-        "all its definitions survive, so you can retry a smaller piece."
+        "all its definitions survive, so you can retry a smaller piece.\n"
+        "When recording is active, every call is written into the recording "
+        "notebook. Pass style to control the cell style: 'Input' (default), "
+        "'Chapter', 'Section', 'Subsection', 'Item', etc. A non-Input style "
+        "is useful for structuring the recorded notebook with section headers "
+        "that still go through the kernel."
     )
 )
-def evaluate(code: str, timeout: float = 60.0) -> dict[str, Any]:
+def evaluate(code: str, timeout: float = 60.0,
+             style: str = "Input") -> dict[str, Any]:
+    nb = get_headless_notebooks()
+    rec = nb.record_input(code, style=style)
     result = evaluate_text(code, timeout=timeout)
     notice = session.take_kernel_change_notice()
     if not result.success:
@@ -172,6 +180,8 @@ def evaluate(code: str, timeout: float = 60.0) -> dict[str, Any]:
             payload["printed"] = result.prints
         if result.messages:
             payload["messages"] = result.messages
+        if rec is not None:
+            payload["recorded"] = rec.get("success", False)
         payload.update(result.extra)
         return _reply(payload)
 
@@ -210,6 +220,8 @@ def evaluate(code: str, timeout: float = 60.0) -> dict[str, Any]:
     if result.messages:
         payload["messages"] = result.messages
         payload["message_names"] = sorted({m["name"] for m in result.messages if m.get("name")})
+    if rec is not None:
+        payload["recorded"] = rec.get("success", False)
     flags = [k for k in ("truncated", "kernel_replaced", "result_may_be_partial")
              if payload.get(k)]
     if result.messages:
@@ -291,12 +303,14 @@ def status() -> dict[str, Any]:
         "kernels_tracked": registry.registered_kernels(),
         "orphans": registry.orphan_report(),
         "notebooks": (get_headless_notebooks().list() or {}).get("notebooks", []),
+        "recording_to": get_headless_notebooks().recording,
     }
     where = (f"K{k.get('generation')}, pid {k.get('pid')}, {k.get('link_health')}"
              if k.get("alive") else "no kernel running")
-    return _reply(payload, "WSTP {} -- {} subkernel(s), {} notebook(s) open, {} orphan(s)".format(
+    rec = f", recording to {payload['recording_to']}" if payload["recording_to"] else ""
+    return _reply(payload, "WSTP {} -- {} subkernel(s), {} notebook(s) open, {} orphan(s){}".format(
         where, len(k.get("subkernels") or []),
-        len(payload["notebooks"]), len(payload["orphans"])))
+        len(payload["notebooks"]), len(payload["orphans"]), rec))
 
 
 # --- notebooks -------------------------------------------------------------
@@ -304,8 +318,12 @@ def status() -> dict[str, Any]:
 @server.tool(
     description=(
         "Notebook sessions over .nb files on disk. actions: open(path) | create(title,path) "
-        "| list | info | save(path) | close | dependencies. Cells are evaluated from "
-        "their original stored boxes, so nothing is lost in translation.\n"
+        "| list | info | save(path) | close | dependencies | record | stop_recording "
+        "| finalize.\n"
+        "record: start recording every evaluate() call as an Input cell into this "
+        "notebook. Pass record=True with create or open to start recording immediately. "
+        "stop_recording: stop recording. finalize: save the notebook and run "
+        "NotebookEvaluate on it so every cell gets native In[n]/Out[n] labels.\n"
         "'dependencies' reports every file the notebook reads or writes, COMMENTED "
         "CELLS INCLUDED, and classifies each one: EXTERNAL_INPUT (must exist first), "
         "ROUND_TRIP (written then read back - never skip the write), "
@@ -318,16 +336,21 @@ def status() -> dict[str, Any]:
 )
 def notebooks(
     action: Literal["open", "create", "list", "info", "save", "close", "verify",
-                    "dependencies"] = "list",
+                    "dependencies", "record", "stop_recording", "finalize"] = "list",
     path: str | None = None,
     title: str = "Untitled",
     notebook: str | None = None,
+    record: bool = False,
 ) -> dict[str, Any]:
     nb = get_headless_notebooks()
     if action == "open":
         if not path:
             return _fail("open requires a path")
-        return _reply(nb.open(path))
+        result = nb.open(path)
+        if record and result.get("success"):
+            nb.start_recording(result.get("id"))
+            result["recording"] = True
+        return _reply(result)
     if action == "dependencies":
         # Run this BEFORE evaluating an unfamiliar notebook. A cell that loads
         # a stored result is indistinguishable at runtime from one that
@@ -342,15 +365,31 @@ def notebooks(
             return _reply(nb.verify_self(notebook=notebook))
         return _reply(nb.verify_against(path, notebook=notebook))
     if action == "create":
-        return _reply(nb.create(title=title, path=path))
+        result = nb.create(title=title, path=path)
+        if record and result.get("success"):
+            nb.start_recording(result.get("id"))
+            result["recording"] = True
+        return _reply(result)
     if action == "list":
-        return _reply(nb.list())
+        result = nb.list()
+        rec = nb.recording
+        if rec:
+            result["recording_to"] = rec
+        return _reply(result)
     if action == "info":
         return _reply(nb.info(notebook))
     if action == "save":
         return _reply(nb.save(notebook, path))
     if action == "close":
+        if nb.recording == nb._resolve(notebook):
+            nb.stop_recording()
         return _reply(nb.close(notebook))
+    if action == "record":
+        return _reply(nb.start_recording(notebook))
+    if action == "stop_recording":
+        return _reply(nb.stop_recording())
+    if action == "finalize":
+        return _reply(nb.finalize(notebook=notebook, timeout=600))
     return _fail(f"unknown action: {action}")
 
 
