@@ -32,7 +32,7 @@ The **hub** is the session where the larger research problem is being developed 
 
 The **spokes** are short-term computational investigations. They do not need to communicate with one another directly. Each may have its own notebook, kernel state, assumptions, intermediate results, and failure history. Each spoke can be used for investigating specific questions that emerged naturally in the course of research in the hub, and would require a Mathematica-driven workflow to adequately address them.
 
-A harness like Claude Code enables agentic message passing across sessions, and the user can also prompt in any session to read up the transcript of another one, and also look up the artefacts generated therein. One of these sessions could be the hub, and the others can play the role of spokes. The artefacts must be generated in a *zero trust* manner - they should not change depending on the choice of the harness, model, model-effort, etc.
+A harness like Claude Code enables agentic message passing across sessions, and the user can also prompt in any session to read up the transcript of another one, and also look up the artifacts generated therein. One of these sessions could be the hub, and the others can play the role of spokes. The artifacts must be generated in a *zero trust* manner - they should not change depending on the choice of the harness, model, model-effort, etc.
 
 A typical workflow:
 
