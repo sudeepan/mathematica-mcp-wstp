@@ -47,6 +47,7 @@ MCPVerifyAgainst::usage = "MCPVerifyAgainst[id, refPath] compares the session's 
 MCPExportMarkdown::usage = "MCPExportMarkdown[id, path, texMath] writes the session notebook as all-text Markdown (no rasterised outputs).";
 MCPExportNotebook::usage = "MCPExportNotebook[id, path, openGroups] writes the session notebook through the front end (PDF, PNG, ...).";
 MCPFrontEndAvailable::usage = "MCPFrontEndAvailable[] reports whether a headless front end can be started.";
+MCPReadBack::usage = "MCPReadBack[id] reads all cells with full metadata: source digest, TaggingRules, Evaluatable, CellTags.";
 MCPFinalize::usage = "MCPFinalize[id, path] saves, then runs NotebookEvaluate via UsingFrontEnd so cells get native In[n]/Out[n] labels.";
 MCPBindNotebookDirectory::usage = "MCPBindNotebookDirectory[dir, path] makes NotebookDirectory[] and friends resolve without a front end.";
 
@@ -939,10 +940,16 @@ MCPFindDefining[id_String, symbol_String] :=
 (* ------------------------------------------------------------------------ *)
 
 MCPWriteCell[id_String, content_String, style_String, position_String, anchor_Integer] :=
+  MCPWriteCell[id, content, style, position, anchor, ""];
+
+MCPWriteCell[id_String, content_String, style_String, position_String, anchor_Integer, recordTag_String] :=
   sessionOr[id, Module[{nb, pos, newCell, cells, at, updated},
     nb = $Sessions[id, "nb"];
     pos = leafPositions[nb];
-    newCell = Cell[BoxData[content], style];
+    newCell = If[recordTag === "",
+      Cell[BoxData[content], style],
+      Cell[BoxData[content], style, TaggingRules -> {"MCPRecordTag" -> recordTag}]
+    ];
     (* Insertion only rewrites the TOP-LEVEL cell list. Splicing into a nested
        CellGroupData would need the group's own position and is deliberately
        not attempted: silently putting a cell in the wrong group is worse than
@@ -959,7 +966,9 @@ MCPWriteCell[id_String, content_String, style_String, position_String, anchor_In
     updated = Insert[cells, newCell, at + 1];
     setNotebook[id, ReplacePart[nb, 1 -> updated]];
     $Sessions[id, "dirty"] = True;
-    ok[<|"id" -> id, "inserted_at" -> at, "cell_count" -> Length[leafPositions[$Sessions[id, "nb"]]]|>]
+    ok[<|"id" -> id, "inserted_at" -> at,
+        "record_tag" -> recordTag,
+        "cell_count" -> Length[leafPositions[$Sessions[id, "nb"]]]|>]
   ]];
 
 (* Replacing a cell's CONTENT, leaving its position, style and options alone.
@@ -1743,6 +1752,54 @@ MCPFinalize[id_String, path_String] := Module[
   ], {FrontEndObject::notavail}]
 ];
 
+
+(* ------------------------------------------------------------------------ *)
+(* Read-back: full cell metadata for recorder verification                  *)
+(* ------------------------------------------------------------------------ *)
+
+(* MCPCells reports style, executable, and a preview. The recorder needs more:
+   the source digest (same pipeline as MCPInputDigests / boxText), the
+   TaggingRules that carry the record identity, and the Evaluatable option
+   that controls whether NotebookEvaluate will skip a cell.
+
+   This is a verification tool, not a display tool. It returns every cell so
+   the recorder can detect injections, deletions, and reorderings by comparing
+   the full sequence against the durable ledger. *)
+
+MCPReadBack[id_String] :=
+  sessionOr[id, Module[{nb, pos, cells},
+    nb = $Sessions[id, "nb"];
+    pos = leafPositions[nb];
+    cells = Table[
+      Module[{c = Extract[nb, pos[[q]]], args, opts, tr, ev, ct, src, digest, tag, replayTag},
+        args = List @@ c;
+        opts = If[Length[args] > 2 && StringQ[args[[2]]], Drop[args, 2], {}];
+        tr = FirstCase[opts, (TaggingRules -> v_) :> v, {}];
+        ev = FirstCase[opts, (Evaluatable -> v_) :> v, Null];
+        ct = FirstCase[opts, (CellTags -> v_) :> v, {}];
+        tag = FirstCase[Flatten[{tr}], ("MCPRecordTag" -> v_) :> v, ""];
+        replayTag = FirstCase[Flatten[{tr}], ("MCPReplayChild" -> v_) :> v, ""];
+        src = boxText[First[c] /. BoxData[b_] :> b];
+        digest = Hash[src, "SHA256", "HexString"];
+        <|
+          "index" -> q - 1,
+          "style" -> cellStyle[c],
+          "executable" -> executableQ[c],
+          "source_digest" -> digest,
+          "source_chars" -> StringLength[src],
+          "source_preview" -> StringTake[src, UpTo[200]],
+          "evaluatable" -> ev,
+          "record_tag" -> tag,
+          "replay_tag" -> replayTag,
+          "cell_tags" -> Flatten[{ct}]
+        |>
+      ],
+      {q, Length[pos]}
+    ];
+    ok[<|"id" -> id, "total" -> Length[cells], "cells" -> cells|>]
+  ]];
+
+Protect[MCPReadBack];
 
 End[];
 EndPackage[];

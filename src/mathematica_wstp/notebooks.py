@@ -868,13 +868,28 @@ class HeadlessNotebooks:
         notebook: str | None = None,
         position: str = "End",
         anchor: int = 0,
+        record_tag: str = "",
     ) -> dict[str, Any]:
         notebook_id = self._resolve(notebook)
         if notebook_id is None:
             return self._no_session(notebook)
         if notebook_id == self._recording_target:
             return dict(self._RECORDING_LOCKED)
-        return self._call_with_session("MCPWriteCell", notebook_id, content, style, position, int(anchor or 0))
+        return self._call_with_session(
+            "MCPWriteCell", notebook_id, content, style, position, int(anchor or 0), record_tag
+        )
+
+    def read_back(self, notebook: str | None = None) -> dict[str, Any]:
+        """Full cell metadata for recorder verification.
+
+        Returns every cell with its source digest, TaggingRules-based record
+        tag, Evaluatable option, and CellTags. The recorder uses this to
+        compare the notebook's actual state against the durable ledger.
+        """
+        notebook_id = self._resolve(notebook)
+        if notebook_id is None:
+            return self._no_session(notebook)
+        return self._call_with_session("MCPReadBack", notebook_id, timeout=30)
 
     def file_dependencies(self, notebook: str | None = None,
                           timeout: int = 120) -> dict[str, Any]:
