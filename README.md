@@ -94,7 +94,7 @@ The transcript is the reasoning-level handoff. The notebook or artifact is the c
 
 This becomes especially important when one session consumes a result produced by another. The receiving session should not have to trust a sentence such as "the other session found that this identity holds." It should be possible to inspect the durable calculation behind that statement.
 
-### Advantages of a headless design
+## Advantages of a headless design
 
 A GUI-centric workflow is excellent when the human and agent are collaborating inside one visible notebook. A headless MCP becomes attractive when the unit of work is instead:
 
