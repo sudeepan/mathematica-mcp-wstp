@@ -47,6 +47,7 @@ MCPVerifyAgainst::usage = "MCPVerifyAgainst[id, refPath] compares the session's 
 MCPExportMarkdown::usage = "MCPExportMarkdown[id, path, texMath] writes the session notebook as all-text Markdown (no rasterised outputs).";
 MCPExportNotebook::usage = "MCPExportNotebook[id, path, openGroups] writes the session notebook through the front end (PDF, PNG, ...).";
 MCPFrontEndAvailable::usage = "MCPFrontEndAvailable[] reports whether a headless front end can be started.";
+MCPAnnotateCell::usage = "MCPAnnotateCell[id, index, evaluatable, reason] sets Evaluatable and stamps an annotation reason on a cell.";
 MCPReadBack::usage = "MCPReadBack[id] reads all cells with full metadata: source digest, TaggingRules, Evaluatable, CellTags.";
 MCPFinalize::usage = "MCPFinalize[id, path] saves, then runs NotebookEvaluate via UsingFrontEnd so cells get native In[n]/Out[n] labels.";
 MCPBindNotebookDirectory::usage = "MCPBindNotebookDirectory[dir, path] makes NotebookDirectory[] and friends resolve without a front end.";
@@ -1754,6 +1755,42 @@ MCPFinalize[id_String, path_String] := Module[
 
 
 (* ------------------------------------------------------------------------ *)
+(* Annotation: set Evaluatable and stamp a reason on a cell                 *)
+(* ------------------------------------------------------------------------ *)
+
+(* The recorder marks cells non-evaluatable after abort, timeout, or failure
+   so that NotebookEvaluate skips them during finalization. The reason is
+   stamped in TaggingRules so MCPReadBack can report it. *)
+
+MCPAnnotateCell[id_String, index_Integer, evaluatable : (True | False), reason_String] :=
+  sessionOr[id, Module[{nb, pos, target, args, opts, tr, newTr, newOpts, replacement},
+    nb = $Sessions[id, "nb"];
+    pos = leafPositions[nb];
+    If[index < 0 || index >= Length[pos],
+      Return[err["Cell index out of range", <|"index" -> index, "total" -> Length[pos]|>]]
+    ];
+    target = Extract[nb, pos[[index + 1]]];
+    If[Head[target] =!= Cell, Return[err["Not a cell"]]];
+    args = List @@ target;
+    If[Length[args] < 2 || !StringQ[args[[2]]], Return[err["malformed cell"]]];
+    opts = Drop[args, 2];
+    (* Update TaggingRules: preserve existing, add/replace MCPAnnotationReason *)
+    tr = FirstCase[opts, (TaggingRules -> v_) :> v, {}];
+    newTr = Prepend[
+      DeleteCases[Flatten[{tr}], ("MCPAnnotationReason" -> _)],
+      "MCPAnnotationReason" -> reason];
+    newOpts = Join[
+      DeleteCases[opts, (TaggingRules -> _) | (Evaluatable -> _)],
+      {TaggingRules -> newTr, Evaluatable -> evaluatable}];
+    replacement = Cell @@ Join[{args[[1]], args[[2]]}, newOpts];
+    setNotebook[id, ReplacePart[nb, pos[[index + 1]] -> replacement]];
+    $Sessions[id, "dirty"] = True;
+    ok[<|"id" -> id, "annotated" -> index, "evaluatable" -> evaluatable,
+        "reason" -> reason,
+        "cell_count" -> Length[leafPositions[$Sessions[id, "nb"]]]|>]
+  ]];
+
+(* ------------------------------------------------------------------------ *)
 (* Read-back: full cell metadata for recorder verification                  *)
 (* ------------------------------------------------------------------------ *)
 
@@ -1771,7 +1808,7 @@ MCPReadBack[id_String] :=
     nb = $Sessions[id, "nb"];
     pos = leafPositions[nb];
     cells = Table[
-      Module[{c = Extract[nb, pos[[q]]], args, opts, tr, ev, ct, src, digest, tag, replayTag},
+      Module[{c = Extract[nb, pos[[q]]], args, opts, tr, ev, ct, src, digest, tag, replayTag, annoReason},
         args = List @@ c;
         opts = If[Length[args] > 2 && StringQ[args[[2]]], Drop[args, 2], {}];
         tr = FirstCase[opts, (TaggingRules -> v_) :> v, {}];
@@ -1779,6 +1816,7 @@ MCPReadBack[id_String] :=
         ct = FirstCase[opts, (CellTags -> v_) :> v, {}];
         tag = FirstCase[Flatten[{tr}], ("MCPRecordTag" -> v_) :> v, ""];
         replayTag = FirstCase[Flatten[{tr}], ("MCPReplayChild" -> v_) :> v, ""];
+        annoReason = FirstCase[Flatten[{tr}], ("MCPAnnotationReason" -> v_) :> v, ""];
         src = boxText[First[c] /. BoxData[b_] :> b];
         digest = Hash[src, "SHA256", "HexString"];
         <|
@@ -1790,6 +1828,7 @@ MCPReadBack[id_String] :=
           "source_preview" -> StringTake[src, UpTo[200]],
           "evaluatable" -> ev,
           "record_tag" -> tag,
+          "annotation_reason" -> annoReason,
           "replay_tag" -> replayTag,
           "cell_tags" -> Flatten[{ct}]
         |>
@@ -1799,7 +1838,7 @@ MCPReadBack[id_String] :=
     ok[<|"id" -> id, "total" -> Length[cells], "cells" -> cells|>]
   ]];
 
-Protect[MCPReadBack];
+Protect[MCPAnnotateCell, MCPReadBack];
 
 End[];
 EndPackage[];

@@ -89,16 +89,77 @@ class Recorder:
 
     def apply_outcome(self, seq: int, disposition: dict[str, str]
                       ) -> dict[str, Any]:
-        """Store the raw disposition axes for a record, then verify post-eval."""
+        """Store the raw disposition axes for a record, then verify post-eval.
+
+        When the execution outcome is not COMPLETED, the cell is automatically
+        annotated as non-evaluatable so finalization will not re-run it.
+        """
         self.ledger.update_record(seq, disposition=disposition,
                                   disposition_at=time.time())
+
+        annotation = self._auto_annotate(seq, disposition)
 
         verification = self._verify_full()
         return {
             "seq": seq,
             "disposition": disposition,
+            "annotation": annotation,
             "post_eval_verification": verification,
         }
+
+    def _auto_annotate(self, seq: int, disposition: dict[str, str]
+                       ) -> dict[str, Any] | None:
+        """Mark non-COMPLETED cells as non-evaluatable in the notebook."""
+        outcome = disposition.get("execution_outcome", "")
+        if outcome == "COMPLETED":
+            return None
+
+        record = self.ledger.record_by_seq(seq)
+        if record is None:
+            return None
+
+        tag = record["record_tag"]
+        readback = self.notebooks._call_with_session(
+            "MCPReadBack", self.notebook_id, timeout=30)
+        if not readback.get("success"):
+            logger.warning("annotation read-back failed: %s",
+                           readback.get("error"))
+            return {"applied": False, "error": readback.get("error")}
+
+        cell_index = None
+        for c in readback.get("cells", []):
+            if c.get("record_tag") == tag:
+                cell_index = c["index"]
+                break
+
+        if cell_index is None:
+            return {"applied": False, "error": f"cell {tag} not found"}
+
+        reason = _annotation_reason(disposition)
+        result = self.notebooks.annotate_cell(
+            cell_index, evaluatable=False, reason=reason,
+            notebook=self.notebook_id)
+        applied = result.get("success", False)
+
+        self.ledger.update_record(seq, annotated=applied,
+                                  annotation_reason=reason)
+        return {"applied": applied, "reason": reason}
+
+    def unresolved_records(self) -> list[dict[str, Any]]:
+        """Records with a non-COMPLETED outcome that have not been annotated."""
+        unresolved = []
+        for r in self.ledger.records:
+            disp = r.get("disposition")
+            if disp is None:
+                continue
+            if disp.get("execution_outcome") == "COMPLETED":
+                continue
+            if not r.get("annotated"):
+                unresolved.append(r)
+        return unresolved
+
+    def has_unresolved(self) -> bool:
+        return len(self.unresolved_records()) > 0
 
     def _verify_full(self) -> dict[str, Any]:
         """Full read-back: compare every ledger entry against the notebook."""
@@ -137,6 +198,22 @@ class Recorder:
             "notebook_id": self.notebook_id,
             "ledger": self.ledger.summary(),
         }
+
+
+def _annotation_reason(disposition: dict[str, str]) -> str:
+    """Human-readable reason for why a cell was marked non-evaluatable."""
+    outcome = disposition.get("execution_outcome", "FAILED")
+    intent = disposition.get("control_intent", "NONE")
+    readiness = disposition.get("kernel_readiness", "READY")
+
+    parts = [outcome.lower().replace("_", " ")]
+    if intent == "SYSTEM_TIMEOUT":
+        parts.append("system timeout")
+    elif intent == "USER_REQUESTED":
+        parts.append("user requested")
+    if readiness in ("FAULTED", "RESTARTED"):
+        parts.append(f"kernel {readiness.lower()}")
+    return "; ".join(parts)
 
 
 def extract_disposition(result: Any, kernel_notice: str | None,
