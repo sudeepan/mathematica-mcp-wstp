@@ -151,6 +151,22 @@ def evaluate(code: str, timeout: float = 60.0,
     rec = nb.record_input(code, style=style)
     result = evaluate_text(code, timeout=timeout)
     notice = session.take_kernel_change_notice()
+
+    # Kernel verification - computed once, used by both payload and recorder
+    kernel_verdict: str | None = None
+    kernel_detail = ""
+    if not result.success and result.timed_out:
+        kernel_verdict, kernel_detail = session.verify_current_kernel()
+
+    # Post-eval recording: store disposition axes and verify notebook integrity
+    rec_seq = rec.get("seq") if isinstance(rec, dict) else None
+    if rec_seq is not None:
+        outcome = nb.record_outcome(rec_seq, result, notice, kernel_verdict)
+        if outcome and isinstance(rec, dict):
+            rec["disposition"] = outcome.get("disposition")
+            rec["post_eval_verification"] = outcome.get(
+                "post_eval_verification")
+
     if not result.success:
         payload: dict[str, Any] = {
             "success": False,
@@ -162,16 +178,13 @@ def evaluate(code: str, timeout: float = 60.0,
             payload["kernel_replaced"] = True
             payload["kernel_notice"] = notice
         if result.timed_out:
-            # Ask the kernel rather than inferring from aborted_cleanly, which
-            # only ever meant "the evaluation released the lock".
-            verdict, detail = session.verify_current_kernel()
-            payload["kernel"] = verdict
+            payload["kernel"] = kernel_verdict
             payload["kernel_state"] = {
-                "alive": "intact -- the kernel answered a probe after the abort",
-                "dead": f"LOST -- the kernel did not survive ({detail}); every definition is gone",
-                "unverified": f"unverified -- no answer to a probe ({detail}); do not assume it survived",
+                "alive": "intact - the kernel answered a probe after the abort",
+                "dead": f"LOST - the kernel did not survive ({kernel_detail}); every definition is gone",
+                "unverified": f"unverified - no answer to a probe ({kernel_detail}); do not assume it survived",
                 "none": "no kernel is running",
-            }[verdict]
+            }[kernel_verdict]
             payload["next_step"] = (
                 "Retry with a smaller input, a larger timeout, or wrap the slow part "
                 "in TimeConstrained. Variables from earlier calls are still defined."
@@ -188,13 +201,6 @@ def evaluate(code: str, timeout: float = 60.0,
     text, truncated = _truncate(result.text)
     payload: dict[str, Any] = {"success": True, "output": text}
     if result.abort_requested_during:
-        # An abort was asked for and a value came back regardless. Whether an
-        # out-of-band abort unwinds the whole expression or only the innermost
-        # one is version-dependent -- measured, 15.0.1 unwinds and 14.0.0 leaves
-        # the enclosing CompoundExpression to continue -- so this result may be
-        # the tail of a computation whose earlier part was cut off. Saying so is
-        # the whole point: a partial execution reported as a clean success is
-        # indistinguishable from a real answer.
         payload["abort_requested_during"] = True
         payload["result_may_be_partial"] = True
         payload["note"] = (
@@ -205,16 +211,11 @@ def evaluate(code: str, timeout: float = 60.0,
             "if the value matters, and check any state it assigned."
         )
     if notice:
-        # The case that matters: a SUCCESSFUL call against a kernel that was
-        # silently swapped underneath it. Without this the reply is
-        # indistinguishable from one against the session you thought you had.
         payload["kernel_replaced"] = True
         payload["kernel_notice"] = notice
     if truncated:
         payload["truncated"] = True
         payload["note"] = "Full value is still in the kernel; ask for a part of it."
-    # Messages and Print output are the difference between a wrong answer you
-    # can explain and one you cannot. Always surface them.
     if result.prints:
         payload["printed"] = result.prints
     if result.messages:

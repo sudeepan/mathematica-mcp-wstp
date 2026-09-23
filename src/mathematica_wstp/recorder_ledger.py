@@ -122,6 +122,14 @@ class RecorderLedger:
         _write_atomically(self.path, self.data)
         return record
 
+    def update_record(self, seq: int, **fields: Any) -> None:
+        """Update fields on an existing record and flush to disk."""
+        record = self.record_by_seq(seq)
+        if record is None:
+            return
+        record.update(fields)
+        _write_atomically(self.path, self.data)
+
     def record_by_seq(self, seq: int) -> dict[str, Any] | None:
         for r in self.data["records"]:
             if r["seq"] == seq:

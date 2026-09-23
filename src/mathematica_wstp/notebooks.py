@@ -86,6 +86,7 @@ class HeadlessNotebooks:
     _sessions: dict[str, _Session] = field(default_factory=dict)
     _counter: int = 0
     _recording_target: str | None = field(default=None, repr=False)
+    _recorder: Any = field(default=None, repr=False)
 
     # -- plumbing ---------------------------------------------------------
 
@@ -1015,29 +1016,40 @@ class HeadlessNotebooks:
 
     def start_recording(self, notebook: str | None = None) -> dict[str, Any]:
         """Start recording every evaluate() call into a notebook."""
+        from .recorder import Recorder
+
         notebook_id = self._resolve(notebook)
         if notebook_id is None:
             return self._no_session(notebook)
         self._recording_target = notebook_id
         with _registry_lock:
             sess = self._sessions.get(notebook_id)
+        nb_path = sess.path if sess else ""
+        self._recorder = Recorder(self, notebook_id, nb_path)
         return {
             "success": True,
             "recording": True,
             "notebook": notebook_id,
-            "path": sess.path if sess else "",
+            "path": nb_path,
+            "run_id": self._recorder.run_id,
+            "ledger": self._recorder.ledger.path,
             "headless": True,
         }
 
     def stop_recording(self) -> dict[str, Any]:
         was = self._recording_target
+        recorder_summary = self._recorder.summary() if self._recorder else None
         self._recording_target = None
-        return {
+        self._recorder = None
+        result: dict[str, Any] = {
             "success": True,
             "recording": False,
             "was_recording": was,
             "headless": True,
         }
+        if recorder_summary:
+            result["recorder"] = recorder_summary
+        return result
 
     @property
     def recording(self) -> str | None:
@@ -1047,18 +1059,39 @@ class HeadlessNotebooks:
         """Write a cell into the recording notebook, if one is active.
 
         Returns None when recording is off, the write result otherwise.
-        Bypasses write_cell() so the recording lock cannot block it.
-        Failures are logged but never block the caller's evaluation.
+        When a recorder is active, the cell is tagged and verified before
+        returning. Failures are logged but never block the caller's evaluation.
         """
         target = self._recording_target
         if target is None:
             return None
         try:
+            if self._recorder:
+                return self._recorder.record_and_verify(code, style)
             return self._call_with_session(
                 "MCPWriteCell", target, code, style, "End", 0)
         except Exception:
             logger.warning("recording cell write failed", exc_info=True)
             return {"success": False, "error": "recording write failed"}
+
+    def record_outcome(self, seq: int, result: Any,
+                       kernel_notice: str | None,
+                       kernel_verdict: str | None) -> dict[str, Any] | None:
+        """Store disposition axes and run post-eval verification.
+
+        Called from server.py after evaluate_text() returns. Returns None
+        when no recorder is active.
+        """
+        if self._recorder is None:
+            return None
+        try:
+            from .recorder import extract_disposition
+            disposition = extract_disposition(result, kernel_notice,
+                                             kernel_verdict)
+            return self._recorder.apply_outcome(seq, disposition)
+        except Exception:
+            logger.warning("recording outcome failed", exc_info=True)
+            return {"success": False, "error": "recording outcome failed"}
 
     def finalize(self, notebook: str | None = None,
                  timeout: int = 600) -> dict[str, Any]:
