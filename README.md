@@ -64,7 +64,7 @@ That makes several properties more important than GUI integration:
 - provenance strong enough that one session can rely on results produced in
   another.
 
-The goal is therefore not merely to let an agent execute code in a computer algebra system. It is closer to let independent computational sessions behave like small scientific laboratories whose results can later be inspected, trusted, and incorporated into a larger research process.
+The goal is therefore not merely to let an agent execute code in a computer algebra system. It is closer to let independent computational sessions behave like small scientific laboratories whose results can later be inspected, independently verified, and incorporated into a larger research process.
 
 A computational session can be thought of as a temporary laboratory:
 
