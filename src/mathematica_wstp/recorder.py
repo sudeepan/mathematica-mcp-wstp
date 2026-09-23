@@ -12,6 +12,8 @@ verifies that the notebook still matches the ledger afterwards.
 from __future__ import annotations
 
 import logging
+import os
+import shutil
 import time
 import uuid
 from typing import Any, TYPE_CHECKING
@@ -31,6 +33,7 @@ class Recorder:
                  notebook_path: str):
         self.notebooks = notebooks
         self.notebook_id = notebook_id
+        self.notebook_path = notebook_path
         self.run_id = f"R{uuid.uuid4().hex[:10]}"
         self.ledger = RecorderLedger.create(notebook_path, notebook_id,
                                             self.run_id)
@@ -161,6 +164,65 @@ class Recorder:
     def has_unresolved(self) -> bool:
         return len(self.unresolved_records()) > 0
 
+    def finalize(self, timeout: int = 600) -> dict[str, Any]:
+        """Copy the recording notebook and evaluate it in a fresh kernel.
+
+        Preflight refuses when any record is unresolved (non-COMPLETED and
+        not yet annotated). The prototype kernel is never touched.
+        """
+        unresolved = self.unresolved_records()
+        if unresolved:
+            return {
+                "success": False,
+                "error": "cannot finalize: unresolved records exist",
+                "unresolved": [{"seq": r["seq"], "tag": r["record_tag"]}
+                               for r in unresolved],
+            }
+
+        verification = self._verify_full()
+        if not verification.get("verified"):
+            return {
+                "success": False,
+                "error": "pre-finalization verification failed",
+                "verification": verification,
+            }
+
+        nb_path = self.notebook_path
+        if not nb_path:
+            return {"success": False,
+                    "error": "recording notebook has no disk path"}
+
+        saved = self.notebooks.save(notebook=self.notebook_id)
+        if not saved.get("success"):
+            return saved
+
+        base, ext = os.path.splitext(nb_path)
+        finalized_path = f"{base}-finalized{ext}"
+        shutil.copy2(nb_path, finalized_path)
+        logger.info("finalize: copied %s -> %s", nb_path, finalized_path)
+
+        result = _evaluate_in_fresh_kernel(finalized_path, timeout)
+
+        self.ledger.update_record(
+            self.ledger.records[-1]["seq"] if self.ledger.records else 0,
+            finalized_at=time.time(),
+            finalized_path=finalized_path,
+            finalization_success=result.get("success", False),
+        )
+
+        self.ledger.data["finalization"] = {
+            "path": finalized_path,
+            "success": result.get("success", False),
+            "at": time.time(),
+        }
+        from .recorder_ledger import _write_atomically
+        _write_atomically(self.ledger.path, self.ledger.data)
+
+        result["recording_path"] = nb_path
+        result["finalized_path"] = finalized_path
+        result["run_id"] = self.run_id
+        return result
+
     def _verify_full(self) -> dict[str, Any]:
         """Full read-back: compare every ledger entry against the notebook."""
         readback = self.notebooks._call_with_session(
@@ -198,6 +260,56 @@ class Recorder:
             "notebook_id": self.notebook_id,
             "ledger": self.ledger.summary(),
         }
+
+
+def _evaluate_in_fresh_kernel(nb_path: str, timeout: int = 600
+                              ) -> dict[str, Any]:
+    """Spin up a temporary kernel, run NotebookEvaluate, shut it down.
+
+    Cells with Evaluatable->False are skipped by NotebookEvaluate. The
+    prototype kernel is never touched.
+    """
+    from .kernel import Kernel, KernelError
+
+    temp_kernel = Kernel()
+    try:
+        temp_kernel.start(timeout=60)
+    except KernelError as exc:
+        return {"success": False,
+                "error": f"could not start finalization kernel: {exc}"}
+
+    escaped = nb_path.replace("\\", "\\\\").replace('"', '\\"')
+    code = (
+        'Module[{nbo, evalResult, ok = True, detail = ""},'
+        '  Quiet[Check['
+        f'    UsingFrontEnd['
+        f'      nbo = NotebookOpen["{escaped}", Visible -> False];'
+        '      If[Head[nbo] =!= NotebookObject,'
+        '        ok = False; detail = "NotebookOpen failed";,'
+        '        evalResult = NotebookEvaluate[nbo, InsertResults -> True];'
+        '        NotebookSave[nbo];'
+        '        NotebookClose[nbo]'
+        '      ]'
+        '    ],'
+        '    ok = False; detail = ToString[$MessageList]'
+        '  ], {FrontEndObject::notavail}];'
+        '  <|"success" -> ok, "detail" -> detail|>'
+        ']'
+    )
+
+    try:
+        result = temp_kernel.evaluate_json(code, timeout=float(timeout))
+        if isinstance(result, dict) and result.get("success"):
+            return {"success": True, "finalized": True}
+        detail = result.get("detail", "") if isinstance(result, dict) else str(result)
+        return {"success": False, "error": f"NotebookEvaluate: {detail}"}
+    except Exception as exc:
+        return {"success": False, "error": f"finalization kernel error: {exc}"}
+    finally:
+        try:
+            temp_kernel.close(grace=5.0)
+        except Exception:
+            logger.warning("failed to close finalization kernel", exc_info=True)
 
 
 def _annotation_reason(disposition: dict[str, str]) -> str:

@@ -880,6 +880,16 @@ class HeadlessNotebooks:
             "MCPWriteCell", notebook_id, content, style, position, int(anchor or 0), record_tag
         )
 
+    def annotate_cell(self, index: int, evaluatable: bool = False,
+                      reason: str = "", notebook: str | None = None
+                      ) -> dict[str, Any]:
+        """Set Evaluatable and stamp an annotation reason on a cell."""
+        notebook_id = self._resolve(notebook)
+        if notebook_id is None:
+            return self._no_session(notebook)
+        return self._call_with_session(
+            "MCPAnnotateCell", notebook_id, int(index), evaluatable, reason)
+
     def read_back(self, notebook: str | None = None) -> dict[str, Any]:
         """Full cell metadata for recorder verification.
 
@@ -1092,6 +1102,20 @@ class HeadlessNotebooks:
         except Exception:
             logger.warning("recording outcome failed", exc_info=True)
             return {"success": False, "error": "recording outcome failed"}
+
+    def finalize_recording(self, timeout: int = 600) -> dict[str, Any]:
+        """Run the recorder's finalization: copy, fresh kernel, evaluate.
+
+        Refuses when no recorder is active or unresolved records exist.
+        """
+        if self._recorder is None:
+            return {"success": False,
+                    "error": "no recording session is active"}
+        try:
+            return self._recorder.finalize(timeout=timeout)
+        except Exception:
+            logger.warning("finalize_recording failed", exc_info=True)
+            return {"success": False, "error": "finalization failed"}
 
     def finalize(self, notebook: str | None = None,
                  timeout: int = 600) -> dict[str, Any]:
