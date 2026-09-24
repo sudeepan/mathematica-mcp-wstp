@@ -49,7 +49,6 @@ def test_finalize_blocked_by_unresolved():
         rec.notebook_path = nb_path
         rec.run_id = run_id
         rec.ledger = ledger
-        rec._sealed = False
 
         result = rec.finalize()
         assert not result["success"]
@@ -102,7 +101,6 @@ def test_finalize_allowed_when_annotated():
         rec.notebook_path = nb_path
         rec.run_id = run_id
         rec.ledger = ledger
-        rec._sealed = False
 
         result = rec.finalize()
         assert result == {"success": False, "error": "no real notebook"}, result

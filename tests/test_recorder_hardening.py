@@ -57,6 +57,7 @@ class FakeHelper:
         self.calls: list[str] = []
         self.write_transform = None
         self.drop_writes = False
+        self.ignore_stamp = False
         self._recorder = None
         self._scratch = 0
 
@@ -72,10 +73,12 @@ class FakeHelper:
         if fn == "MCPWriteCell":
             content, style = args[0], args[1]
             tag = args[4] if len(args) > 4 else ""
+            stamp = args[5] if len(args) > 5 else ""
             if self.write_transform:
                 content = self.write_transform(content)
             if not self.drop_writes:
-                cells.append(cell(style, content, tag))
+                evaluatable = None if self.ignore_stamp else {"True": True, "False": False}.get(stamp)
+                cells.append(cell(style, content, tag, evaluatable))
             return {"success": True, "id": notebook_id, "record_tag": tag}
         if fn == "MCPReadBack":
             return {"success": True, "id": notebook_id, "total": len(cells),
@@ -651,6 +654,178 @@ def test_foreign_tag_in_finalized_rejected():
         v = w.rec._verify_finalized(path)
         assert v["verified"] is False
         assert w.issue_names(v) == ["tag_not_in_ledger_in_finalized"]
+
+
+# --- exact replay flags ---------------------------------------------------------
+
+def test_writes_stamp_replay_flags():
+    """Scientific cells are stamped Evaluatable->True, narrative ones ->False."""
+    with workspace() as w:
+        w.rec.record_and_verify("Setup", style="Section")
+        a = w.record_ok("a = 1")
+        p = w.record_ok("Pause[10]", disposition=TIMED_OUT)
+        assert w.fake.cells[0]["evaluatable"] is False
+        assert w.fake.cell_with_tag(a["record_tag"])["evaluatable"] is True
+        assert w.fake.cell_with_tag(p["record_tag"])["evaluatable"] is False
+
+
+def test_pre_dispatch_requires_stamped_flag():
+    """A written cell that did not keep its Evaluatable->True stamp is refused."""
+    with workspace() as w:
+        w.fake.ignore_stamp = True
+        r = w.rec.record_and_verify("x = 1")
+        assert r["success"] is False
+        assert r["error"] == "pre-dispatch verification failed: cell not stamped evaluatable"
+        assert w.rec.ledger.data["fault"]["phase"] == "PRE_DISPATCH"
+
+
+def test_annotated_cell_with_missing_flag_fails():
+    """An annotated cell whose Evaluatable option was removed is not accepted."""
+    with workspace() as w:
+        p = w.record_ok("Pause[10]", disposition=TIMED_OUT)
+        w.fake.cell_with_tag(p["record_tag"])["evaluatable"] = None
+        live = w.rec._verify_full()
+        assert w.issue_names(live) == ["annotated_cell_enabled"]
+        path = os.path.join(w.dir, "fin.nb")
+        w.fake.files[path] = copy.deepcopy(w.fake.cells)
+        assert w.issue_names(w.rec._verify_finalized(path)) == ["annotation_not_preserved"]
+
+
+def test_completed_cell_with_missing_flag_fails():
+    """A completed cell whose Evaluatable option was removed is not accepted."""
+    with workspace() as w:
+        a = w.record_ok("a = 1")
+        w.fake.cell_with_tag(a["record_tag"])["evaluatable"] = None
+        live = w.rec._verify_full()
+        assert w.issue_names(live) == ["completed_cell_disabled"]
+        assert live["issues"][0]["found_evaluatable"] is None
+        path = os.path.join(w.dir, "fin.nb")
+        w.fake.files[path] = copy.deepcopy(w.fake.cells)
+        assert w.issue_names(w.rec._verify_finalized(path)) == ["completed_cell_disabled_in_finalized"]
+
+
+def test_unrecorded_evaluatable_cell_fails():
+    """A cell outside the ledger that is marked evaluatable fails, whatever its style."""
+    with workspace() as w:
+        w.record_ok("a = 1")
+        w.fake.cells.append(cell("Text", "x = 42", evaluatable=True))
+        live = w.rec._verify_full()
+        assert w.issue_names(live) == ["unrecorded_cell_evaluatable"]
+        path = os.path.join(w.dir, "fin.nb")
+        w.fake.files[path] = copy.deepcopy(w.fake.cells)
+        assert w.issue_names(w.rec._verify_finalized(path)) == ["unrecorded_cell_evaluatable_in_finalized"]
+
+
+# --- unknown outcomes and bookkeeping ---------------------------------------------
+
+def test_missing_outcome_blocks_next_record():
+    """A record whose outcome was never stored stops the run before new science."""
+    with workspace() as w:
+        first = w.rec.record_and_verify("a = 1")
+        assert first["success"], first
+        calls_before = len(w.fake.calls)
+        r = w.rec.record_and_verify("b = 2")
+        assert r["success"] is False
+        assert "never recorded" in r["error"]
+        assert len(w.fake.calls) == calls_before, "refused before touching the notebook"
+        fault = w.rec.ledger.data["fault"]
+        assert fault["phase"] == "PRE_DISPATCH" and "[1]" in fault["reason"]
+
+
+def test_outcome_for_unknown_seq_is_reported():
+    """An outcome for a record that does not exist faults the run and says so."""
+    from mathematica_wstp.session import WLResult
+    with workspace() as w:
+        nb = headless_with(w.fake, w.nb_path)
+        assert nb.start_recording(notebook="hnb1")["success"]
+        out = nb.record_outcome(999, WLResult(success=True, text="1"), None, None)
+        assert out["success"] is False
+        assert out["recording_faulted"] is True
+        assert out["recording_fault"]["phase"] == "POST_EVAL"
+        assert "999" in out["recording_fault"]["reason"]
+
+
+def test_record_input_exception_is_reported():
+    """An exception while recording faults the run and the reply carries the fault."""
+    with workspace() as w:
+        nb = headless_with(w.fake, w.nb_path)
+        assert nb.start_recording(notebook="hnb1")["success"]
+
+        def explode(*args, **kwargs):
+            raise RuntimeError("link broke mid-write")
+
+        nb._call_with_session = explode
+        out = nb.record_input("x = 1")
+        assert out["success"] is False
+        assert out["recording_faulted"] is True
+        assert out["recording_fault"]["phase"] == "PRE_DISPATCH"
+
+
+# --- durable seal and finalization attempts ---------------------------------------
+
+def test_seal_is_durable():
+    """The seal is read from the ledger, so a reloaded ledger is still sealed."""
+    with workspace() as w:
+        w.record_ok("a = 1")
+        with fresh_kernel_stub():
+            assert w.rec.finalize(timeout=5)["success"]
+        reborn = Recorder.__new__(Recorder)
+        reborn.ledger = RecorderLedger.load(w.rec.ledger.path)
+        assert reborn.is_sealed
+
+
+def test_failed_finalization_can_be_retried():
+    """A failed attempt keeps its artifact as evidence and a retry can succeed."""
+    with workspace() as w:
+        w.record_ok("a = 1")
+        canonical = os.path.splitext(w.nb_path)[0] + f"-{w.rec.run_id}-finalized.nb"
+        with fresh_kernel_stub({"success": False, "error": "kernel licence busy"}):
+            first = w.rec.finalize(timeout=5)
+        assert first["success"] is False and os.path.exists(canonical)
+        assert not w.rec.is_sealed
+        with fresh_kernel_stub():
+            second = w.rec.finalize(timeout=5)
+        assert second["success"], second
+        assert second["finalized_path"] == canonical
+        preserved = second["previous_attempt_preserved_as"]
+        assert preserved.endswith(f"-{w.rec.run_id}-finalized-failed-1.nb")
+        assert os.path.exists(preserved)
+        attempts = w.rec.ledger.data["finalization_attempts"]
+        assert [a["success"] for a in attempts] == [False, True]
+        assert attempts[0]["preserved_as"] == preserved
+        assert w.rec.is_sealed
+
+
+def test_finalize_refuses_unknown_existing_artifact():
+    """A file at the artifact path that this run did not produce is left alone."""
+    with workspace() as w:
+        w.record_ok("a = 1")
+        canonical = os.path.splitext(w.nb_path)[0] + f"-{w.rec.run_id}-finalized.nb"
+        with open(canonical, "w") as fh:
+            fh.write("somebody else's file")
+        with fresh_kernel_stub():
+            fin = w.rec.finalize(timeout=5)
+        assert fin["success"] is False
+        assert "refusing to overwrite" in fin["error"]
+        with open(canonical) as fh:
+            assert fh.read() == "somebody else's file"
+
+
+# --- backend ---------------------------------------------------------------------
+
+def test_start_recording_refuses_supervisor_backend():
+    """Integrity recording starts only on the direct kernel."""
+    from mathematica_wstp import evaluator
+    with workspace() as w:
+        nb = headless_with(w.fake, w.nb_path)
+        previous = evaluator.set_evaluator(type("FakeSupervisor", (), {"name": "supervisor"})())
+        try:
+            refused = nb.start_recording(notebook="hnb1")
+        finally:
+            evaluator.set_evaluator(previous)
+        assert refused["success"] is False
+        assert "direct kernel" in refused["error"]
+        assert nb._recorder is None
 
 
 # --- Runner ----------------------------------------------------------------

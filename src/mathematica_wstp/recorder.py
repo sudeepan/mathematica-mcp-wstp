@@ -15,7 +15,6 @@ import hashlib
 import logging
 import os
 import shutil
-import threading
 import time
 import uuid
 from typing import Any, TYPE_CHECKING
@@ -47,8 +46,6 @@ class Recorder:
         self.notebook_id = notebook_id
         self.notebook_path = notebook_path
         self.run_id = f"R{uuid.uuid4().hex[:10]}"
-        self.lock = threading.Lock()
-        self._sealed = False
         self.ledger = RecorderLedger.create(notebook_path, notebook_id,
                                             self.run_id)
 
@@ -57,6 +54,12 @@ class Recorder:
     @property
     def is_faulted(self) -> bool:
         return "fault" in self.ledger.data
+
+    @property
+    def is_sealed(self) -> bool:
+        """True once a finalization attempt has succeeded; read from the ledger."""
+        latest = self.ledger.data.get("finalization")
+        return isinstance(latest, dict) and latest.get("success") is True
 
     def _fault(self, phase: str, reason: str) -> None:
         """Write a durable fault marker to the ledger.
@@ -98,16 +101,31 @@ class Recorder:
 
         Any failure faults the recorder for the remainder of this run.
         """
-        if self._sealed:
+        if self.is_sealed:
             return {
                 "success": False,
-                "error": "recorder is sealed after successful finalization",
+                "error": ("recorder is sealed after successful finalization; "
+                          "stop_recording releases it"),
             }
 
         if self.is_faulted:
             return {
                 "success": False,
                 "error": "recorder is faulted; no further science permitted",
+                "fault": self.ledger.data["fault"],
+            }
+
+        # Every recorded evaluation stores its outcome before the next one
+        # starts, so a record without one means an earlier transaction broke
+        # after dispatch. Whether that science ran is unknown.
+        pending = [r["seq"] for r in self.ledger.records
+                   if r.get("disposition") is None]
+        if pending:
+            self._fault("PRE_DISPATCH",
+                        f"earlier record(s) {pending} have no recorded outcome")
+            return {
+                "success": False,
+                "error": f"outcome of earlier record(s) {pending} was never recorded",
                 "fault": self.ledger.data["fault"],
             }
 
@@ -126,7 +144,7 @@ class Recorder:
     def _write_narrative(self, code: str, style: str) -> dict[str, Any]:
         """Write a narrative cell without creating a scientific record."""
         write_result = self.notebooks._call_with_session(
-            "MCPWriteCell", self.notebook_id, code, style, "End", 0)
+            "MCPWriteCell", self.notebook_id, code, style, "End", 0, "", "False")
         if self._check_session_loss(write_result, "narrative write"):
             return {"success": False,
                     "error": "kernel state lost during narrative write"}
@@ -149,7 +167,7 @@ class Recorder:
         intended_digest = hashlib.sha256(code.encode("utf-8")).hexdigest()
 
         write_result = self.notebooks._call_with_session(
-            "MCPWriteCell", self.notebook_id, code, style, "End", 0, tag)
+            "MCPWriteCell", self.notebook_id, code, style, "End", 0, tag, "True")
         if self._check_session_loss(write_result, "cell write"):
             return {"success": False,
                     "error": "kernel state lost during cell write"}
@@ -228,12 +246,13 @@ class Recorder:
                 "error": f"pre-dispatch verification failed: cell not executable",
             }
 
-        if our_cell.get("evaluatable") is False:
+        if our_cell.get("evaluatable") is not True:
             self._fault("PRE_DISPATCH",
-                        f"cell {tag} has Evaluatable->False")
+                        f"cell {tag} is not stamped Evaluatable->True "
+                        f"(found {our_cell.get('evaluatable')!r})")
             return {
                 "success": False,
-                "error": f"pre-dispatch verification failed: cell not evaluatable",
+                "error": "pre-dispatch verification failed: cell not stamped evaluatable",
             }
 
         record = self.ledger.append(
@@ -372,11 +391,12 @@ class Recorder:
         unresolved (non-COMPLETED and not yet annotated). The prototype
         kernel is never touched.
         """
-        if self._sealed:
+        if self.is_sealed:
             return {
                 "success": False,
                 "error": "recorder is sealed; already finalized",
                 "run_id": self.run_id,
+                "finalized_path": self.ledger.data["finalization"].get("path"),
             }
 
         if self.is_faulted:
@@ -418,29 +438,35 @@ class Recorder:
 
         base, ext = os.path.splitext(nb_path)
         finalized_path = f"{base}-{self.run_id}-finalized{ext}"
-        if os.path.exists(finalized_path):
+        preserved = self._move_aside_failed_artifact(finalized_path, base, ext)
+        if preserved is False:
             return {
                 "success": False,
-                "error": f"finalized artifact already exists: {finalized_path}",
+                "error": (f"{finalized_path} already exists and no failed attempt "
+                          "of this run produced it; refusing to overwrite"),
             }
         shutil.copy2(nb_path, finalized_path)
         logger.info("finalize: copied %s -> %s", nb_path, finalized_path)
 
-        eval_result = _evaluate_in_fresh_kernel(finalized_path, timeout)
-        if not eval_result.get("success"):
-            self._record_finalization(finalized_path, success=False)
-            eval_result["recording_path"] = nb_path
-            eval_result["finalized_path"] = finalized_path
-            eval_result["run_id"] = self.run_id
-            return eval_result
+        try:
+            eval_result = _evaluate_in_fresh_kernel(finalized_path, timeout)
+            if not eval_result.get("success"):
+                self._record_finalization(finalized_path, success=False,
+                                          error=eval_result.get("error"))
+                eval_result["recording_path"] = nb_path
+                eval_result["finalized_path"] = finalized_path
+                eval_result["run_id"] = self.run_id
+                return eval_result
 
-        structural = self._verify_finalized(finalized_path)
+            structural = self._verify_finalized(finalized_path)
+        except Exception as exc:
+            self._record_finalization(finalized_path, success=False, error=repr(exc))
+            raise
         overall_success = structural.get("verified", False)
 
-        self._record_finalization(finalized_path, success=overall_success)
-
-        if overall_success:
-            self._sealed = True
+        self._record_finalization(
+            finalized_path, success=overall_success,
+            error=None if overall_success else "structural verification failed")
 
         return {
             "success": overall_success,
@@ -449,7 +475,8 @@ class Recorder:
             "recording_path": nb_path,
             "finalized_path": finalized_path,
             "run_id": self.run_id,
-            "sealed": self._sealed,
+            "sealed": self.is_sealed,
+            **({"previous_attempt_preserved_as": preserved} if preserved else {}),
             **({"error": "post-finalization structural verification failed"}
                if not overall_success else {}),
         }
@@ -509,8 +536,14 @@ class Recorder:
                                "expected": record.get("style"),
                                "found": cell.get("style")})
 
+            found = cell.get("evaluatable")
+            if not record.get("annotated") and found is not True:
+                issues.append({"seq": record["seq"], "tag": tag,
+                               "issue": "completed_cell_disabled_in_finalized",
+                               "expected_evaluatable": True,
+                               "found_evaluatable": found})
             if record.get("annotated"):
-                if cell.get("evaluatable", True):
+                if found is not False:
                     issues.append({"seq": record["seq"], "tag": tag,
                                    "issue": "annotation_not_preserved",
                                    "expected_evaluatable": False,
@@ -529,6 +562,15 @@ class Recorder:
             style = cell.get("style", "")
             tag = cell.get("record_tag")
             executable = cell.get("executable", False)
+
+            if cell.get("evaluatable") is True and tag not in ledger_tags:
+                issues.append({
+                    "index": cell.get("index"),
+                    "issue": "unrecorded_cell_evaluatable_in_finalized",
+                    "style": style,
+                    "tag": tag,
+                })
+                continue
 
             if style in self._NARRATIVE_STYLES:
                 continue
@@ -572,8 +614,9 @@ class Recorder:
             "issues": issues,
         }
 
-    def _record_finalization(self, finalized_path: str, success: bool) -> None:
-        """Write finalization metadata to the ledger."""
+    def _record_finalization(self, finalized_path: str, success: bool,
+                             error: str | None = None) -> None:
+        """Append this attempt to the ledger; a successful one seals the run."""
         if self.ledger.records:
             self.ledger.update_record(
                 self.ledger.records[-1]["seq"],
@@ -581,12 +624,36 @@ class Recorder:
                 finalized_path=finalized_path,
                 finalization_success=success,
             )
-        self.ledger.data["finalization"] = {
+        attempts = self.ledger.data.get("finalization_attempts", [])
+        attempt: dict[str, Any] = {
+            "attempt": len(attempts) + 1,
             "path": finalized_path,
             "success": success,
             "at": time.time(),
         }
+        if error:
+            attempt["error"] = error
+        self.ledger.add_finalization_attempt(attempt)
+
+    def _move_aside_failed_artifact(self, finalized_path: str, base: str,
+                                    ext: str) -> str | bool | None:
+        """Keep a failed attempt's artifact as evidence before retrying.
+
+        Returns None when nothing is in the way, the new name when a failed
+        attempt of this run was moved aside, and False when the file exists
+        but this run never produced it, so it must not be touched.
+        """
+        if not os.path.exists(finalized_path):
+            return None
+        latest = self.ledger.data.get("finalization")
+        if not (isinstance(latest, dict) and latest.get("path") == finalized_path
+                and latest.get("success") is False):
+            return False
+        preserved = f"{base}-{self.run_id}-finalized-failed-{latest.get('attempt', 1)}{ext}"
+        os.replace(finalized_path, preserved)
+        latest["preserved_as"] = preserved
         _write_atomically(self.ledger.path, self.ledger.data)
+        return preserved
 
     def _verify_full(self) -> dict[str, Any]:
         """Bidirectional verification: ledger-to-notebook and notebook-to-ledger.
@@ -631,19 +698,16 @@ class Recorder:
                                "expected": record.get("style"),
                                "found": cell.get("style")})
 
-            disp = record.get("disposition")
-            annotated = record.get("annotated", False)
-            if disp and disp.get("execution_outcome") == "COMPLETED" and not annotated:
-                if cell.get("evaluatable") is False:
-                    issues.append({"seq": record["seq"], "tag": tag,
-                                   "issue": "completed_cell_disabled",
-                                   "evaluatable": False})
-            elif annotated:
-                if cell.get("evaluatable", True):
+            # The recorder stamps every cell, so the flag is checked exactly:
+            # a missing option (None) means the stamp was removed and replay
+            # would fall back to stylesheet defaults.
+            found = cell.get("evaluatable")
+            if record.get("annotated"):
+                if found is not False:
                     issues.append({"seq": record["seq"], "tag": tag,
                                    "issue": "annotated_cell_enabled",
                                    "expected_evaluatable": False,
-                                   "found_evaluatable": cell.get("evaluatable")})
+                                   "found_evaluatable": found})
                 cell_reason = cell.get("annotation_reason", "")
                 ledger_reason = record.get("annotation_reason", "")
                 if cell_reason != ledger_reason:
@@ -651,6 +715,11 @@ class Recorder:
                                    "issue": "annotation_reason_changed",
                                    "expected": ledger_reason,
                                    "found": cell_reason})
+            elif found is not True:
+                issues.append({"seq": record["seq"], "tag": tag,
+                               "issue": "completed_cell_disabled",
+                               "expected_evaluatable": True,
+                               "found_evaluatable": found})
 
         # Converse: every executable cell must have a ledger entry
         seen_tags: dict[str, int] = {}
@@ -659,6 +728,15 @@ class Recorder:
             style = cell.get("style", "")
             tag = cell.get("record_tag")
             executable = cell.get("executable", False)
+
+            if cell.get("evaluatable") is True and tag not in ledger_tags:
+                issues.append({
+                    "index": cell.get("index"),
+                    "issue": "unrecorded_cell_evaluatable",
+                    "style": style,
+                    "tag": tag,
+                })
+                continue
 
             if style in self._NARRATIVE_STYLES:
                 continue
@@ -717,7 +795,7 @@ class Recorder:
         if self.is_faulted:
             result["faulted"] = True
             result["fault"] = self.ledger.data["fault"]
-        if self._sealed:
+        if self.is_sealed:
             result["sealed"] = True
         return result
 

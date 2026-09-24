@@ -33,7 +33,7 @@ MCPEvaluateInput::usage = "MCPEvaluateInput[id, ordinal, timeout, writeOutputs, 
 MCPFileDependencies::usage = "MCPFileDependencies[id] reports every file a notebook reads or writes, including from commented cells.";
 MCPInputDigests::usage = "MCPInputDigests[id] hashes the stored boxes of every input cell, by ordinal.";
 MCPOutputProvenance::usage = "MCPOutputProvenance[id] reports which replay child wrote each output cell.";
-MCPWriteCell::usage = "MCPWriteCell[id, content, style, position, anchor] inserts a cell.";
+MCPWriteCell::usage = "MCPWriteCell[id, content, style, position, anchor, recordTag, evaluatable] inserts a cell. recordTag and evaluatable (\"True\" | \"False\" | \"\") are optional; a non-empty evaluatable stamps Evaluatable on the cell.";
 MCPDeleteCell::usage = "MCPDeleteCell[id, index] removes a cell.";
 MCPReplaceCell::usage = "MCPReplaceCell[id, index, content] replaces one cell's content, keeping its style and options.";
 MCPSave::usage = "MCPSave[id, path] writes the session's notebook expression to disk.";
@@ -944,13 +944,20 @@ MCPWriteCell[id_String, content_String, style_String, position_String, anchor_In
   MCPWriteCell[id, content, style, position, anchor, ""];
 
 MCPWriteCell[id_String, content_String, style_String, position_String, anchor_Integer, recordTag_String] :=
-  sessionOr[id, Module[{nb, pos, newCell, cells, at, updated},
+  MCPWriteCell[id, content, style, position, anchor, recordTag, ""];
+
+(* The recorder stamps Evaluatable on every cell it writes (True for Input/Code,
+   False for narrative) so replay never depends on stylesheet defaults, and so
+   read-back can check the flag exactly instead of inferring it from style. *)
+MCPWriteCell[id_String, content_String, style_String, position_String, anchor_Integer, recordTag_String, evaluatable_String] :=
+  sessionOr[id, Module[{nb, pos, newCell, cells, at, updated, opts},
     nb = $Sessions[id, "nb"];
     pos = leafPositions[nb];
-    newCell = If[recordTag === "",
-      Cell[BoxData[content], style],
-      Cell[BoxData[content], style, TaggingRules -> {"MCPRecordTag" -> recordTag}]
+    opts = Join[
+      If[recordTag === "", {}, {TaggingRules -> {"MCPRecordTag" -> recordTag}}],
+      Switch[evaluatable, "True", {Evaluatable -> True}, "False", {Evaluatable -> False}, _, {}]
     ];
+    newCell = Cell[BoxData[content], style, Sequence @@ opts];
     (* Insertion only rewrites the TOP-LEVEL cell list. Splicing into a nested
        CellGroupData would need the group's own position and is deliberately
        not attempted: silently putting a cell in the wrong group is worse than

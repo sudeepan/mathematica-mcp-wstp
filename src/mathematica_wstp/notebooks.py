@@ -20,6 +20,7 @@ than surfacing an error the caller cannot act on.
 from __future__ import annotations
 
 import contextlib
+import functools
 import json
 import logging
 import os
@@ -37,6 +38,15 @@ logger = logging.getLogger("mathematica_wstp.notebooks")
 
 # Guards the registry only. Kernel evaluation is serialised inside session.py.
 _registry_lock = threading.Lock()
+
+
+def _under_recording_lock(method):
+    """Run a recorder lifecycle step while no recorded evaluation is in flight."""
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._recording_lock:
+            return method(self, *args, **kwargs)
+    return wrapper
 
 
 def _wl_string(value: str) -> str:
@@ -87,6 +97,8 @@ class HeadlessNotebooks:
     _counter: int = 0
     _recording_target: str | None = field(default=None, repr=False)
     _recorder: Any = field(default=None, repr=False)
+    # Re-entrant: finalization saves and closes through the same object.
+    _recording_lock: Any = field(default_factory=threading.RLock, repr=False)
 
     # -- plumbing ---------------------------------------------------------
 
@@ -278,18 +290,24 @@ class HeadlessNotebooks:
                 )
         return result
 
+    @_under_recording_lock
     def close(self, notebook: str | None = None) -> dict[str, Any]:
         notebook_id = self._resolve(notebook)
         if notebook_id is None:
             return self._no_session(notebook)
-        if (self._recorder and not self._recorder._sealed
-                and notebook_id == self._recording_target):
-            return {
-                "success": False,
-                "error": ("cannot close the recording target before "
-                          "finalization; finalize first or stop_recording(force=True)"),
-            }
+        released = False
+        if notebook_id == self._recording_target:
+            if self._recorder and not self._recorder.is_sealed:
+                return {
+                    "success": False,
+                    "error": ("cannot close the recording target before "
+                              "finalization; finalize first or stop_recording(force=True)"),
+                }
+            self.stop_recording()
+            released = True
         result = self._call("MCPClose", notebook_id)
+        if released:
+            result["recording_released"] = True
         with _registry_lock:
             self._sessions.pop(notebook_id, None)
         if not result.get("success") and "No such headless notebook session" in str(result.get("error", "")):
@@ -1017,6 +1035,7 @@ class HeadlessNotebooks:
         result["written"] = True
         return result
 
+    @_under_recording_lock
     def save(self, notebook: str | None = None, path: str | None = None) -> dict[str, Any]:
         notebook_id = self._resolve(notebook)
         if notebook_id is None:
@@ -1042,6 +1061,7 @@ class HeadlessNotebooks:
 
     # -- recording --------------------------------------------------------
 
+    @_under_recording_lock
     def start_recording(self, notebook: str | None = None) -> dict[str, Any]:
         """Start a new integrity recording session on a notebook.
 
@@ -1059,6 +1079,19 @@ class HeadlessNotebooks:
                           f"{self._recording_target}; finalize or stop it first"),
                 "active_recording": self._recording_target,
                 "run_id": self._recorder.run_id,
+            }
+
+        # Supervisor-backed recording would need the supervisor's own outcome,
+        # control and readiness facts; until those reach the recorder, only
+        # the direct kernel is supported.
+        from .evaluator import get_evaluator
+        backend = get_evaluator().name
+        if backend != "direct":
+            return {
+                "success": False,
+                "error": (f"integrity recording needs the direct kernel; the active "
+                          f"backend is {backend!r}. Switch with "
+                          "supervisor(action='use_direct') first."),
             }
 
         notebook_id = self._resolve(notebook)
@@ -1117,10 +1150,11 @@ class HeadlessNotebooks:
             "headless": True,
         }
 
+    @_under_recording_lock
     def stop_recording(self, force: bool = False) -> dict[str, Any]:
         was = self._recording_target
         recorder = self._recorder
-        if recorder and not recorder._sealed and not force:
+        if recorder and not recorder.is_sealed and not force:
             return {
                 "success": False,
                 "error": ("integrity recorder has not been finalized; "
@@ -1129,7 +1163,7 @@ class HeadlessNotebooks:
                 "run_id": recorder.run_id,
             }
         recorder_summary = recorder.summary() if recorder else None
-        abandoned = recorder and not recorder._sealed
+        abandoned = bool(recorder) and not recorder.is_sealed
         self._recording_target = None
         self._recorder = None
         result: dict[str, Any] = {
@@ -1153,6 +1187,23 @@ class HeadlessNotebooks:
         """True when an integrity recorder is active (not just basic capture)."""
         return self._recorder is not None
 
+    def recording_transaction(self):
+        """The lock a recorded evaluate() holds from record to outcome."""
+        return self._recording_lock
+
+    def recording_fault(self) -> dict[str, Any] | None:
+        """The durable fault of the active recorder, if it has one."""
+        recorder = self._recorder
+        if recorder is None or not recorder.is_faulted:
+            return None
+        return recorder.ledger.data["fault"]
+
+    def fault_recording(self, phase: str, reason: str) -> dict[str, Any] | None:
+        """Latch a fault on the active recorder and return it."""
+        if self._recorder is not None:
+            self._recorder._fault(phase, reason)
+        return self.recording_fault()
+
     def record_input(self, code: str, style: str = "Input") -> dict[str, Any] | None:
         """Write a cell into the recording notebook, if one is active.
 
@@ -1171,10 +1222,9 @@ class HeadlessNotebooks:
                 "MCPWriteCell", target, code, style, "End", 0)
         except Exception as exc:
             logger.warning("recording cell write failed", exc_info=True)
-            if self._recorder:
-                self._recorder._fault("PRE_DISPATCH",
-                                      f"unhandled exception: {exc}")
-            return {"success": False, "error": "recording write failed"}
+            fault = self.fault_recording("PRE_DISPATCH", f"unhandled exception: {exc!r}")
+            return {"success": False, "error": "recording write failed",
+                    **({"recording_faulted": True, "recording_fault": fault} if fault else {})}
 
     def record_outcome(self, seq: int, result: Any,
                        kernel_notice: str | None,
@@ -1193,11 +1243,11 @@ class HeadlessNotebooks:
             return self._recorder.apply_outcome(seq, disposition)
         except Exception as exc:
             logger.warning("recording outcome failed", exc_info=True)
-            if self._recorder:
-                self._recorder._fault("POST_EVAL",
-                                      f"unhandled exception: {exc}")
-            return {"success": False, "error": "recording outcome failed"}
+            fault = self.fault_recording("POST_EVAL", f"unhandled exception: {exc!r}")
+            return {"success": False, "error": "recording outcome failed",
+                    "recording_faulted": True, "recording_fault": fault}
 
+    @_under_recording_lock
     def finalize_recording(self, timeout: int = 600) -> dict[str, Any]:
         """Run the recorder's finalization: copy, fresh kernel, evaluate.
 

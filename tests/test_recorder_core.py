@@ -169,6 +169,10 @@ def test_recorder_end_to_end():
         assert rec.get("source_digest")
         assert rec.get("record_tag")
 
+        # Each record's outcome is stored before the next record may start.
+        from mathematica_wstp.evaluator import evaluate_text
+        nb.record_outcome(rec["seq"], evaluate_text("x = 1 + 2", timeout=30), None, None)
+
         rec2 = nb.record_input("y = x^2", style="Input")
         assert rec2.get("seq") == 2
 

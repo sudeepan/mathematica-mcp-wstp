@@ -123,11 +123,22 @@ class RecorderLedger:
         return record
 
     def update_record(self, seq: int, **fields: Any) -> None:
-        """Update fields on an existing record and flush to disk."""
+        """Update fields on an existing record and flush to disk.
+
+        An unknown seq raises: attaching facts to a record that does not
+        exist means the bookkeeping contradicts itself, which an audit
+        ledger must not paper over.
+        """
         record = self.record_by_seq(seq)
         if record is None:
-            return
+            raise KeyError(f"ledger has no record with seq {seq}")
         record.update(fields)
+        _write_atomically(self.path, self.data)
+
+    def add_finalization_attempt(self, attempt: dict[str, Any]) -> None:
+        """Append one finalization attempt; the latest is mirrored in "finalization"."""
+        self.data.setdefault("finalization_attempts", []).append(attempt)
+        self.data["finalization"] = attempt
         _write_atomically(self.path, self.data)
 
     def record_by_seq(self, seq: int) -> dict[str, Any] | None:

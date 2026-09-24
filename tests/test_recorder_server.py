@@ -131,7 +131,17 @@ def test_concurrent_evaluates_get_distinct_ordered_records():
 def test_public_finalize_uses_recorder_finalizer():
     """notebooks(action="finalize") runs the recorder's fresh-kernel finalizer."""
     with recording_session("fin") as ctx:
+        section = payload(server.evaluate("Setup", style="Section"))
+        assert section["success"] and section["scientific"] is False, section
         assert payload(server.evaluate(fresh_symbol("mcpFinX") + " = 2 + 3"))["success"]
+        slow = payload(server.evaluate("Pause[3]", timeout=0.5))
+        assert slow["success"] is False and slow["timed_out"] is True, slow
+        assert not slow.get("recording_faulted"), slow
+        flags = [(c["style"], c["evaluatable"])
+                 for c in ctx.nb.read_back(notebook=ctx.nbid)["cells"]]
+        # create() writes an unstamped title; everything the recorder wrote is stamped
+        assert flags == [("Title", None), ("Section", False),
+                         ("Input", True), ("Input", False)], flags
         saved = payload(server.notebooks(action="save"))
         assert saved["success"], saved
 
@@ -143,9 +153,68 @@ def test_public_finalize_uses_recorder_finalizer():
         expected = os.path.splitext(ctx.path)[0] + f"-{run_id}-finalized.nb"
         assert fin["finalized_path"] == expected and os.path.exists(expected)
 
-        stopped = payload(server.notebooks(action="stop_recording"))
-        assert stopped["success"], stopped
+        refused = payload(server.evaluate(fresh_symbol("mcpAfterSeal") + " = 1"))
+        assert refused["success"] is False and "sealed" in refused["error"], refused
+
+        closed = payload(server.notebooks(action="close"))
+        assert closed["success"] and closed.get("recording_released") is True, closed
         assert not ctx.nb.has_active_recorder
+        ctx.nbid = None
+
+
+def test_close_before_finalize_refused():
+    """Closing the recording notebook early would silently drop the audit trail."""
+    with recording_session("earlyclose") as ctx:
+        assert payload(server.evaluate(fresh_symbol("mcpEarly") + " = 1"))["success"]
+        closed = payload(server.notebooks(action="close"))
+        assert closed["success"] is False and "before finalization" in closed["error"], closed
+        assert ctx.nb.has_active_recorder
+        stopped = payload(server.notebooks(action="stop_recording"))
+        assert stopped["success"] is False, stopped
+        forced = payload(server.notebooks(action="stop_recording", force=True))
+        assert forced["success"] and forced["abandoned"] is True, forced
+
+
+def test_dispatch_exception_faults_as_outcome_unknown():
+    """If evaluation breaks after the record exists, the run is faulted, not guessed."""
+    with recording_session("gap") as ctx:
+        real_eval = server.evaluate_text
+
+        def evaluate_then_break(code, timeout=60):
+            real_eval(code, timeout=timeout)
+            raise RuntimeError("link dropped before the reply was read")
+
+        server.evaluate_text = evaluate_then_break
+        try:
+            reply = payload(server.evaluate(fresh_symbol("mcpGap") + " = 1"))
+        finally:
+            server.evaluate_text = real_eval
+        assert reply["success"] is False and reply["outcome_unknown"] is True, reply
+        assert reply["recording_faulted"] is True, reply
+        assert reply["recording_fault"]["phase"] == "POST_DISPATCH", reply
+        record = ctx.nb._recorder.ledger.records[0]
+        assert "disposition" not in record, "no outcome may be invented"
+        again = payload(server.evaluate(fresh_symbol("mcpGapNext") + " = 2"))
+        assert again["success"] is False and "faulted" in again["error"], again
+
+
+def test_outcome_exception_is_reported_in_reply():
+    """A crash while storing the outcome is visible in the reply that ran the science."""
+    from mathematica_wstp import recorder as recorder_mod
+    with recording_session("outcome") as ctx:
+        real_extract = recorder_mod.extract_disposition
+
+        def broken(*args, **kwargs):
+            raise ValueError("disposition axes unreadable")
+
+        recorder_mod.extract_disposition = broken
+        try:
+            reply = payload(server.evaluate(fresh_symbol("mcpOutcome") + " = 3"))
+        finally:
+            recorder_mod.extract_disposition = real_extract
+        assert reply["success"] is True and reply["output"].strip() == "3", reply
+        assert reply["recording_faulted"] is True, reply
+        assert reply["recording_fault"]["phase"] == "POST_EVAL", reply
 
 
 def test_bad_explicit_finalize_target_rejected():
@@ -201,20 +270,32 @@ def test_state_changing_tools_blocked_while_recording():
     """Tools that change kernel state outside the recorder are refused."""
     with recording_session("blocked") as ctx:
         name = fresh_symbol("mcpBlocked")
+        via_get = fresh_symbol("mcpViaGet")
+        via_render = fresh_symbol("mcpViaRender")
+        via_verify = fresh_symbol("mcpViaVerify")
         attempts = {
             "evaluate_cells": lambda: server.evaluate_cells(index=0),
             "replay run": lambda: server.replay(action="run"),
             "vars set": lambda: server.vars(action="set", name=name, value="1"),
             "vars clear": lambda: server.vars(action="clear", name=name),
             "vars clear_all": lambda: server.vars(action="clear_all"),
+            "vars get": lambda: server.vars(action="get", name=f"{via_get} = 5"),
             "kernel restart": lambda: server.kernel(action="restart"),
             "kernel stop": lambda: server.kernel(action="stop"),
+            "kernel close_subkernels": lambda: server.kernel(action="close_subkernels"),
+            "render expression": lambda: server.render(action="expression", code=f"{via_render} = 1"),
+            "verify_derivation": lambda: server.verify_derivation([f"{via_verify} = 1", "1"]),
+            "supervisor use": lambda: server.supervisor(action="use"),
+            "supervisor use_direct": lambda: server.supervisor(action="use_direct"),
         }
         for label, attempt in attempts.items():
             reply = payload(attempt())
             assert reply["success"] is False, (label, reply)
             assert "blocked during integrity recording" in reply["error"], (label, reply)
-        assert not symbol_exists(name)
+        for probe in (name, via_get, via_render, via_verify):
+            assert not symbol_exists(probe), probe
+        from mathematica_wstp.evaluator import get_evaluator
+        assert get_evaluator().name == "direct"
         assert ctx.nb.has_active_recorder and not ctx.nb._recorder.is_faulted
 
 

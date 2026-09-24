@@ -24,7 +24,7 @@ from mathematica_wstp.recorder_ledger import RecorderLedger
 # --- Pure-Python: ledger edge cases ------------------------------------------
 
 def test_update_record_nonexistent_seq():
-    """Updating a seq that does not exist is a silent no-op."""
+    """Updating a seq that does not exist raises instead of passing silently."""
     d = tempfile.mkdtemp(prefix="rec-adv-")
     nb_path = os.path.join(d, "test.nb")
     os.environ["MATHEMATICA_WSTP_RECORDING_DIR"] = os.path.join(d, "ledgers")
@@ -34,7 +34,12 @@ def test_update_record_nonexistent_seq():
         tag = ledger.make_tag()
         ledger.append("digest1", "x = 1", "Input", tag)
 
-        ledger.update_record(999, disposition={"execution_outcome": "COMPLETED"})
+        try:
+            ledger.update_record(999, disposition={"execution_outcome": "COMPLETED"})
+        except KeyError:
+            pass
+        else:
+            raise AssertionError("update_record accepted an unknown seq")
 
         r = ledger.record_by_seq(1)
         assert "disposition" not in r
