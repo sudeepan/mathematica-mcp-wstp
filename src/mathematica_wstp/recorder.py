@@ -182,6 +182,13 @@ class Recorder:
 
         annotation = self._auto_annotate(seq, disposition)
 
+        if (annotation is not None
+                and isinstance(annotation, dict)
+                and not annotation.get("applied", True)):
+            self._fault("POST_EVAL",
+                        f"annotation failed for seq {seq}: "
+                        + str(annotation.get("error", "unknown")))
+
         verification = self._verify_full()
 
         if not verification.get("verified"):
@@ -189,13 +196,16 @@ class Recorder:
                         f"integrity verification failed after seq {seq}: "
                         + str(verification.get("issues", [])[:3]))
 
-        return {
+        result = {
             "seq": seq,
             "disposition": disposition,
             "annotation": annotation,
             "post_eval_verification": verification,
             "recording_faulted": self.is_faulted,
         }
+        if self.is_faulted:
+            result["recording_fault"] = self.ledger.data["fault"]
+        return result
 
     def _auto_annotate(self, seq: int, disposition: dict[str, str]
                        ) -> dict[str, Any] | None:

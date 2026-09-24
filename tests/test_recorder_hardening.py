@@ -1,4 +1,4 @@
-"""Hardening tests: Phases 7-10 invariant enforcement.
+"""Hardening tests: Phases 7-13 invariant enforcement.
 
 Each phase adds its own section. Tests are pure-Python where possible,
 falling back to integration only when the invariant crosses the kernel.
@@ -1032,6 +1032,178 @@ def test_positive_gate_accepts_verified_record():
     assert verified, "a fully verified record must pass the positive gate"
 
 
+# --- Phase 13: integration fix tests ----------------------------------------
+
+def test_annotation_failure_faults_recorder():
+    """A failed annotation must fault the recorder immediately."""
+    d = tempfile.mkdtemp(prefix="rec-h13a-")
+    os.environ["MATHEMATICA_WSTP_RECORDING_DIR"] = os.path.join(d, "ledgers")
+    try:
+        nb_path = os.path.join(d, "test.nb")
+        call_count = {"n": 0}
+
+        class StubNotebooks:
+            _recorder = None
+
+            @property
+            def has_active_recorder(self):
+                return self._recorder is not None
+
+            def _call_with_session(self, fn, *args, **kwargs):
+                call_count["n"] += 1
+                if fn == "MCPWriteCell":
+                    return {"success": True}
+                if fn == "MCPReadBack":
+                    if call_count["n"] <= 3:
+                        return {
+                            "success": True, "total": 1,
+                            "cells": [{"index": 1, "style": "Input",
+                                        "record_tag": "R001-1",
+                                        "source_digest": "d1",
+                                        "evaluatable": True}],
+                        }
+                    return {
+                        "success": False,
+                        "error": "kernel not responding",
+                    }
+                return {"success": False}
+
+            def annotate_cell(self, index, **kwargs):
+                return {"success": False, "error": "annotate failed"}
+
+        notebooks = StubNotebooks()
+        rec = Recorder(notebooks, "hnb1", nb_path)
+        notebooks._recorder = rec
+
+        rec_result = rec.record_and_verify("Pause[10]", style="Input")
+        assert rec_result["success"], "initial record must succeed"
+
+        outcome = rec.apply_outcome(
+            rec_result["seq"],
+            {"execution_outcome": "TIMED_OUT", "timed_out": "true"})
+
+        assert outcome["recording_faulted"], \
+            "annotation failure must fault the recorder"
+        assert rec.is_faulted
+        assert rec.ledger.data["fault"]["phase"] == "POST_EVAL"
+    finally:
+        os.environ.pop("MATHEMATICA_WSTP_RECORDING_DIR", None)
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_finalize_routes_to_recorder_finalizer():
+    """When recorder is active, finalize action must route to finalize_recording."""
+    d = tempfile.mkdtemp(prefix="rec-h13b-")
+    os.environ["MATHEMATICA_WSTP_RECORDING_DIR"] = os.path.join(d, "ledgers")
+    try:
+        from mathematica_wstp.notebooks import HeadlessNotebooks
+
+        routed = {"to_recorder": False, "to_legacy": False}
+
+        class PatchedNotebooks(HeadlessNotebooks):
+            def __init__(self):
+                self._sessions = {}
+                self._recorder = None
+                self._recording_target = None
+
+            @property
+            def has_active_recorder(self):
+                return self._recorder is not None
+
+            @property
+            def recording(self):
+                return self._recording_target
+
+            def _resolve(self, notebook):
+                return notebook or self._recording_target
+
+            def finalize_recording(self, timeout=600):
+                routed["to_recorder"] = True
+                return {"success": True, "path": "recorder_finalize"}
+
+            def finalize(self, notebook=None, timeout=600):
+                routed["to_legacy"] = True
+                return {"success": True, "path": "legacy_finalize"}
+
+        nb = PatchedNotebooks()
+        nb._recorder = object()
+        nb._recording_target = "hnb1"
+
+        if nb.has_active_recorder:
+            target = nb._resolve(None)
+            if target and target != nb.recording:
+                raise AssertionError("target mismatch")
+            result = nb.finalize_recording(timeout=600)
+        else:
+            result = nb.finalize(notebook=None, timeout=600)
+
+        assert routed["to_recorder"], \
+            "finalize must route to recorder finalizer when recorder is active"
+        assert not routed["to_legacy"], \
+            "legacy finalizer must not be called when recorder is active"
+    finally:
+        os.environ.pop("MATHEMATICA_WSTP_RECORDING_DIR", None)
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_post_eval_fault_surfaces_in_outcome():
+    """apply_outcome must include recording_fault when faulted."""
+    d = tempfile.mkdtemp(prefix="rec-h13c-")
+    os.environ["MATHEMATICA_WSTP_RECORDING_DIR"] = os.path.join(d, "ledgers")
+    try:
+        nb_path = os.path.join(d, "test.nb")
+        call_count = {"n": 0}
+
+        class StubNotebooks:
+            _recorder = None
+
+            @property
+            def has_active_recorder(self):
+                return self._recorder is not None
+
+            def _call_with_session(self, fn, *args, **kwargs):
+                call_count["n"] += 1
+                if fn == "MCPWriteCell":
+                    return {"success": True}
+                if fn == "MCPReadBack":
+                    if call_count["n"] <= 3:
+                        return {
+                            "success": True, "total": 1,
+                            "cells": [{"index": 1, "style": "Input",
+                                        "record_tag": "R001-1",
+                                        "source_digest": "d1",
+                                        "evaluatable": True}],
+                        }
+                    return {"success": True, "total": 1, "cells": [
+                        {"index": 1, "style": "Input",
+                         "record_tag": "R001-1",
+                         "source_digest": "WRONG",
+                         "evaluatable": True}]}
+
+            def annotate_cell(self, index, **kwargs):
+                return {"success": True}
+
+        notebooks = StubNotebooks()
+        rec = Recorder(notebooks, "hnb1", nb_path)
+        notebooks._recorder = rec
+
+        rec_result = rec.record_and_verify("x = 1", style="Input")
+        assert rec_result["success"]
+
+        outcome = rec.apply_outcome(
+            rec_result["seq"],
+            {"execution_outcome": "COMPLETED"})
+
+        assert outcome["recording_faulted"], \
+            "digest mismatch must fault"
+        assert "recording_fault" in outcome, \
+            "faulted outcome must include recording_fault object"
+        assert outcome["recording_fault"]["phase"] == "POST_EVAL"
+    finally:
+        os.environ.pop("MATHEMATICA_WSTP_RECORDING_DIR", None)
+        shutil.rmtree(d, ignore_errors=True)
+
+
 # --- Runner ----------------------------------------------------------------
 
 if __name__ == "__main__":
@@ -1072,10 +1244,14 @@ if __name__ == "__main__":
         test_duplicate_source_distinct_tags_passes,
         test_positive_gate_rejects_missing_seq,
         test_positive_gate_accepts_verified_record,
+        # Phase 13
+        test_annotation_failure_faults_recorder,
+        test_finalize_routes_to_recorder_finalizer,
+        test_post_eval_fault_surfaces_in_outcome,
     ]
 
     passed = failed = 0
-    print("=== Phases 7-11: hardening tests ===")
+    print("=== Phases 7-13: hardening tests ===")
     for fn in tests:
         try:
             fn()

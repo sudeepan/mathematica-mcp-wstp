@@ -306,8 +306,18 @@ malformed results, or `None` refuse dispatch.
 
 ### Finalization and structural verification
 
-Stop with `notebooks(action="stop_recording")`. Finalize with
-`notebooks(action="finalize")` - this re-runs every cell in a fresh kernel
+Finalize **before** stopping the recorder:
+
+```text
+notebooks(action="save")
+notebooks(action="finalize")       # while recorder is still active
+notebooks(action="stop_recording") # only after finalization
+```
+
+`stop_recording` clears the recorder object. If you stop first, finalization
+falls through to the legacy path and never checks the recorder ledger.
+
+`notebooks(action="finalize")` re-runs every cell in a fresh kernel
 via `NotebookEvaluate` so the notebook gets native `In[n]`/`Out[n]` labels.
 
 After finalization, the server opens the finalized `.nb` as a temporary
@@ -416,8 +426,9 @@ For a from-scratch computation:
 1. notebooks(action="create", ..., record=True)
 2. evaluate(code) - every call is recorded as a cell
 3. notebooks(action="save")
-4. notebooks(action="finalize") - re-evaluates in a fresh kernel, then
-   verifies the finalized artifact against the recorder ledger
+4. notebooks(action="finalize") - while recorder is still active;
+   re-evaluates in a fresh kernel, then verifies against the ledger
+5. notebooks(action="stop_recording")
 ```
 
 For the observed failure modes behind these rules, read

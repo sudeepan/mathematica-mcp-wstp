@@ -140,9 +140,9 @@ def _fail(error: str, **extra: Any) -> CallToolResult:
         "all its definitions survive, so you can retry a smaller piece.\n"
         "When recording is active, every call is written into the recording "
         "notebook. Pass style to control the cell style: 'Input' (default), "
-        "'Chapter', 'Section', 'Subsection', 'Item', etc. A non-Input style "
-        "is useful for structuring the recorded notebook with section headers "
-        "that still go through the kernel."
+        "'Chapter', 'Section', 'Subsection', 'Item', etc. Narrative styles "
+        "(Title, Section, Text, Item, etc.) write notebook structure but skip "
+        "scientific execution - no ledger record is created."
     )
 )
 def evaluate(code: str, timeout: float = 60.0,
@@ -192,6 +192,9 @@ def evaluate(code: str, timeout: float = 60.0,
             rec["disposition"] = outcome.get("disposition")
             rec["post_eval_verification"] = outcome.get(
                 "post_eval_verification")
+            if outcome.get("recording_faulted"):
+                rec["recording_faulted"] = True
+                rec["recording_fault"] = outcome.get("recording_fault")
 
     if not result.success:
         payload: dict[str, Any] = {
@@ -375,8 +378,11 @@ def notebooks(
             return _fail("open requires a path")
         result = nb.open(path)
         if record and result.get("success"):
-            nb.start_recording(result.get("id"))
-            result["recording"] = True
+            rec_result = nb.start_recording(result.get("id"))
+            result["recording"] = rec_result.get("success", False)
+            if not result["recording"]:
+                result["recording_error"] = rec_result.get("error",
+                                                           "start_recording failed")
         return _reply(result)
     if action == "dependencies":
         # Run this BEFORE evaluating an unfamiliar notebook. A cell that loads
@@ -394,8 +400,11 @@ def notebooks(
     if action == "create":
         result = nb.create(title=title, path=path)
         if record and result.get("success"):
-            nb.start_recording(result.get("id"))
-            result["recording"] = True
+            rec_result = nb.start_recording(result.get("id"))
+            result["recording"] = rec_result.get("success", False)
+            if not result["recording"]:
+                result["recording_error"] = rec_result.get("error",
+                                                           "start_recording failed")
         return _reply(result)
     if action == "list":
         result = nb.list()
@@ -416,6 +425,13 @@ def notebooks(
     if action == "stop_recording":
         return _reply(nb.stop_recording())
     if action == "finalize":
+        if nb.has_active_recorder:
+            target = nb._resolve(notebook) if notebook else nb.recording
+            if target and target != nb.recording:
+                return _fail(
+                    f"notebook {notebook} is not the recording target; "
+                    f"the active recording is on {nb.recording}")
+            return _reply(nb.finalize_recording(timeout=600))
         return _reply(nb.finalize(notebook=notebook, timeout=600))
     return _fail(f"unknown action: {action}")
 
