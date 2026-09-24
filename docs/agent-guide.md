@@ -257,35 +257,17 @@ kernel while still being unsuitable as a desktop notebook.
 
 ## Recording every evaluation into a notebook
 
-Every `evaluate()` call can be automatically written as a cell into an open
-notebook. This gives a complete, auditable record of what the kernel ran.
-
-Start recording when you create or open the target notebook:
-
 ```text
 notebooks(action="create", title="Computation Log", path="/tmp/log.nb", record=True)
 ```
 
-Or start it later on an already-open notebook:
+Or on an already-open notebook: `notebooks(action="record", notebook="hnb1")`.
 
-```text
-notebooks(action="record", notebook="hnb1")
-```
+Every `evaluate(code)` call writes `code` as a cell before evaluating it.
+While recording, `write_cell`, `edit_cells`, `execute_in_notebook` are blocked
+on that notebook.
 
-From that point on, every `evaluate(code)` call writes `code` as a cell
-into the recording notebook before the kernel evaluates it. The recording
-happens silently; a `recorded: true` flag in the evaluate reply confirms it.
-
-### The recording lock
-
-While recording is active, `write_cell`, `edit_cells`, `execute_in_notebook`
-are **blocked** on the recording notebook. The only write path is `evaluate()`.
-This is enforced in code, not by convention.
-
-### Cell styles
-
-By default, recorded cells are Input cells. Pass `style` to `evaluate()` to
-write a different cell style:
+Pass `style` to write structure cells:
 
 ```text
 evaluate("Diagrams", style="Chapter")
@@ -293,33 +275,9 @@ evaluate("Common setup", style="Section")
 evaluate("GraphGen[1]")
 ```
 
-The style string passes through to the notebook unchanged. The kernel still
-evaluates the code (a section title evaluates to the string itself), and the
-notebook gets a Chapter, Section, or Subsection cell instead of an Input cell.
-
-### Stopping
-
-```text
-notebooks(action="stop_recording")
-```
-
-Closing the recording notebook also stops recording. Once stopped, the lock
-lifts and `write_cell`/`edit_cells` work again on that notebook.
-
-### Finalizing
-
-Once the prototyping session is complete and the recording notebook contains
-all the cells, `finalize` re-runs them via `NotebookEvaluate` so every
-cell gets native In[n]/Out[n] labels:
-
-```text
-notebooks(action="finalize")
-```
-
-This saves the notebook to disk, opens it in the offscreen front end, runs
-`NotebookEvaluate[nb, InsertResults -> True]`, and saves the result. The
-notebook on disk is then a self-contained document a human can open in
-Mathematica and see exactly what was computed.
+Stop with `notebooks(action="stop_recording")`. Finalize with
+`notebooks(action="finalize")` - this re-runs every cell in a fresh kernel
+via `NotebookEvaluate` so the notebook gets native `In[n]`/`Out[n]` labels.
 
 ## Parallel work
 
@@ -377,29 +335,14 @@ created here.
 
 ## Checking the record
 
-Do not judge a replay by page count and a success flag.
-
-Against a reference notebook:
-
 ```text
-notebooks(action="verify", path="/path/to/original.nb")
+notebooks(action="verify", path="/path/to/original.nb")   # against a reference
+notebooks(action="verify")                                  # self-consistency
 ```
 
-checks output shape and label behavior. It does **not** prove scientific
-correctness or value equality.
-
-Without a reference:
-
-```text
-notebooks(action="verify")
-```
-
-checks the record's own label consistency where the server is the author.
-
-For mathematical divergence, use explicit fingerprints chosen for the object:
-`Length`/`LeafCount` are useful tripwires for transparent expressions but can be
-misleading across serialization or opaque heads. Use `ByteCount` when
-appropriate.
+Neither proves scientific correctness. For mathematical divergence, use
+`Length`/`LeafCount` on transparent expressions and `ByteCount` on opaque
+ones (pitfall 7).
 
 ## Exporting for a human
 
@@ -433,12 +376,10 @@ Before a serious replay:
 For a from-scratch computation:
 
 ```text
-1. notebooks(action="create", ..., record=True) to start a recording notebook
-2. evaluate("Chapter Title", style="Chapter") for structure
-3. evaluate(code) for computation - every call is recorded
-4. write_cell/edit_cells are BLOCKED on the recording notebook
-5. notebooks(action="save") to persist the record
-6. notebooks(action="finalize") to re-run with native In/Out labels
+1. notebooks(action="create", ..., record=True)
+2. evaluate(code) - every call is recorded as a cell
+3. notebooks(action="save")
+4. notebooks(action="finalize")
 ```
 
 For the observed failure modes behind these rules, read

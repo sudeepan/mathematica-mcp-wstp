@@ -313,6 +313,11 @@ Run Wolfram's own MCP server alongside it and use `WolframLanguageContext` for q
 python3 tests/test_kernel.py
 .venv/bin/python tests/test_server_mcp.py
 .venv/bin/python tests/test_supervisor.py
+python3 tests/test_recorder_foundation.py
+python3 tests/test_recorder_core.py
+python3 tests/test_recorder_annotations.py
+python3 tests/test_recorder_finalize.py
+python3 tests/test_recorder_adversarial.py
 ```
 
-Point `MATHEMATICA_WSTP_TEST_NOTEBOOK` at any `.nb` to exercise notebook tools against a real document; those checks are skipped when it is unset.
+The recorder tests use their own `__main__` runner and do not require pytest. Point `MATHEMATICA_WSTP_TEST_NOTEBOOK` at any `.nb` to exercise notebook tools against a real document; those checks are skipped when it is unset.
