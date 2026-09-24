@@ -177,8 +177,9 @@ def test_recorder_end_to_end():
         tagged = [c for c in readback["cells"] if c["record_tag"]]
         assert len(tagged) == 2
 
-        stopped = nb.stop_recording()
+        stopped = nb.stop_recording(force=True)
         assert stopped.get("success")
+        assert stopped.get("abandoned") is True
         assert stopped["recorder"]["ledger"]["records"] == 2
     finally:
         os.environ.pop("MATHEMATICA_WSTP_RECORDING_DIR", None)

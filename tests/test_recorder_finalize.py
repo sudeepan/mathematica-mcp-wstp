@@ -49,6 +49,7 @@ def test_finalize_blocked_by_unresolved():
         rec.notebook_path = nb_path
         rec.run_id = run_id
         rec.ledger = ledger
+        rec._sealed = False
 
         result = rec.finalize()
         assert not result["success"]
@@ -91,7 +92,9 @@ def test_finalize_allowed_when_annotated():
             def _call_with_session(self, *a, **kw):
                 return {"success": True, "cells": [
                     {"record_tag": tag, "source_digest": "digest1",
-                     "index": 0}
+                     "index": 0, "style": "Input", "executable": True,
+                     "evaluatable": False,
+                     "annotation_reason": "timed out; system timeout"}
                 ], "total": 1}
         rec = Recorder.__new__(Recorder)
         rec.notebooks = FakeNotebooks()
@@ -99,9 +102,10 @@ def test_finalize_allowed_when_annotated():
         rec.notebook_path = nb_path
         rec.run_id = run_id
         rec.ledger = ledger
+        rec._sealed = False
 
         result = rec.finalize()
-        assert "unresolved" not in result
+        assert result == {"success": False, "error": "no real notebook"}, result
     finally:
         os.environ.pop("MATHEMATICA_WSTP_RECORDING_DIR", None)
         shutil.rmtree(d, ignore_errors=True)
@@ -129,6 +133,7 @@ def test_finalize_end_to_end():
         nbid = made["id"]
 
         recorder = Recorder(nb, nbid, path)
+        finalized_path = os.path.splitext(path)[0] + f"-{recorder.run_id}-finalized.nb"
 
         rec1 = recorder.record_and_verify("x = 2 + 3", style="Input")
         assert rec1.get("pre_dispatch_verified")
@@ -186,6 +191,7 @@ def test_finalize_skips_non_evaluatable():
         nbid = made["id"]
 
         recorder = Recorder(nb, nbid, path)
+        finalized_path = os.path.splitext(path)[0] + f"-{recorder.run_id}-finalized.nb"
 
         rec1 = recorder.record_and_verify("good = 42", style="Input")
         disp_ok = {"execution_outcome": "COMPLETED", "control_intent": "NONE",
@@ -238,6 +244,7 @@ def test_finalize_via_notebooks_api():
 
         started = nb.start_recording(nbid)
         assert started.get("success")
+        finalized_path = os.path.splitext(path)[0] + f"-{started['run_id']}-finalized.nb"
 
         rec = nb.record_input("z = 7")
         assert rec.get("success")

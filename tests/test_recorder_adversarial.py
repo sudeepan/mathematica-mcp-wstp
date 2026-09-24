@@ -154,6 +154,7 @@ def test_full_lifecycle_mixed_outcomes():
         nbid = made["id"]
 
         recorder = Recorder(nb, nbid, path)
+        finalized_path = os.path.splitext(path)[0] + f"-{recorder.run_id}-finalized.nb"
 
         # Cell 1: successful
         rec1 = recorder.record_and_verify("a = 10", style="Input")
