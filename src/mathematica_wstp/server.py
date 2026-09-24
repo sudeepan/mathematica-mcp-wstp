@@ -149,6 +149,17 @@ def evaluate(code: str, timeout: float = 60.0,
              style: str = "Input") -> dict[str, Any]:
     nb = get_headless_notebooks()
     rec = nb.record_input(code, style=style)
+
+    # Fail closed: when the integrity recorder is active, a recording
+    # failure prevents scientific dispatch.
+    if (nb.has_active_recorder
+            and isinstance(rec, dict) and not rec.get("success", True)):
+        return _fail(
+            "recording integrity: cell could not be verified before dispatch",
+            recording_error=rec.get("error"),
+            record_tag=rec.get("record_tag"),
+        )
+
     result = evaluate_text(code, timeout=timeout)
     notice = session.take_kernel_change_notice()
 

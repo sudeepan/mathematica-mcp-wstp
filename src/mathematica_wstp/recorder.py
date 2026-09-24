@@ -40,7 +40,11 @@ class Recorder:
 
     def record_and_verify(self, code: str, style: str = "Input"
                           ) -> dict[str, Any]:
-        """Write a tagged cell, append to ledger, verify via pre-dispatch read-back."""
+        """Write a tagged cell, append to ledger, verify via pre-dispatch read-back.
+
+        Returns success=False if any step fails. The caller must not dispatch
+        the scientific evaluation when success is False.
+        """
         tag = self.ledger.make_tag()
 
         write_result = self.notebooks._call_with_session(
@@ -55,9 +59,9 @@ class Recorder:
             logger.warning("pre-dispatch read-back failed: %s",
                            readback.get("error"))
             return {
-                "success": True,
+                "success": False,
+                "error": "pre-dispatch verification failed: read-back error",
                 "record_tag": tag,
-                "pre_dispatch_verified": False,
                 "readback_error": readback.get("error"),
             }
 

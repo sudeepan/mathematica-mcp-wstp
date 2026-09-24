@@ -1065,12 +1065,18 @@ class HeadlessNotebooks:
     def recording(self) -> str | None:
         return self._recording_target
 
+    @property
+    def has_active_recorder(self) -> bool:
+        """True when an integrity recorder is active (not just basic capture)."""
+        return self._recorder is not None
+
     def record_input(self, code: str, style: str = "Input") -> dict[str, Any] | None:
         """Write a cell into the recording notebook, if one is active.
 
         Returns None when recording is off, the write result otherwise.
-        When a recorder is active, the cell is tagged and verified before
-        returning. Failures are logged but never block the caller's evaluation.
+        When an integrity recorder is active, the cell is tagged and
+        verified before returning. A failure result means the caller
+        must not dispatch the scientific evaluation.
         """
         target = self._recording_target
         if target is None:
