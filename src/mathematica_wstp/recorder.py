@@ -153,11 +153,18 @@ class Recorder:
         return {"applied": applied, "reason": reason}
 
     def unresolved_records(self) -> list[dict[str, Any]]:
-        """Records with a non-COMPLETED outcome that have not been annotated."""
+        """Records whose terminal state is unknown or non-COMPLETED.
+
+        A record with no disposition at all is unresolved: it was durably
+        recorded but the recorder does not know whether dispatch occurred
+        or what happened afterwards. Treating it as resolved would let
+        finalization proceed without knowing whether the cell ever ran.
+        """
         unresolved = []
         for r in self.ledger.records:
             disp = r.get("disposition")
             if disp is None:
+                unresolved.append(r)
                 continue
             if disp.get("execution_outcome") == "COMPLETED":
                 continue

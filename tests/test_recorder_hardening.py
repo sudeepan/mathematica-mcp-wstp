@@ -191,21 +191,111 @@ def test_has_active_recorder_property():
     assert not nb.has_active_recorder
 
 
+# --- Phase 8: missing disposition = unresolved ----------------------------
+
+def test_no_disposition_is_unresolved():
+    """A record with no disposition must be treated as unresolved."""
+    d = tempfile.mkdtemp(prefix="rec-h8-")
+    os.environ["MATHEMATICA_WSTP_RECORDING_DIR"] = os.path.join(d, "ledgers")
+    try:
+        nb_path = os.path.join(d, "test.nb")
+        run_id = f"R{uuid.uuid4().hex[:10]}"
+        ledger = RecorderLedger.create(nb_path, "hnb1", run_id)
+        tag = ledger.make_tag()
+        ledger.append("d1", "x = 1", "Input", tag)
+
+        rec = Recorder.__new__(Recorder)
+        rec.notebooks = type("FN", (), {})()
+        rec.notebook_id = "hnb1"
+        rec.notebook_path = nb_path
+        rec.run_id = run_id
+        rec.ledger = ledger
+
+        unresolved = rec.unresolved_records()
+        assert len(unresolved) == 1
+        assert unresolved[0]["record_tag"] == tag
+        assert rec.has_unresolved()
+    finally:
+        os.environ.pop("MATHEMATICA_WSTP_RECORDING_DIR", None)
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_completed_disposition_is_resolved():
+    """A record with COMPLETED disposition is not unresolved."""
+    d = tempfile.mkdtemp(prefix="rec-h8b-")
+    os.environ["MATHEMATICA_WSTP_RECORDING_DIR"] = os.path.join(d, "ledgers")
+    try:
+        nb_path = os.path.join(d, "test.nb")
+        run_id = f"R{uuid.uuid4().hex[:10]}"
+        ledger = RecorderLedger.create(nb_path, "hnb1", run_id)
+        tag = ledger.make_tag()
+        ledger.append("d1", "x = 1", "Input", tag)
+        ledger.update_record(1, disposition={
+            "execution_outcome": "COMPLETED",
+            "control_intent": "NONE",
+            "abort_confirmation": "NOT_APPLICABLE",
+            "kernel_readiness": "READY",
+        })
+
+        rec = Recorder.__new__(Recorder)
+        rec.notebooks = type("FN", (), {})()
+        rec.notebook_id = "hnb1"
+        rec.notebook_path = nb_path
+        rec.run_id = run_id
+        rec.ledger = ledger
+
+        assert not rec.has_unresolved()
+    finally:
+        os.environ.pop("MATHEMATICA_WSTP_RECORDING_DIR", None)
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_no_disposition_blocks_finalization():
+    """finalize() refuses when any record has no disposition."""
+    d = tempfile.mkdtemp(prefix="rec-h8c-")
+    os.environ["MATHEMATICA_WSTP_RECORDING_DIR"] = os.path.join(d, "ledgers")
+    try:
+        nb_path = os.path.join(d, "test.nb")
+        run_id = f"R{uuid.uuid4().hex[:10]}"
+        ledger = RecorderLedger.create(nb_path, "hnb1", run_id)
+        tag = ledger.make_tag()
+        ledger.append("d1", "x = 1", "Input", tag)
+
+        rec = Recorder.__new__(Recorder)
+        rec.notebooks = type("FN", (), {})()
+        rec.notebook_id = "hnb1"
+        rec.notebook_path = nb_path
+        rec.run_id = run_id
+        rec.ledger = ledger
+
+        fin = rec.finalize(timeout=120)
+        assert not fin["success"]
+        assert "unresolved" in fin["error"]
+    finally:
+        os.environ.pop("MATHEMATICA_WSTP_RECORDING_DIR", None)
+        shutil.rmtree(d, ignore_errors=True)
+
+
 # --- Runner ----------------------------------------------------------------
 
 if __name__ == "__main__":
     import traceback
 
     tests = [
+        # Phase 7
         test_readback_failure_returns_success_false,
         test_readback_failure_does_not_append_to_ledger,
         test_cell_not_found_returns_success_false,
         test_write_failure_returns_success_false,
         test_has_active_recorder_property,
+        # Phase 8
+        test_no_disposition_is_unresolved,
+        test_completed_disposition_is_resolved,
+        test_no_disposition_blocks_finalization,
     ]
 
     passed = failed = 0
-    print("=== Phase 7: fail closed before dispatch ===")
+    print("=== Phases 7-8: hardening tests ===")
     for fn in tests:
         try:
             fn()

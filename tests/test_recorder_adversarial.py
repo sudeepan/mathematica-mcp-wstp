@@ -83,8 +83,8 @@ def test_ledger_survives_reload():
         shutil.rmtree(d, ignore_errors=True)
 
 
-def test_unresolved_ignores_records_without_disposition():
-    """A record that was never dispatched (no disposition) is not unresolved."""
+def test_unresolved_includes_records_without_disposition():
+    """A record with no disposition IS unresolved - it was never dispatched."""
     from mathematica_wstp.recorder import Recorder
 
     d = tempfile.mkdtemp(prefix="rec-adv-")
@@ -105,7 +105,7 @@ def test_unresolved_ignores_records_without_disposition():
         rec.run_id = run_id
         rec.ledger = ledger
 
-        assert not rec.has_unresolved()
+        assert rec.has_unresolved(), "a record with no disposition must be unresolved"
     finally:
         os.environ.pop("MATHEMATICA_WSTP_RECORDING_DIR", None)
         shutil.rmtree(d, ignore_errors=True)
@@ -423,7 +423,7 @@ if __name__ == "__main__":
     pure_python = [
         test_update_record_nonexistent_seq,
         test_ledger_survives_reload,
-        test_unresolved_ignores_records_without_disposition,
+        test_unresolved_includes_records_without_disposition,
         test_disposition_all_axis_combinations,
     ]
     integration = [
