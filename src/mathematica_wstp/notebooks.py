@@ -1025,12 +1025,50 @@ class HeadlessNotebooks:
     # -- recording --------------------------------------------------------
 
     def start_recording(self, notebook: str | None = None) -> dict[str, Any]:
-        """Start recording every evaluate() call into a notebook."""
+        """Start a new integrity recording session on a notebook.
+
+        A new recording requires a clean executable baseline: no
+        pre-existing executable cells. Narrative cells (Title, Section,
+        Text, etc.) are allowed. Resuming an interrupted recording is
+        a separate operation.
+        """
         from .recorder import Recorder
 
         notebook_id = self._resolve(notebook)
         if notebook_id is None:
             return self._no_session(notebook)
+
+        readback = self._call_with_session(
+            "MCPReadBack", notebook_id, timeout=30)
+        if not readback.get("success"):
+            return {
+                "success": False,
+                "error": "cannot verify executable baseline: " + str(readback.get("error", "")),
+            }
+
+        narrative_styles = Recorder._NARRATIVE_STYLES
+        existing_executable = []
+        for cell in readback.get("cells", []):
+            if cell.get("style", "") in narrative_styles:
+                continue
+            if cell.get("executable", False):
+                existing_executable.append({
+                    "index": cell.get("index"),
+                    "style": cell.get("style"),
+                    "source_preview": cell.get("source_preview", "")[:80],
+                })
+
+        if existing_executable:
+            return {
+                "success": False,
+                "error": (
+                    f"cannot start new recording: notebook has "
+                    f"{len(existing_executable)} pre-existing executable cell(s); "
+                    f"new integrity recordings require a clean executable baseline"
+                ),
+                "existing_executable": existing_executable[:10],
+            }
+
         self._recording_target = notebook_id
         with _registry_lock:
             sess = self._sessions.get(notebook_id)

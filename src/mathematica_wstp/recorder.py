@@ -234,8 +234,26 @@ class Recorder:
         result["run_id"] = self.run_id
         return result
 
+    _NARRATIVE_STYLES = frozenset({
+        "Title", "Subtitle", "Chapter", "Subchapter",
+        "Section", "Subsection", "Subsubsection",
+        "Text", "Item", "ItemNumbered", "ItemParagraph",
+        "Subitem", "SubitemNumbered", "SubitemParagraph",
+        "Output", "Print", "Message",
+    })
+
     def _verify_full(self) -> dict[str, Any]:
-        """Full read-back: compare every ledger entry against the notebook."""
+        """Bidirectional verification: ledger-to-notebook and notebook-to-ledger.
+
+        Ledger-to-notebook: every ledger record has a matching cell with
+        the same source digest.
+
+        Notebook-to-ledger (the converse check): every executable cell in
+        the notebook must carry a recorder tag that appears in the ledger.
+        Narrative cells (Title, Section, Text, Output, etc.) are exempt.
+        Duplicate record tags across cells and out-of-order tag sequences
+        are also flagged.
+        """
         readback = self.notebooks._call_with_session(
             "MCPReadBack", self.notebook_id, timeout=30)
         if not readback.get("success"):
@@ -244,8 +262,11 @@ class Recorder:
         cells = readback.get("cells", [])
         tagged_cells = {c["record_tag"]: c for c in cells
                         if c.get("record_tag")}
+        ledger_tags = {r["record_tag"] for r in self.ledger.records}
 
         issues = []
+
+        # Forward: every ledger record must have a matching cell
         for record in self.ledger.records:
             tag = record["record_tag"]
             cell = tagged_cells.get(tag)
@@ -257,6 +278,55 @@ class Recorder:
                                "issue": "source_changed",
                                "expected": record["source_digest"],
                                "found": cell["source_digest"]})
+
+        # Converse: every executable cell must have a ledger entry
+        seen_tags: dict[str, int] = {}
+        last_ledger_seq = -1
+        for cell in cells:
+            style = cell.get("style", "")
+            tag = cell.get("record_tag")
+            executable = cell.get("executable", False)
+
+            if style in self._NARRATIVE_STYLES:
+                continue
+
+            if not tag and executable:
+                issues.append({
+                    "index": cell.get("index"),
+                    "issue": "untagged_executable",
+                    "style": style,
+                    "source_preview": cell.get("source_preview", "")[:80],
+                })
+                continue
+
+            if tag:
+                if tag in seen_tags:
+                    issues.append({
+                        "tag": tag,
+                        "issue": "duplicate_tag",
+                        "first_index": seen_tags[tag],
+                        "second_index": cell.get("index"),
+                    })
+                seen_tags[tag] = cell.get("index", 0)
+
+                if tag in ledger_tags:
+                    record = self.ledger.record_by_tag(tag)
+                    if record:
+                        seq = record["seq"]
+                        if seq < last_ledger_seq:
+                            issues.append({
+                                "tag": tag,
+                                "seq": seq,
+                                "issue": "out_of_order",
+                                "expected_after_seq": last_ledger_seq,
+                            })
+                        last_ledger_seq = max(last_ledger_seq, seq)
+                elif executable:
+                    issues.append({
+                        "tag": tag,
+                        "index": cell.get("index"),
+                        "issue": "tag_not_in_ledger",
+                    })
 
         return {
             "verified": len(issues) == 0,

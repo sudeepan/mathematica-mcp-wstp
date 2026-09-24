@@ -276,6 +276,249 @@ def test_no_disposition_blocks_finalization():
         shutil.rmtree(d, ignore_errors=True)
 
 
+# --- Phase 9: recording boundary and converse check ----------------------
+
+def test_converse_untagged_executable_fails_verification():
+    """An executable cell without a recorder tag fails verification."""
+    d = tempfile.mkdtemp(prefix="rec-h9-")
+    os.environ["MATHEMATICA_WSTP_RECORDING_DIR"] = os.path.join(d, "ledgers")
+    try:
+        nb_path = os.path.join(d, "test.nb")
+
+        class StubNotebooks:
+            _recorder = None
+
+            def _call_with_session(self, fn, *args, **kwargs):
+                if fn == "MCPReadBack":
+                    return {
+                        "success": True,
+                        "total": 2,
+                        "cells": [
+                            {"index": 1, "style": "Input", "executable": True,
+                             "record_tag": "R001-1", "source_digest": "aaa"},
+                            {"index": 2, "style": "Input", "executable": True,
+                             "record_tag": "", "source_digest": "bbb"},
+                        ],
+                    }
+                return {"success": False}
+
+        notebooks = StubNotebooks()
+        rec = Recorder(notebooks, "hnb1", nb_path)
+        rec.ledger = RecorderLedger.create(nb_path, "hnb1", rec.run_id)
+        tag = rec.ledger.make_tag()
+        rec.ledger.append("aaa", "x = 1", "Input", tag)
+
+        result = rec._verify_full()
+        assert not result["verified"]
+        issues = result["issues"]
+        untagged = [i for i in issues if i["issue"] == "untagged_executable"]
+        assert len(untagged) == 1
+        assert untagged[0]["index"] == 2
+    finally:
+        os.environ.pop("MATHEMATICA_WSTP_RECORDING_DIR", None)
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_converse_narrative_cells_exempt():
+    """Narrative cells (Title, Section, Text) do not need recorder tags."""
+    d = tempfile.mkdtemp(prefix="rec-h9b-")
+    os.environ["MATHEMATICA_WSTP_RECORDING_DIR"] = os.path.join(d, "ledgers")
+    try:
+        nb_path = os.path.join(d, "test.nb")
+
+        class StubNotebooks:
+            _recorder = None
+
+            def _call_with_session(self, fn, *args, **kwargs):
+                if fn == "MCPReadBack":
+                    return {
+                        "success": True,
+                        "total": 3,
+                        "cells": [
+                            {"index": 1, "style": "Title", "executable": False,
+                             "record_tag": "", "source_digest": "t1"},
+                            {"index": 2, "style": "Section", "executable": False,
+                             "record_tag": "", "source_digest": "s1"},
+                            {"index": 3, "style": "Input", "executable": True,
+                             "record_tag": "R001-1", "source_digest": "aaa"},
+                        ],
+                    }
+                return {"success": False}
+
+        notebooks = StubNotebooks()
+        rec = Recorder(notebooks, "hnb1", nb_path)
+        rec.ledger = RecorderLedger.create(nb_path, "hnb1", rec.run_id)
+        tag = rec.ledger.make_tag()
+        rec.ledger.append("aaa", "x = 1", "Input", tag)
+
+        result = rec._verify_full()
+        assert result["verified"], f"narrative cells should not cause issues: {result['issues']}"
+    finally:
+        os.environ.pop("MATHEMATICA_WSTP_RECORDING_DIR", None)
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_converse_duplicate_tag_fails():
+    """Two cells with the same recorder tag fail verification."""
+    d = tempfile.mkdtemp(prefix="rec-h9c-")
+    os.environ["MATHEMATICA_WSTP_RECORDING_DIR"] = os.path.join(d, "ledgers")
+    try:
+        nb_path = os.path.join(d, "test.nb")
+
+        class StubNotebooks:
+            _recorder = None
+
+            def _call_with_session(self, fn, *args, **kwargs):
+                if fn == "MCPReadBack":
+                    return {
+                        "success": True,
+                        "total": 2,
+                        "cells": [
+                            {"index": 1, "style": "Input", "executable": True,
+                             "record_tag": "R001-1", "source_digest": "aaa"},
+                            {"index": 2, "style": "Input", "executable": True,
+                             "record_tag": "R001-1", "source_digest": "aaa"},
+                        ],
+                    }
+                return {"success": False}
+
+        notebooks = StubNotebooks()
+        rec = Recorder(notebooks, "hnb1", nb_path)
+        rec.ledger = RecorderLedger.create(nb_path, "hnb1", rec.run_id)
+        tag = rec.ledger.make_tag()
+        rec.ledger.append("aaa", "x = 1", "Input", tag)
+
+        result = rec._verify_full()
+        assert not result["verified"]
+        dupes = [i for i in result["issues"] if i["issue"] == "duplicate_tag"]
+        assert len(dupes) == 1
+    finally:
+        os.environ.pop("MATHEMATICA_WSTP_RECORDING_DIR", None)
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_converse_out_of_order_fails():
+    """Cells appearing out of ledger sequence order fail verification."""
+    d = tempfile.mkdtemp(prefix="rec-h9d-")
+    os.environ["MATHEMATICA_WSTP_RECORDING_DIR"] = os.path.join(d, "ledgers")
+    try:
+        nb_path = os.path.join(d, "test.nb")
+
+        class StubNotebooks:
+            _recorder = None
+
+            def _call_with_session(self, fn, *args, **kwargs):
+                if fn == "MCPReadBack":
+                    return {
+                        "success": True,
+                        "total": 2,
+                        "cells": [
+                            {"index": 1, "style": "Input", "executable": True,
+                             "record_tag": "R001-2", "source_digest": "bbb"},
+                            {"index": 2, "style": "Input", "executable": True,
+                             "record_tag": "R001-1", "source_digest": "aaa"},
+                        ],
+                    }
+                return {"success": False}
+
+        notebooks = StubNotebooks()
+        rec = Recorder(notebooks, "hnb1", nb_path)
+        rec.ledger = RecorderLedger.create(nb_path, "hnb1", rec.run_id)
+        t1 = rec.ledger.make_tag()
+        rec.ledger.append("aaa", "x = 1", "Input", t1)
+        t2 = rec.ledger.make_tag()
+        rec.ledger.append("bbb", "y = 2", "Input", t2)
+
+        result = rec._verify_full()
+        assert not result["verified"]
+        ooo = [i for i in result["issues"] if i["issue"] == "out_of_order"]
+        assert len(ooo) == 1
+    finally:
+        os.environ.pop("MATHEMATICA_WSTP_RECORDING_DIR", None)
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_recording_boundary_rejects_existing_executable():
+    """start_recording refuses when executable cells already exist."""
+    from mathematica_wstp.notebooks import HeadlessNotebooks
+
+    d = tempfile.mkdtemp(prefix="rec-h9e-")
+    os.environ["MATHEMATICA_WSTP_RECORDING_DIR"] = os.path.join(d, "ledgers")
+    try:
+        call_responses = {
+            "MCPReadBack": {
+                "success": True,
+                "total": 1,
+                "cells": [
+                    {"index": 1, "style": "Input", "executable": True,
+                     "record_tag": "", "source_digest": "abc"},
+                ],
+            },
+        }
+
+        nb = HeadlessNotebooks()
+        nb._sessions["hnb1"] = type("S", (), {
+            "notebook_id": "hnb1", "path": "/tmp/test.nb",
+            "title": "", "created": True,
+        })()
+
+        original_call = nb._call_with_session
+
+        def mock_call(fn, *args, **kwargs):
+            if fn in call_responses:
+                return call_responses[fn]
+            return {"success": False, "error": "not mocked"}
+
+        nb._call_with_session = mock_call
+        result = nb.start_recording(notebook="hnb1")
+        assert not result["success"]
+        assert "pre-existing executable" in result["error"]
+        assert nb._recorder is None
+    finally:
+        os.environ.pop("MATHEMATICA_WSTP_RECORDING_DIR", None)
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_recording_boundary_allows_narrative_only():
+    """start_recording succeeds when only narrative cells exist."""
+    from mathematica_wstp.notebooks import HeadlessNotebooks
+
+    d = tempfile.mkdtemp(prefix="rec-h9f-")
+    os.environ["MATHEMATICA_WSTP_RECORDING_DIR"] = os.path.join(d, "ledgers")
+    try:
+        call_responses = {
+            "MCPReadBack": {
+                "success": True,
+                "total": 2,
+                "cells": [
+                    {"index": 1, "style": "Title", "executable": False,
+                     "record_tag": "", "source_digest": "t1"},
+                    {"index": 2, "style": "Section", "executable": False,
+                     "record_tag": "", "source_digest": "s1"},
+                ],
+            },
+        }
+
+        nb = HeadlessNotebooks()
+        nb._sessions["hnb1"] = type("S", (), {
+            "notebook_id": "hnb1", "path": "/tmp/test.nb",
+            "title": "", "created": True,
+        })()
+
+        def mock_call(fn, *args, **kwargs):
+            if fn in call_responses:
+                return call_responses[fn]
+            return {"success": False, "error": "not mocked"}
+
+        nb._call_with_session = mock_call
+        result = nb.start_recording(notebook="hnb1")
+        assert result["success"], f"narrative-only notebook should allow recording: {result}"
+        assert nb._recorder is not None
+    finally:
+        os.environ.pop("MATHEMATICA_WSTP_RECORDING_DIR", None)
+        shutil.rmtree(d, ignore_errors=True)
+
+
 # --- Runner ----------------------------------------------------------------
 
 if __name__ == "__main__":
@@ -292,10 +535,17 @@ if __name__ == "__main__":
         test_no_disposition_is_unresolved,
         test_completed_disposition_is_resolved,
         test_no_disposition_blocks_finalization,
+        # Phase 9
+        test_converse_untagged_executable_fails_verification,
+        test_converse_narrative_cells_exempt,
+        test_converse_duplicate_tag_fails,
+        test_converse_out_of_order_fails,
+        test_recording_boundary_rejects_existing_executable,
+        test_recording_boundary_allows_narrative_only,
     ]
 
     passed = failed = 0
-    print("=== Phases 7-8: hardening tests ===")
+    print("=== Phases 7-9: hardening tests ===")
     for fn in tests:
         try:
             fn()

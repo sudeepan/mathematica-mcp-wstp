@@ -297,11 +297,12 @@ def test_deletion_blocks_finalization():
         session.close_kernel()
 
 
-def test_injection_does_not_block_finalization():
-    """An extra cell injected outside the recorder does not block finalize.
+def test_injection_blocks_finalization():
+    """An executable cell injected outside the recorder blocks finalize.
 
-    The recorder checks that every ledger entry has a matching cell, not
-    that every cell has a ledger entry. Injections are untracked.
+    The converse check verifies that every executable cell in the notebook
+    has a ledger entry. An untagged executable injection is an integrity
+    violation.
     """
     from mathematica_wstp import notebooks, session
     from mathematica_wstp.recorder import Recorder, extract_disposition
@@ -325,12 +326,13 @@ def test_injection_does_not_block_finalization():
         d = extract_disposition(r, None, None)
         recorder.apply_outcome(rec["seq"], d)
 
-        # Inject an untagged cell
+        # Inject an untagged executable cell
         nb.write_cell("injected = 999", style="Input", notebook=nbid)
 
-        # Finalize should succeed - injections are not tracked
+        # Finalize must fail - the injected cell has no ledger entry
         fin = recorder.finalize(timeout=120)
-        assert fin.get("success"), fin
+        assert not fin["success"], "injection must block finalization"
+        assert "verification failed" in fin.get("error", "")
     finally:
         os.environ.pop("MATHEMATICA_WSTP_RECORDING_DIR", None)
         with contextlib.suppress(Exception):
@@ -430,7 +432,7 @@ if __name__ == "__main__":
         test_full_lifecycle_mixed_outcomes,
         test_mutation_blocks_finalization,
         test_deletion_blocks_finalization,
-        test_injection_does_not_block_finalization,
+        test_injection_blocks_finalization,
         test_re_annotate_updates_reason,
         test_finalize_no_recorder_active,
     ]
