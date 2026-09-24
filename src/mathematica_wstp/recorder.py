@@ -212,27 +212,144 @@ class Recorder:
         shutil.copy2(nb_path, finalized_path)
         logger.info("finalize: copied %s -> %s", nb_path, finalized_path)
 
-        result = _evaluate_in_fresh_kernel(finalized_path, timeout)
+        eval_result = _evaluate_in_fresh_kernel(finalized_path, timeout)
+        if not eval_result.get("success"):
+            self._record_finalization(finalized_path, success=False)
+            eval_result["recording_path"] = nb_path
+            eval_result["finalized_path"] = finalized_path
+            eval_result["run_id"] = self.run_id
+            return eval_result
 
-        self.ledger.update_record(
-            self.ledger.records[-1]["seq"] if self.ledger.records else 0,
-            finalized_at=time.time(),
-            finalized_path=finalized_path,
-            finalization_success=result.get("success", False),
-        )
+        structural = self._verify_finalized(finalized_path)
+        overall_success = structural.get("verified", False)
 
+        self._record_finalization(finalized_path, success=overall_success)
+
+        return {
+            "success": overall_success,
+            "finalized": True,
+            "structural_verification": structural,
+            "recording_path": nb_path,
+            "finalized_path": finalized_path,
+            "run_id": self.run_id,
+            **({"error": "post-finalization structural verification failed"}
+               if not overall_success else {}),
+        }
+
+    def _verify_finalized(self, finalized_path: str) -> dict[str, Any]:
+        """Open the finalized .nb as a temporary session and verify structure.
+
+        Checks: every ledger record has a matching cell (same tag and
+        digest), every executable cell has a ledger entry, annotated
+        cells remain non-evaluatable, and cell order matches ledger
+        sequence.
+
+        Uses the prototype kernel (not a fresh one) for the inert
+        read-back. This is acceptable because MCPReadBack does not
+        evaluate anything - it only reads box structures and metadata.
+        """
+        borrowed = self.notebooks.is_open(finalized_path)
+        opened = self.notebooks.open(finalized_path)
+        if not opened.get("success"):
+            return {"verified": False,
+                    "error": f"could not open finalized notebook: {opened.get('error')}"}
+        scratch_id = opened.get("id")
+        try:
+            readback = self.notebooks._call_with_session(
+                "MCPReadBack", scratch_id, timeout=60)
+            if not readback.get("success"):
+                return {"verified": False,
+                        "error": f"could not read finalized notebook: {readback.get('error')}"}
+        finally:
+            if not borrowed and scratch_id:
+                self.notebooks.close(notebook=scratch_id)
+
+        cells = readback.get("cells", [])
+        tagged_cells = {c["record_tag"]: c for c in cells
+                        if c.get("record_tag")}
+        ledger_tags = {r["record_tag"] for r in self.ledger.records}
+
+        issues = []
+
+        for record in self.ledger.records:
+            tag = record["record_tag"]
+            cell = tagged_cells.get(tag)
+            if cell is None:
+                issues.append({"seq": record["seq"], "tag": tag,
+                               "issue": "cell_missing_in_finalized"})
+                continue
+
+            if cell["source_digest"] != record["source_digest"]:
+                issues.append({"seq": record["seq"], "tag": tag,
+                               "issue": "source_changed_in_finalized",
+                               "expected": record["source_digest"],
+                               "found": cell["source_digest"]})
+
+            if record.get("annotated") and cell.get("evaluatable", True):
+                issues.append({"seq": record["seq"], "tag": tag,
+                               "issue": "annotation_not_preserved",
+                               "expected_evaluatable": False,
+                               "found_evaluatable": cell.get("evaluatable")})
+
+        seen_tags: dict[str, int] = {}
+        last_ledger_seq = -1
+        for cell in cells:
+            style = cell.get("style", "")
+            tag = cell.get("record_tag")
+            executable = cell.get("executable", False)
+
+            if style in self._NARRATIVE_STYLES:
+                continue
+
+            if not tag and executable:
+                issues.append({
+                    "index": cell.get("index"),
+                    "issue": "untagged_executable_in_finalized",
+                    "style": style,
+                })
+
+            if tag:
+                if tag in seen_tags:
+                    issues.append({
+                        "tag": tag,
+                        "issue": "duplicate_tag_in_finalized",
+                    })
+                seen_tags[tag] = cell.get("index", 0)
+
+                if tag in ledger_tags:
+                    record = self.ledger.record_by_tag(tag)
+                    if record:
+                        seq = record["seq"]
+                        if seq < last_ledger_seq:
+                            issues.append({
+                                "tag": tag, "seq": seq,
+                                "issue": "out_of_order_in_finalized",
+                            })
+                        last_ledger_seq = max(last_ledger_seq, seq)
+
+        return {
+            "verified": len(issues) == 0,
+            "finalized_cells": readback.get("total", len(cells)),
+            "ledger_records": len(self.ledger.records),
+            "issues": issues,
+        }
+
+    def _record_finalization(self, finalized_path: str, success: bool) -> None:
+        """Write finalization metadata to the ledger."""
+        if self.ledger.records:
+            self.ledger.update_record(
+                self.ledger.records[-1]["seq"],
+                finalized_at=time.time(),
+                finalized_path=finalized_path,
+                finalization_success=success,
+            )
         self.ledger.data["finalization"] = {
             "path": finalized_path,
-            "success": result.get("success", False),
+            "success": success,
             "at": time.time(),
         }
         from .recorder_ledger import _write_atomically
         _write_atomically(self.ledger.path, self.ledger.data)
-
-        result["recording_path"] = nb_path
-        result["finalized_path"] = finalized_path
-        result["run_id"] = self.run_id
-        return result
 
     _NARRATIVE_STYLES = frozenset({
         "Title", "Subtitle", "Chapter", "Subchapter",

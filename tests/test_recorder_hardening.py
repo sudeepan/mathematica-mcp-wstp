@@ -519,6 +519,184 @@ def test_recording_boundary_allows_narrative_only():
         shutil.rmtree(d, ignore_errors=True)
 
 
+# --- Phase 10: post-finalization structural verification ------------------
+
+def _make_finalized_stub(finalized_cells):
+    """Build a StubNotebooks that serves finalized_cells via open/readback/close."""
+
+    class StubNotebooks:
+        _recorder = None
+        _opened = set()
+
+        def is_open(self, path):
+            return path in self._opened
+
+        def open(self, path):
+            self._opened.add(path)
+            return {"success": True, "id": "fin-scratch"}
+
+        def close(self, notebook=None):
+            self._opened.discard(notebook)
+            return {"success": True}
+
+        def _call_with_session(self, fn, *args, **kwargs):
+            if fn == "MCPReadBack":
+                return {
+                    "success": True,
+                    "total": len(finalized_cells),
+                    "cells": finalized_cells,
+                }
+            return {"success": True}
+
+        def save(self, **kwargs):
+            return {"success": True}
+
+    return StubNotebooks()
+
+
+def test_verify_finalized_catches_missing_cell():
+    """Structural verification fails when a ledger record has no cell."""
+    d = tempfile.mkdtemp(prefix="rec-h10-")
+    os.environ["MATHEMATICA_WSTP_RECORDING_DIR"] = os.path.join(d, "ledgers")
+    try:
+        nb_path = os.path.join(d, "test.nb")
+        notebooks = _make_finalized_stub([])
+        rec = Recorder(notebooks, "hnb1", nb_path)
+        rec.ledger = RecorderLedger.create(nb_path, "hnb1", rec.run_id)
+        tag = rec.ledger.make_tag()
+        rec.ledger.append("aaa", "x = 1", "Input", tag)
+
+        result = rec._verify_finalized("/tmp/finalized.nb")
+        assert not result["verified"]
+        assert any(i["issue"] == "cell_missing_in_finalized" for i in result["issues"])
+    finally:
+        os.environ.pop("MATHEMATICA_WSTP_RECORDING_DIR", None)
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_verify_finalized_catches_digest_change():
+    """Structural verification fails when a cell's digest changed."""
+    d = tempfile.mkdtemp(prefix="rec-h10b-")
+    os.environ["MATHEMATICA_WSTP_RECORDING_DIR"] = os.path.join(d, "ledgers")
+    try:
+        nb_path = os.path.join(d, "test.nb")
+        notebooks = _make_finalized_stub([
+            {"index": 1, "style": "Input", "executable": True,
+             "record_tag": "R001-1", "source_digest": "CHANGED",
+             "evaluatable": True},
+        ])
+        rec = Recorder(notebooks, "hnb1", nb_path)
+        rec.ledger = RecorderLedger.create(nb_path, "hnb1", rec.run_id)
+        tag = rec.ledger.make_tag()
+        rec.ledger.append("aaa", "x = 1", "Input", tag)
+
+        result = rec._verify_finalized("/tmp/finalized.nb")
+        assert not result["verified"]
+        assert any(i["issue"] == "source_changed_in_finalized" for i in result["issues"])
+    finally:
+        os.environ.pop("MATHEMATICA_WSTP_RECORDING_DIR", None)
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_verify_finalized_catches_annotation_not_preserved():
+    """Structural verification fails when an annotated cell is still evaluatable."""
+    d = tempfile.mkdtemp(prefix="rec-h10c-")
+    os.environ["MATHEMATICA_WSTP_RECORDING_DIR"] = os.path.join(d, "ledgers")
+    try:
+        nb_path = os.path.join(d, "test.nb")
+        notebooks = _make_finalized_stub([
+            {"index": 1, "style": "Input", "executable": True,
+             "record_tag": "R001-1", "source_digest": "aaa",
+             "evaluatable": True},
+        ])
+        rec = Recorder(notebooks, "hnb1", nb_path)
+        rec.ledger = RecorderLedger.create(nb_path, "hnb1", rec.run_id)
+        tag = rec.ledger.make_tag()
+        rec.ledger.append("aaa", "x = 1", "Input", tag)
+        rec.ledger.update_record(1, annotated=True, annotation_reason="timed out")
+
+        result = rec._verify_finalized("/tmp/finalized.nb")
+        assert not result["verified"]
+        assert any(i["issue"] == "annotation_not_preserved" for i in result["issues"])
+    finally:
+        os.environ.pop("MATHEMATICA_WSTP_RECORDING_DIR", None)
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_verify_finalized_passes_clean():
+    """Structural verification passes when everything matches."""
+    d = tempfile.mkdtemp(prefix="rec-h10d-")
+    os.environ["MATHEMATICA_WSTP_RECORDING_DIR"] = os.path.join(d, "ledgers")
+    try:
+        nb_path = os.path.join(d, "test.nb")
+        notebooks = _make_finalized_stub([
+            {"index": 1, "style": "Input", "executable": True,
+             "record_tag": "R001-1", "source_digest": "aaa",
+             "evaluatable": True},
+            {"index": 2, "style": "Input", "executable": True,
+             "record_tag": "R001-2", "source_digest": "bbb",
+             "evaluatable": False},
+        ])
+        rec = Recorder(notebooks, "hnb1", nb_path)
+        rec.ledger = RecorderLedger.create(nb_path, "hnb1", rec.run_id)
+        t1 = rec.ledger.make_tag()
+        rec.ledger.append("aaa", "x = 1", "Input", t1)
+        t2 = rec.ledger.make_tag()
+        rec.ledger.append("bbb", "Pause[999]", "Input", t2)
+        rec.ledger.update_record(2, annotated=True, annotation_reason="timed out")
+
+        result = rec._verify_finalized("/tmp/finalized.nb")
+        assert result["verified"], f"clean state should pass: {result['issues']}"
+    finally:
+        os.environ.pop("MATHEMATICA_WSTP_RECORDING_DIR", None)
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_finalize_returns_structural_verification():
+    """finalize() result includes structural_verification when eval succeeds."""
+    d = tempfile.mkdtemp(prefix="rec-h10e-")
+    os.environ["MATHEMATICA_WSTP_RECORDING_DIR"] = os.path.join(d, "ledgers")
+    try:
+        nb_path = os.path.join(d, "test.nb")
+        with open(nb_path, "w") as f:
+            f.write("Notebook[{}]")
+
+        notebooks = _make_finalized_stub([
+            {"index": 1, "style": "Input", "executable": True,
+             "record_tag": "R001-1", "source_digest": "aaa",
+             "evaluatable": True},
+        ])
+
+        import mathematica_wstp.recorder as rec_mod
+        original_eval = rec_mod._evaluate_in_fresh_kernel
+
+        def mock_eval(path, timeout=600):
+            return {"success": True, "finalized": True}
+
+        rec_mod._evaluate_in_fresh_kernel = mock_eval
+        try:
+            rec = Recorder(notebooks, "hnb1", nb_path)
+            rec.ledger = RecorderLedger.create(nb_path, "hnb1", rec.run_id)
+            tag = rec.ledger.make_tag()
+            rec.ledger.append("aaa", "x = 1", "Input", tag)
+            rec.ledger.update_record(1, disposition={
+                "execution_outcome": "COMPLETED",
+                "control_intent": "NONE",
+                "abort_confirmation": "NOT_APPLICABLE",
+                "kernel_readiness": "READY",
+            })
+
+            fin = rec.finalize(timeout=120)
+            assert fin["success"], f"finalize should succeed: {fin}"
+            assert "structural_verification" in fin
+            assert fin["structural_verification"]["verified"]
+        finally:
+            rec_mod._evaluate_in_fresh_kernel = original_eval
+    finally:
+        os.environ.pop("MATHEMATICA_WSTP_RECORDING_DIR", None)
+        shutil.rmtree(d, ignore_errors=True)
+
+
 # --- Runner ----------------------------------------------------------------
 
 if __name__ == "__main__":
@@ -542,10 +720,16 @@ if __name__ == "__main__":
         test_converse_out_of_order_fails,
         test_recording_boundary_rejects_existing_executable,
         test_recording_boundary_allows_narrative_only,
+        # Phase 10
+        test_verify_finalized_catches_missing_cell,
+        test_verify_finalized_catches_digest_change,
+        test_verify_finalized_catches_annotation_not_preserved,
+        test_verify_finalized_passes_clean,
+        test_finalize_returns_structural_verification,
     ]
 
     passed = failed = 0
-    print("=== Phases 7-9: hardening tests ===")
+    print("=== Phases 7-10: hardening tests ===")
     for fn in tests:
         try:
             fn()
