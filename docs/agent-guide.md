@@ -263,6 +263,10 @@ notebooks(action="create", title="Computation Log", path="/tmp/log.nb", record=T
 
 Or on an already-open notebook: `notebooks(action="record", notebook="hnb1")`.
 
+Recording requires **zero pre-existing executable cells** in the notebook.
+This guarantees the recorder ledger is the sole authority for what was
+computed. Resuming a partially-filled notebook is a separate operation.
+
 Every `evaluate(code)` call writes `code` as a cell before evaluating it.
 While recording, `write_cell`, `edit_cells`, `execute_in_notebook` are blocked
 on that notebook.
@@ -275,9 +279,42 @@ evaluate("Common setup", style="Section")
 evaluate("GraphGen[1]")
 ```
 
+Narrative styles (Title, Subtitle, Section, Subsection, Subsubsection, Text,
+Item, ItemNumbered, ItemParagraph) write notebook structure but **skip
+scientific execution entirely**. No ledger record is created, so the
+scientific ledger contains only cells that actually computed.
+
+### Fail-closed recording
+
+If any recording step fails - a cell write, a read-back verification, or a
+post-evaluation integrity check - the recorder **faults the entire run**.
+Once faulted, all further scientific dispatch and finalization are refused for
+that recording. The fault is written into the recorder ledger on disk, so it
+survives process restarts.
+
+Two separate phases can trigger a fault:
+
+- **Pre-dispatch**: the cell was written but its identity or content could
+  not be verified before execution. Science did not run.
+- **Post-evaluation**: science ran and produced a result, but the notebook
+  no longer matches the ledger. The execution outcome is preserved and
+  returned, but the recording is marked integrity-faulted.
+
+The server dispatch gate is **positive**: science is dispatched only when the
+recorder returned a verified record with a sequence number. Missing keys,
+malformed results, or `None` refuse dispatch.
+
+### Finalization and structural verification
+
 Stop with `notebooks(action="stop_recording")`. Finalize with
 `notebooks(action="finalize")` - this re-runs every cell in a fresh kernel
 via `NotebookEvaluate` so the notebook gets native `In[n]`/`Out[n]` labels.
+
+After finalization, the server opens the finalized `.nb` as a temporary
+session and runs a structural comparison against the recorder ledger:
+tags, source digests, styles, annotation state, annotation reasons, and cell
+order. A mismatch means the finalized artifact does not faithfully represent
+the recorded computation.
 
 ## Parallel work
 
@@ -379,7 +416,8 @@ For a from-scratch computation:
 1. notebooks(action="create", ..., record=True)
 2. evaluate(code) - every call is recorded as a cell
 3. notebooks(action="save")
-4. notebooks(action="finalize")
+4. notebooks(action="finalize") - re-evaluates in a fresh kernel, then
+   verifies the finalized artifact against the recorder ledger
 ```
 
 For the observed failure modes behind these rules, read
