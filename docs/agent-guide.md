@@ -279,30 +279,53 @@ evaluate("Common setup", style="Section")
 evaluate("GraphGen[1]")
 ```
 
-Narrative styles (Title, Subtitle, Section, Subsection, Subsubsection, Text,
-Item, ItemNumbered, ItemParagraph) write notebook structure but **skip
-scientific execution entirely**. No ledger record is created, so the
-scientific ledger contains only cells that actually computed.
+Only `Input` and `Code` are accepted as scientific styles. Narrative styles
+(Title, Subtitle, Section, Subsection, Subsubsection, Text, Item,
+ItemNumbered, ItemParagraph) write notebook structure but **skip scientific
+execution entirely**. No ledger record is created, so the scientific ledger
+contains only cells that actually computed. Any other style is rejected.
+
+### What is blocked during recording
+
+While an integrity recorder is active, the following are refused to prevent
+unrecorded kernel state changes:
+
+- `evaluate_cells`, `replay(action="run")`
+- `vars(action="set/clear/clear_all")`
+- `kernel(action="restart/stop")`
+
+All scientific work must go through `evaluate()`, which routes through the
+recorder. Inspection tools (`vars list/get`, `cells`, `status`) remain
+available.
 
 ### Fail-closed recording
 
-If any recording step fails - a cell write, a read-back verification, or a
+If any recording step fails - a cell write, a read-back verification, a
+source digest mismatch, an annotation failure, a session loss, or a
 post-evaluation integrity check - the recorder **faults the entire run**.
 Once faulted, all further scientific dispatch and finalization are refused for
 that recording. The fault is written into the recorder ledger on disk, so it
 survives process restarts.
 
+Before every scientific dispatch, the recorder:
+
+1. verifies the written cell matches the intended source (digest comparison)
+2. verifies the cell style, executable flag, and Evaluatable state
+3. verifies exactly one cell carries the new tag
+4. runs full bidirectional ledger/notebook verification
+
 Two separate phases can trigger a fault:
 
-- **Pre-dispatch**: the cell was written but its identity or content could
-  not be verified before execution. Science did not run.
+- **Pre-dispatch**: the cell was written but its identity, content, or
+  notebook state could not be verified before execution. Science did not run.
 - **Post-evaluation**: science ran and produced a result, but the notebook
   no longer matches the ledger. The execution outcome is preserved and
   returned, but the recording is marked integrity-faulted.
 
 The server dispatch gate is **positive**: science is dispatched only when the
 recorder returned a verified record with a sequence number. Missing keys,
-malformed results, or `None` refuse dispatch.
+malformed results, or `None` refuse dispatch. A post-eval fault is surfaced
+in the tool reply so the caller knows immediately.
 
 ### Finalization and structural verification
 
@@ -314,11 +337,16 @@ notebooks(action="finalize")       # while recorder is still active
 notebooks(action="stop_recording") # only after finalization
 ```
 
-`stop_recording` clears the recorder object. If you stop first, finalization
-falls through to the legacy path and never checks the recorder ledger.
+`stop_recording` without prior finalization is refused (pass `force=True`
+to abandon the run). If you force-stop first, finalization falls through to
+the legacy path and never checks the recorder ledger.
 
 `notebooks(action="finalize")` re-runs every cell in a fresh kernel
 via `NotebookEvaluate` so the notebook gets native `In[n]`/`Out[n]` labels.
+
+A successful finalization **seals** the recorder: no further scientific
+cells or narrative writes are accepted, and a second finalize is refused.
+The finalized artifact is named `<base>-<run_id>-finalized.nb`.
 
 After finalization, the server opens the finalized `.nb` as a temporary
 session and runs a structural comparison against the recorder ledger:

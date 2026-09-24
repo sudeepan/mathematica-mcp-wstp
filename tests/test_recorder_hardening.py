@@ -1,4 +1,4 @@
-"""Hardening tests: Phases 7-13 invariant enforcement.
+"""Hardening tests: Phases 7-14 invariant enforcement.
 
 Each phase adds its own section. Tests are pure-Python where possible,
 falling back to integration only when the invariant crosses the kernel.
@@ -1204,6 +1204,384 @@ def test_post_eval_fault_surfaces_in_outcome():
         shutil.rmtree(d, ignore_errors=True)
 
 
+# --- Phase 14: closure pass tests -------------------------------------------
+
+def test_unknown_style_rejected():
+    """A style that is neither narrative nor scientific must be rejected."""
+    d = tempfile.mkdtemp(prefix="rec-h14a-")
+    os.environ["MATHEMATICA_WSTP_RECORDING_DIR"] = os.path.join(d, "ledgers")
+    try:
+        rec, _ = _make_recorder(d)
+        result = rec.record_and_verify("x = 1", style="ExternalLanguage")
+        assert not result["success"], "unknown style must be rejected"
+        assert "neither narrative nor scientific" in result.get("error", "")
+    finally:
+        os.environ.pop("MATHEMATICA_WSTP_RECORDING_DIR", None)
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_scientific_whitelist_accepts_input_code():
+    """Input and Code styles must be accepted as scientific."""
+    for style in ("Input", "Code"):
+        d = tempfile.mkdtemp(prefix="rec-h14b-")
+        os.environ["MATHEMATICA_WSTP_RECORDING_DIR"] = os.path.join(d, "ledgers")
+        try:
+            nb_path = os.path.join(d, "test.nb")
+            import hashlib as _hl
+
+            class StubNB:
+                _recorder = None
+                @property
+                def has_active_recorder(self):
+                    return self._recorder is not None
+                def _call_with_session(self, fn, *args, **kwargs):
+                    if fn == "MCPWriteCell":
+                        return {"success": True}
+                    if fn == "MCPReadBack":
+                        code = "x = 1"
+                        digest = _hl.sha256(code.encode("utf-8")).hexdigest()
+                        return {
+                            "success": True, "total": 1,
+                            "cells": [{"index": 1, "style": style,
+                                        "record_tag": f"R001-1",
+                                        "source_digest": digest,
+                                        "executable": True,
+                                        "evaluatable": True,
+                                        "source_preview": code}],
+                        }
+
+            notebooks = StubNB()
+            rec = Recorder(notebooks, "hnb1", nb_path)
+            notebooks._recorder = rec
+            result = rec.record_and_verify("x = 1", style=style)
+            assert result["success"], f"style {style} must be accepted"
+        finally:
+            os.environ.pop("MATHEMATICA_WSTP_RECORDING_DIR", None)
+            shutil.rmtree(d, ignore_errors=True)
+
+
+def test_source_digest_mismatch_faults():
+    """Read-back source digest != intended digest must fault PRE_DISPATCH."""
+    d = tempfile.mkdtemp(prefix="rec-h14c-")
+    os.environ["MATHEMATICA_WSTP_RECORDING_DIR"] = os.path.join(d, "ledgers")
+    try:
+        nb_path = os.path.join(d, "test.nb")
+
+        class StubNB:
+            _recorder = None
+            @property
+            def has_active_recorder(self):
+                return self._recorder is not None
+            def _call_with_session(self, fn, *args, **kwargs):
+                if fn == "MCPWriteCell":
+                    return {"success": True}
+                if fn == "MCPReadBack":
+                    return {
+                        "success": True, "total": 1,
+                        "cells": [{"index": 1, "style": "Input",
+                                    "record_tag": "R001-1",
+                                    "source_digest": "wrong_digest",
+                                    "executable": True,
+                                    "evaluatable": True}],
+                    }
+
+        notebooks = StubNB()
+        rec = Recorder(notebooks, "hnb1", nb_path)
+        notebooks._recorder = rec
+        result = rec.record_and_verify("x = 1", style="Input")
+        assert not result["success"]
+        assert rec.is_faulted
+        assert rec.ledger.data["fault"]["phase"] == "PRE_DISPATCH"
+        assert "source" in result.get("error", "").lower() or "digest" in result.get("error", "").lower()
+    finally:
+        os.environ.pop("MATHEMATICA_WSTP_RECORDING_DIR", None)
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_pre_dispatch_full_verify_runs():
+    """Full bidirectional verification must run before dispatch."""
+    d = tempfile.mkdtemp(prefix="rec-h14d-")
+    os.environ["MATHEMATICA_WSTP_RECORDING_DIR"] = os.path.join(d, "ledgers")
+    try:
+        nb_path = os.path.join(d, "test.nb")
+        import hashlib as _hl
+        call_count = {"n": 0}
+
+        class StubNB:
+            _recorder = None
+            @property
+            def has_active_recorder(self):
+                return self._recorder is not None
+            def _call_with_session(self, fn, *args, **kwargs):
+                call_count["n"] += 1
+                if fn == "MCPWriteCell":
+                    return {"success": True}
+                if fn == "MCPReadBack":
+                    code = "x = 1"
+                    digest = _hl.sha256(code.encode("utf-8")).hexdigest()
+                    cells = [{"index": 1, "style": "Input",
+                              "record_tag": "R001-1",
+                              "source_digest": digest,
+                              "executable": True,
+                              "evaluatable": True,
+                              "source_preview": code}]
+                    if call_count["n"] >= 4:
+                        cells.append({"index": 2, "style": "Input",
+                                      "executable": True,
+                                      "source_preview": "injected"})
+                    return {"success": True, "total": len(cells),
+                            "cells": cells}
+
+        notebooks = StubNB()
+        rec = Recorder(notebooks, "hnb1", nb_path)
+        notebooks._recorder = rec
+        result = rec.record_and_verify("x = 1", style="Input")
+        assert not result["success"], \
+            "injected untagged executable must fail full verification"
+        assert rec.is_faulted
+    finally:
+        os.environ.pop("MATHEMATICA_WSTP_RECORDING_DIR", None)
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_sealed_recorder_refuses_science():
+    """After successful finalization, record_and_verify must refuse."""
+    d = tempfile.mkdtemp(prefix="rec-h14e-")
+    os.environ["MATHEMATICA_WSTP_RECORDING_DIR"] = os.path.join(d, "ledgers")
+    try:
+        rec, _ = _make_recorder(d)
+        rec._sealed = True
+        result = rec.record_and_verify("x = 1", style="Input")
+        assert not result["success"]
+        assert "sealed" in result.get("error", "").lower()
+    finally:
+        os.environ.pop("MATHEMATICA_WSTP_RECORDING_DIR", None)
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_sealed_recorder_refuses_second_finalize():
+    """After successful finalization, finalize() must refuse."""
+    d = tempfile.mkdtemp(prefix="rec-h14f-")
+    os.environ["MATHEMATICA_WSTP_RECORDING_DIR"] = os.path.join(d, "ledgers")
+    try:
+        rec, _ = _make_recorder(d)
+        rec._sealed = True
+        result = rec.finalize()
+        assert not result["success"]
+        assert "sealed" in result.get("error", "").lower()
+    finally:
+        os.environ.pop("MATHEMATICA_WSTP_RECORDING_DIR", None)
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_second_start_recording_refused():
+    """start_recording must refuse when a recorder is already active."""
+    d = tempfile.mkdtemp(prefix="rec-h14g-")
+    os.environ["MATHEMATICA_WSTP_RECORDING_DIR"] = os.path.join(d, "ledgers")
+    try:
+        from mathematica_wstp.notebooks import HeadlessNotebooks
+
+        class PatchedNB(HeadlessNotebooks):
+            def __init__(self):
+                self._sessions = {}
+                self._recorder = None
+                self._recording_target = None
+
+        nb = PatchedNB()
+        nb._recorder = object()
+        nb._recording_target = "hnb1"
+        result = nb.start_recording("hnb2")
+        assert not result["success"]
+        assert "already active" in result.get("error", "").lower()
+    finally:
+        os.environ.pop("MATHEMATICA_WSTP_RECORDING_DIR", None)
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_verify_full_catches_disabled_completed():
+    """A COMPLETED cell with Evaluatable->False must fail _verify_full."""
+    d = tempfile.mkdtemp(prefix="rec-h14h-")
+    os.environ["MATHEMATICA_WSTP_RECORDING_DIR"] = os.path.join(d, "ledgers")
+    try:
+        nb_path = os.path.join(d, "test.nb")
+        import hashlib as _hl
+        code = "x = 1"
+        digest = _hl.sha256(code.encode("utf-8")).hexdigest()
+
+        class StubNB:
+            _recorder = None
+            @property
+            def has_active_recorder(self):
+                return self._recorder is not None
+            def _call_with_session(self, fn, *args, **kwargs):
+                if fn == "MCPWriteCell":
+                    return {"success": True}
+                if fn == "MCPReadBack":
+                    return {
+                        "success": True, "total": 1,
+                        "cells": [{"index": 1, "style": "Input",
+                                    "record_tag": "R001-1",
+                                    "source_digest": digest,
+                                    "executable": True,
+                                    "evaluatable": False}],
+                    }
+
+        notebooks = StubNB()
+        rec = Recorder(notebooks, "hnb1", nb_path)
+        notebooks._recorder = rec
+
+        rec.ledger.append(source_digest=digest,
+                          source_preview=code, style="Input",
+                          record_tag="R001-1")
+        rec.ledger.update_record(1,
+            disposition={"execution_outcome": "COMPLETED"},
+            disposition_at=1.0)
+
+        result = rec._verify_full()
+        assert not result["verified"], \
+            "COMPLETED cell with Evaluatable->False must fail"
+        issues = [i["issue"] for i in result["issues"]]
+        assert "completed_cell_disabled" in issues
+    finally:
+        os.environ.pop("MATHEMATICA_WSTP_RECORDING_DIR", None)
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_verify_full_catches_enabled_annotated():
+    """An annotated cell that has Evaluatable->True must fail _verify_full."""
+    d = tempfile.mkdtemp(prefix="rec-h14i-")
+    os.environ["MATHEMATICA_WSTP_RECORDING_DIR"] = os.path.join(d, "ledgers")
+    try:
+        nb_path = os.path.join(d, "test.nb")
+        import hashlib as _hl
+        code = "Pause[10]"
+        digest = _hl.sha256(code.encode("utf-8")).hexdigest()
+
+        class StubNB:
+            _recorder = None
+            @property
+            def has_active_recorder(self):
+                return self._recorder is not None
+            def _call_with_session(self, fn, *args, **kwargs):
+                if fn == "MCPWriteCell":
+                    return {"success": True}
+                if fn == "MCPReadBack":
+                    return {
+                        "success": True, "total": 1,
+                        "cells": [{"index": 1, "style": "Input",
+                                    "record_tag": "R001-1",
+                                    "source_digest": digest,
+                                    "executable": True,
+                                    "evaluatable": True}],
+                    }
+
+        notebooks = StubNB()
+        rec = Recorder(notebooks, "hnb1", nb_path)
+        notebooks._recorder = rec
+
+        rec.ledger.append(source_digest=digest,
+                          source_preview=code, style="Input",
+                          record_tag="R001-1")
+        rec.ledger.update_record(1,
+            disposition={"execution_outcome": "TIMED_OUT"},
+            disposition_at=1.0,
+            annotated=True, annotation_reason="timed out")
+
+        result = rec._verify_full()
+        assert not result["verified"], \
+            "annotated cell with Evaluatable->True must fail"
+        issues = [i["issue"] for i in result["issues"]]
+        assert "annotated_cell_enabled" in issues
+    finally:
+        os.environ.pop("MATHEMATICA_WSTP_RECORDING_DIR", None)
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_stop_unfinalized_requires_force():
+    """stop_recording without force must refuse an unfinalized recorder."""
+    d = tempfile.mkdtemp(prefix="rec-h14j-")
+    os.environ["MATHEMATICA_WSTP_RECORDING_DIR"] = os.path.join(d, "ledgers")
+    try:
+        from mathematica_wstp.notebooks import HeadlessNotebooks
+
+        class PatchedNB(HeadlessNotebooks):
+            def __init__(self):
+                self._sessions = {}
+                self._recorder = None
+                self._recording_target = None
+
+        nb = PatchedNB()
+        rec, _ = _make_recorder(d)
+        nb._recorder = rec
+        nb._recording_target = "hnb1"
+
+        result = nb.stop_recording(force=False)
+        assert not result["success"], "must refuse without force"
+        assert "finalize" in result.get("error", "").lower()
+
+        result = nb.stop_recording(force=True)
+        assert result["success"], "force=True must succeed"
+        assert result.get("abandoned"), "should report abandoned"
+    finally:
+        os.environ.pop("MATHEMATICA_WSTP_RECORDING_DIR", None)
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_foreign_tag_in_finalized_rejected():
+    """A finalized executable cell with a tag not in the ledger must fail."""
+    d = tempfile.mkdtemp(prefix="rec-h14k-")
+    os.environ["MATHEMATICA_WSTP_RECORDING_DIR"] = os.path.join(d, "ledgers")
+    try:
+        nb_path = os.path.join(d, "test.nb")
+        import hashlib as _hl
+        code = "x = 1"
+        digest = _hl.sha256(code.encode("utf-8")).hexdigest()
+
+        class StubNB:
+            _recorder = None
+            @property
+            def has_active_recorder(self):
+                return self._recorder is not None
+            def is_open(self, path):
+                return True
+            def open(self, path):
+                return {"success": True, "id": "scratch"}
+            def close(self, notebook=None):
+                return {"success": True}
+            def _call_with_session(self, fn, *args, **kwargs):
+                if fn == "MCPReadBack":
+                    return {
+                        "success": True, "total": 2,
+                        "cells": [
+                            {"index": 1, "style": "Input",
+                             "record_tag": "R001-1",
+                             "source_digest": digest,
+                             "executable": True},
+                            {"index": 2, "style": "Input",
+                             "record_tag": "FOREIGN-99",
+                             "source_digest": "abc",
+                             "executable": True},
+                        ],
+                    }
+
+        notebooks = StubNB()
+        rec = Recorder(notebooks, "hnb1", nb_path)
+        notebooks._recorder = rec
+
+        rec.ledger.append(source_digest=digest,
+                          source_preview=code, style="Input",
+                          record_tag="R001-1")
+
+        result = rec._verify_finalized("/tmp/fake-finalized.nb")
+        assert not result["verified"], \
+            "foreign tag must fail finalized verification"
+        issues = [i["issue"] for i in result["issues"]]
+        assert "tag_not_in_ledger_in_finalized" in issues
+    finally:
+        os.environ.pop("MATHEMATICA_WSTP_RECORDING_DIR", None)
+        shutil.rmtree(d, ignore_errors=True)
+
+
 # --- Runner ----------------------------------------------------------------
 
 if __name__ == "__main__":
@@ -1248,10 +1626,22 @@ if __name__ == "__main__":
         test_annotation_failure_faults_recorder,
         test_finalize_routes_to_recorder_finalizer,
         test_post_eval_fault_surfaces_in_outcome,
+        # Phase 14
+        test_unknown_style_rejected,
+        test_scientific_whitelist_accepts_input_code,
+        test_source_digest_mismatch_faults,
+        test_pre_dispatch_full_verify_runs,
+        test_sealed_recorder_refuses_science,
+        test_sealed_recorder_refuses_second_finalize,
+        test_second_start_recording_refused,
+        test_verify_full_catches_disabled_completed,
+        test_verify_full_catches_enabled_annotated,
+        test_stop_unfinalized_requires_force,
+        test_foreign_tag_in_finalized_rejected,
     ]
 
     passed = failed = 0
-    print("=== Phases 7-13: hardening tests ===")
+    print("=== Phases 7-14: hardening tests ===")
     for fn in tests:
         try:
             fn()

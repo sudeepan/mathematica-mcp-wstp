@@ -148,10 +148,20 @@ def _fail(error: str, **extra: Any) -> CallToolResult:
 def evaluate(code: str, timeout: float = 60.0,
              style: str = "Input") -> dict[str, Any]:
     nb = get_headless_notebooks()
+    recorder_lock = nb._recorder.lock if nb._recorder else None
+    if recorder_lock:
+        recorder_lock.acquire()
+    try:
+        return _evaluate_inner(nb, code, timeout, style)
+    finally:
+        if recorder_lock:
+            recorder_lock.release()
+
+
+def _evaluate_inner(nb, code: str, timeout: float, style: str) -> dict[str, Any]:
     rec = nb.record_input(code, style=style)
 
     if nb.has_active_recorder:
-        # Narrative path: cell was written as notebook structure, no science.
         if isinstance(rec, dict) and rec.get("scientific") is False:
             return _reply({
                 "success": True,
@@ -161,7 +171,6 @@ def evaluate(code: str, timeout: float = 60.0,
                 "recorded": True,
             })
 
-        # Positive gate: dispatch science ONLY after a verified durable record.
         verified = (isinstance(rec, dict)
                     and rec.get("success") is True
                     and rec.get("pre_dispatch_verified") is True
@@ -224,6 +233,9 @@ def evaluate(code: str, timeout: float = 60.0,
             payload["messages"] = result.messages
         if rec is not None:
             payload["recorded"] = rec.get("success", False)
+            if rec.get("recording_faulted"):
+                payload["recording_faulted"] = True
+                payload["recording_fault"] = rec.get("recording_fault")
         payload.update(result.extra)
         return _reply(payload)
 
@@ -252,6 +264,9 @@ def evaluate(code: str, timeout: float = 60.0,
         payload["message_names"] = sorted({m["name"] for m in result.messages if m.get("name")})
     if rec is not None:
         payload["recorded"] = rec.get("success", False)
+        if rec.get("recording_faulted"):
+            payload["recording_faulted"] = True
+            payload["recording_fault"] = rec.get("recording_fault")
     flags = [k for k in ("truncated", "kernel_replaced", "result_may_be_partial")
              if payload.get(k)]
     if result.messages:
@@ -297,6 +312,10 @@ def kernel(
     action: Literal["state", "restart", "stop", "abort", "subkernels",
                     "close_subkernels", "reap"] = "state",
 ) -> dict[str, Any]:
+    if action in ("restart", "stop") and get_headless_notebooks().has_active_recorder:
+        return _fail(
+            f"kernel {action} is blocked during integrity recording; "
+            "finalize or stop recording first")
     if action == "state":
         return _reply({"success": True, **session.kernel_status()})
     if action == "stop":
@@ -371,6 +390,7 @@ def notebooks(
     title: str = "Untitled",
     notebook: str | None = None,
     record: bool = False,
+    force: bool = False,
 ) -> dict[str, Any]:
     nb = get_headless_notebooks()
     if action == "open":
@@ -417,20 +437,21 @@ def notebooks(
     if action == "save":
         return _reply(nb.save(notebook, path))
     if action == "close":
-        if nb.recording == nb._resolve(notebook):
-            nb.stop_recording()
         return _reply(nb.close(notebook))
     if action == "record":
         return _reply(nb.start_recording(notebook))
     if action == "stop_recording":
-        return _reply(nb.stop_recording())
+        return _reply(nb.stop_recording(force=force))
     if action == "finalize":
         if nb.has_active_recorder:
-            target = nb._resolve(notebook) if notebook else nb.recording
-            if target and target != nb.recording:
-                return _fail(
-                    f"notebook {notebook} is not the recording target; "
-                    f"the active recording is on {nb.recording}")
+            if notebook:
+                target = nb._resolve(notebook)
+                if target is None:
+                    return _fail(f"notebook {notebook!r} not found")
+                if target != nb.recording:
+                    return _fail(
+                        f"notebook {notebook} is not the recording target; "
+                        f"the active recording is on {nb.recording}")
             return _reply(nb.finalize_recording(timeout=600))
         return _reply(nb.finalize(notebook=notebook, timeout=600))
     return _fail(f"unknown action: {action}")
@@ -616,6 +637,10 @@ def evaluate_cells(
     notebook: str | None = None,
 ) -> dict[str, Any]:
     nb = get_headless_notebooks()
+    if nb.has_active_recorder:
+        return _fail(
+            "evaluate_cells is blocked during integrity recording; "
+            "use evaluate() which routes through the recorder")
     if index is not None:
         if write_outputs:
             # index=N used to route to a separate single-cell path that never
@@ -764,6 +789,10 @@ def vars(
     include_system: bool = False,
     full: bool = False,
 ) -> dict[str, Any]:
+    if action in ("set", "clear", "clear_all") and get_headless_notebooks().has_active_recorder:
+        return _fail(
+            f"vars {action} is blocked during integrity recording; "
+            "kernel state changes must go through the recorder")
     if action == "list":
         ctx = '"Global`*"' if not include_system else '"System`*"'
         if pattern:
@@ -953,6 +982,10 @@ def replay(
     from .replay_manifest import ReplayManifest
 
     nb = get_headless_notebooks()
+    if action == "run" and nb.has_active_recorder:
+        return _fail(
+            "replay is blocked during integrity recording; "
+            "use evaluate() which routes through the recorder")
 
     if action == "list":
         path = nb.session_path(notebook)

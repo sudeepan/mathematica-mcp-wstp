@@ -11,9 +11,11 @@ verifies that the notebook still matches the ledger afterwards.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import shutil
+import threading
 import time
 import uuid
 from typing import Any, TYPE_CHECKING
@@ -37,12 +39,16 @@ class Recorder:
         "Output", "Print", "Message",
     })
 
+    _SCIENTIFIC_STYLES = frozenset({"Input", "Code"})
+
     def __init__(self, notebooks: HeadlessNotebooks, notebook_id: str,
                  notebook_path: str):
         self.notebooks = notebooks
         self.notebook_id = notebook_id
         self.notebook_path = notebook_path
         self.run_id = f"R{uuid.uuid4().hex[:10]}"
+        self.lock = threading.Lock()
+        self._sealed = False
         self.ledger = RecorderLedger.create(notebook_path, notebook_id,
                                             self.run_id)
 
@@ -68,6 +74,15 @@ class Recorder:
         _write_atomically(self.ledger.path, self.ledger.data)
         logger.warning("recorder FAULTED (%s): %s", phase, reason)
 
+    def _check_session_loss(self, result: dict[str, Any],
+                            context: str) -> bool:
+        """Fault if a helper call reports kernel_state_lost. Returns True if faulted."""
+        if result.get("kernel_state_lost"):
+            self._fault("PRE_DISPATCH",
+                        f"kernel state lost during {context}")
+            return True
+        return False
+
     # -- recording ----------------------------------------------------------
 
     def record_and_verify(self, code: str, style: str = "Input"
@@ -83,6 +98,12 @@ class Recorder:
 
         Any failure faults the recorder for the remainder of this run.
         """
+        if self._sealed:
+            return {
+                "success": False,
+                "error": "recorder is sealed after successful finalization",
+            }
+
         if self.is_faulted:
             return {
                 "success": False,
@@ -93,12 +114,22 @@ class Recorder:
         if style in self._NARRATIVE_STYLES:
             return self._write_narrative(code, style)
 
+        if style not in self._SCIENTIFIC_STYLES:
+            return {
+                "success": False,
+                "error": (f"style {style!r} is neither narrative nor scientific "
+                          f"(allowed: {sorted(self._SCIENTIFIC_STYLES)})"),
+            }
+
         return self._record_scientific(code, style)
 
     def _write_narrative(self, code: str, style: str) -> dict[str, Any]:
         """Write a narrative cell without creating a scientific record."""
         write_result = self.notebooks._call_with_session(
             "MCPWriteCell", self.notebook_id, code, style, "End", 0)
+        if self._check_session_loss(write_result, "narrative write"):
+            return {"success": False,
+                    "error": "kernel state lost during narrative write"}
         if not write_result.get("success"):
             self._fault("PRE_DISPATCH",
                         f"narrative write failed: {write_result.get('error')}")
@@ -115,9 +146,13 @@ class Recorder:
     def _record_scientific(self, code: str, style: str) -> dict[str, Any]:
         """Tag, write, verify, and append a scientific cell to the ledger."""
         tag = self.ledger.make_tag()
+        intended_digest = hashlib.sha256(code.encode("utf-8")).hexdigest()
 
         write_result = self.notebooks._call_with_session(
             "MCPWriteCell", self.notebook_id, code, style, "End", 0, tag)
+        if self._check_session_loss(write_result, "cell write"):
+            return {"success": False,
+                    "error": "kernel state lost during cell write"}
         if not write_result.get("success"):
             self._fault("PRE_DISPATCH",
                         f"cell write failed: {write_result.get('error')}")
@@ -125,6 +160,9 @@ class Recorder:
 
         readback = self.notebooks._call_with_session(
             "MCPReadBack", self.notebook_id, timeout=30)
+        if self._check_session_loss(readback, "read-back"):
+            return {"success": False,
+                    "error": "kernel state lost during read-back"}
         if not readback.get("success"):
             self._fault("PRE_DISPATCH",
                         f"read-back failed: {readback.get('error')}")
@@ -136,10 +174,12 @@ class Recorder:
             }
 
         our_cell = None
+        tag_count = 0
         for c in readback.get("cells", []):
             if c.get("record_tag") == tag:
-                our_cell = c
-                break
+                tag_count += 1
+                if our_cell is None:
+                    our_cell = c
 
         if our_cell is None:
             self._fault("PRE_DISPATCH",
@@ -150,12 +190,69 @@ class Recorder:
                          f"cell with tag {tag} not found in notebook",
             }
 
+        if tag_count > 1:
+            self._fault("PRE_DISPATCH",
+                        f"tag {tag} found {tag_count} times in notebook")
+            return {
+                "success": False,
+                "error": f"pre-dispatch verification failed: "
+                         f"tag {tag} is not unique ({tag_count} occurrences)",
+            }
+
+        if our_cell["source_digest"] != intended_digest:
+            self._fault("PRE_DISPATCH",
+                        f"source digest mismatch: intended {intended_digest[:12]} "
+                        f"vs read-back {our_cell['source_digest'][:12]}")
+            return {
+                "success": False,
+                "error": "pre-dispatch verification failed: source mismatch",
+                "intended_digest": intended_digest,
+                "readback_digest": our_cell["source_digest"],
+            }
+
+        observed_style = our_cell.get("style", "")
+        if observed_style != style:
+            self._fault("PRE_DISPATCH",
+                        f"style mismatch: requested {style}, found {observed_style}")
+            return {
+                "success": False,
+                "error": f"pre-dispatch verification failed: "
+                         f"style {observed_style!r} != requested {style!r}",
+            }
+
+        if not our_cell.get("executable", False):
+            self._fault("PRE_DISPATCH",
+                        f"cell {tag} is not executable")
+            return {
+                "success": False,
+                "error": f"pre-dispatch verification failed: cell not executable",
+            }
+
+        if our_cell.get("evaluatable") is False:
+            self._fault("PRE_DISPATCH",
+                        f"cell {tag} has Evaluatable->False")
+            return {
+                "success": False,
+                "error": f"pre-dispatch verification failed: cell not evaluatable",
+            }
+
         record = self.ledger.append(
             source_digest=our_cell["source_digest"],
             source_preview=our_cell.get("source_preview", code[:200]),
             style=style,
             record_tag=tag,
         )
+
+        full_check = self._verify_full()
+        if not full_check.get("verified"):
+            self._fault("PRE_DISPATCH",
+                        f"full verification failed before dispatch: "
+                        + str(full_check.get("issues", [])[:3]))
+            return {
+                "success": False,
+                "error": "pre-dispatch full verification failed",
+                "verification": full_check,
+            }
 
         return {
             "success": True,
@@ -275,6 +372,13 @@ class Recorder:
         unresolved (non-COMPLETED and not yet annotated). The prototype
         kernel is never touched.
         """
+        if self._sealed:
+            return {
+                "success": False,
+                "error": "recorder is sealed; already finalized",
+                "run_id": self.run_id,
+            }
+
         if self.is_faulted:
             return {
                 "success": False,
@@ -293,10 +397,14 @@ class Recorder:
 
         verification = self._verify_full()
         if not verification.get("verified"):
+            self._fault("PRE_FINALIZE",
+                        "ledger/notebook mismatch before finalization: "
+                        + str(verification.get("issues", [])[:3]))
             return {
                 "success": False,
                 "error": "pre-finalization verification failed",
                 "verification": verification,
+                "fault": self.ledger.data.get("fault"),
             }
 
         nb_path = self.notebook_path
@@ -309,7 +417,12 @@ class Recorder:
             return saved
 
         base, ext = os.path.splitext(nb_path)
-        finalized_path = f"{base}-finalized{ext}"
+        finalized_path = f"{base}-{self.run_id}-finalized{ext}"
+        if os.path.exists(finalized_path):
+            return {
+                "success": False,
+                "error": f"finalized artifact already exists: {finalized_path}",
+            }
         shutil.copy2(nb_path, finalized_path)
         logger.info("finalize: copied %s -> %s", nb_path, finalized_path)
 
@@ -326,6 +439,9 @@ class Recorder:
 
         self._record_finalization(finalized_path, success=overall_success)
 
+        if overall_success:
+            self._sealed = True
+
         return {
             "success": overall_success,
             "finalized": True,
@@ -333,6 +449,7 @@ class Recorder:
             "recording_path": nb_path,
             "finalized_path": finalized_path,
             "run_id": self.run_id,
+            "sealed": self._sealed,
             **({"error": "post-finalization structural verification failed"}
                if not overall_success else {}),
         }
@@ -441,6 +558,12 @@ class Recorder:
                                 "issue": "out_of_order_in_finalized",
                             })
                         last_ledger_seq = max(last_ledger_seq, seq)
+                elif executable:
+                    issues.append({
+                        "tag": tag,
+                        "index": cell.get("index"),
+                        "issue": "tag_not_in_ledger_in_finalized",
+                    })
 
         return {
             "verified": len(issues) == 0,
@@ -508,6 +631,27 @@ class Recorder:
                                "expected": record.get("style"),
                                "found": cell.get("style")})
 
+            disp = record.get("disposition")
+            annotated = record.get("annotated", False)
+            if disp and disp.get("execution_outcome") == "COMPLETED" and not annotated:
+                if cell.get("evaluatable") is False:
+                    issues.append({"seq": record["seq"], "tag": tag,
+                                   "issue": "completed_cell_disabled",
+                                   "evaluatable": False})
+            elif annotated:
+                if cell.get("evaluatable", True):
+                    issues.append({"seq": record["seq"], "tag": tag,
+                                   "issue": "annotated_cell_enabled",
+                                   "expected_evaluatable": False,
+                                   "found_evaluatable": cell.get("evaluatable")})
+                cell_reason = cell.get("annotation_reason", "")
+                ledger_reason = record.get("annotation_reason", "")
+                if cell_reason != ledger_reason:
+                    issues.append({"seq": record["seq"], "tag": tag,
+                                   "issue": "annotation_reason_changed",
+                                   "expected": ledger_reason,
+                                   "found": cell_reason})
+
         # Converse: every executable cell must have a ledger entry
         seen_tags: dict[str, int] = {}
         last_ledger_seq = -1
@@ -573,6 +717,8 @@ class Recorder:
         if self.is_faulted:
             result["faulted"] = True
             result["fault"] = self.ledger.data["fault"]
+        if self._sealed:
+            result["sealed"] = True
         return result
 
 

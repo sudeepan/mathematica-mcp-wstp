@@ -282,6 +282,13 @@ class HeadlessNotebooks:
         notebook_id = self._resolve(notebook)
         if notebook_id is None:
             return self._no_session(notebook)
+        if (self._recorder and not self._recorder._sealed
+                and notebook_id == self._recording_target):
+            return {
+                "success": False,
+                "error": ("cannot close the recording target before "
+                          "finalization; finalize first or stop_recording(force=True)"),
+            }
         result = self._call("MCPClose", notebook_id)
         with _registry_lock:
             self._sessions.pop(notebook_id, None)
@@ -1014,6 +1021,17 @@ class HeadlessNotebooks:
         notebook_id = self._resolve(notebook)
         if notebook_id is None:
             return self._no_session(notebook)
+        if (path and self._recorder
+                and notebook_id == self._recording_target):
+            rec_path = self._recorder.notebook_path
+            target_abs = os.path.abspath(os.path.expanduser(path))
+            if rec_path and target_abs != os.path.abspath(rec_path):
+                return {
+                    "success": False,
+                    "error": ("save-as to a different path is blocked during "
+                              "integrity recording; the recorder tracks "
+                              f"{rec_path}"),
+                }
         target = os.path.abspath(os.path.expanduser(path)) if path else ""
         result = self._call_with_session("MCPSave", notebook_id, target)
         if result.get("success") and result.get("path"):
@@ -1033,6 +1051,15 @@ class HeadlessNotebooks:
         a separate operation.
         """
         from .recorder import Recorder
+
+        if self._recorder is not None:
+            return {
+                "success": False,
+                "error": (f"a recording is already active on "
+                          f"{self._recording_target}; finalize or stop it first"),
+                "active_recording": self._recording_target,
+                "run_id": self._recorder.run_id,
+            }
 
         notebook_id = self._resolve(notebook)
         if notebook_id is None:
@@ -1069,10 +1096,16 @@ class HeadlessNotebooks:
                 "existing_executable": existing_executable[:10],
             }
 
-        self._recording_target = notebook_id
         with _registry_lock:
             sess = self._sessions.get(notebook_id)
         nb_path = sess.path if sess else ""
+        if not nb_path:
+            return {
+                "success": False,
+                "error": "integrity recording requires a notebook with a disk path",
+            }
+
+        self._recording_target = notebook_id
         self._recorder = Recorder(self, notebook_id, nb_path)
         return {
             "success": True,
@@ -1084,9 +1117,19 @@ class HeadlessNotebooks:
             "headless": True,
         }
 
-    def stop_recording(self) -> dict[str, Any]:
+    def stop_recording(self, force: bool = False) -> dict[str, Any]:
         was = self._recording_target
-        recorder_summary = self._recorder.summary() if self._recorder else None
+        recorder = self._recorder
+        if recorder and not recorder._sealed and not force:
+            return {
+                "success": False,
+                "error": ("integrity recorder has not been finalized; "
+                          "finalize first, or pass force=True to abandon"),
+                "recording": True,
+                "run_id": recorder.run_id,
+            }
+        recorder_summary = recorder.summary() if recorder else None
+        abandoned = recorder and not recorder._sealed
         self._recording_target = None
         self._recorder = None
         result: dict[str, Any] = {
@@ -1095,6 +1138,8 @@ class HeadlessNotebooks:
             "was_recording": was,
             "headless": True,
         }
+        if abandoned:
+            result["abandoned"] = True
         if recorder_summary:
             result["recorder"] = recorder_summary
         return result
@@ -1124,8 +1169,11 @@ class HeadlessNotebooks:
                 return self._recorder.record_and_verify(code, style)
             return self._call_with_session(
                 "MCPWriteCell", target, code, style, "End", 0)
-        except Exception:
+        except Exception as exc:
             logger.warning("recording cell write failed", exc_info=True)
+            if self._recorder:
+                self._recorder._fault("PRE_DISPATCH",
+                                      f"unhandled exception: {exc}")
             return {"success": False, "error": "recording write failed"}
 
     def record_outcome(self, seq: int, result: Any,
@@ -1143,8 +1191,11 @@ class HeadlessNotebooks:
             disposition = extract_disposition(result, kernel_notice,
                                              kernel_verdict)
             return self._recorder.apply_outcome(seq, disposition)
-        except Exception:
+        except Exception as exc:
             logger.warning("recording outcome failed", exc_info=True)
+            if self._recorder:
+                self._recorder._fault("POST_EVAL",
+                                      f"unhandled exception: {exc}")
             return {"success": False, "error": "recording outcome failed"}
 
     def finalize_recording(self, timeout: int = 600) -> dict[str, Any]:
