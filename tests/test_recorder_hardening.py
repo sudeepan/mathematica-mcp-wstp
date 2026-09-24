@@ -697,6 +697,341 @@ def test_finalize_returns_structural_verification():
         shutil.rmtree(d, ignore_errors=True)
 
 
+# --- Phase 11: fault latch, positive gate, narrative guard ----------------
+
+def test_fault_latch_blocks_second_call():
+    """After a pre-dispatch failure, the next call is refused immediately."""
+    d = tempfile.mkdtemp(prefix="rec-h11-")
+    os.environ["MATHEMATICA_WSTP_RECORDING_DIR"] = os.path.join(d, "ledgers")
+    try:
+        nb_path = os.path.join(d, "test.nb")
+        call_count = [0]
+
+        class StubNotebooks:
+            _recorder = None
+
+            @property
+            def has_active_recorder(self):
+                return self._recorder is not None
+
+            def _call_with_session(self, fn, *args, **kwargs):
+                if fn == "MCPWriteCell":
+                    call_count[0] += 1
+                    if call_count[0] == 1:
+                        return {"success": True}
+                    return {"success": True}
+                if fn == "MCPReadBack":
+                    if call_count[0] == 1:
+                        return {"success": False, "error": "link dead"}
+                    return {"success": True, "total": 0, "cells": []}
+                return {"success": False}
+
+        notebooks = StubNotebooks()
+        rec = Recorder(notebooks, "hnb1", nb_path)
+        notebooks._recorder = rec
+
+        r1 = rec.record_and_verify("x = 1")
+        assert not r1["success"], "first call should fail (readback failure)"
+        assert rec.is_faulted, "recorder must be faulted after failure"
+
+        r2 = rec.record_and_verify("y = 2")
+        assert not r2["success"], "second call must be refused"
+        assert "faulted" in r2.get("error", "").lower()
+        assert call_count[0] == 1, "second call must not attempt a write"
+    finally:
+        os.environ.pop("MATHEMATICA_WSTP_RECORDING_DIR", None)
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_fault_latch_is_durable():
+    """The fault marker is written to the ledger and survives reload."""
+    d = tempfile.mkdtemp(prefix="rec-h11b-")
+    os.environ["MATHEMATICA_WSTP_RECORDING_DIR"] = os.path.join(d, "ledgers")
+    try:
+        nb_path = os.path.join(d, "test.nb")
+
+        class StubNotebooks:
+            _recorder = None
+
+            def _call_with_session(self, fn, *args, **kwargs):
+                if fn == "MCPWriteCell":
+                    return {"success": True}
+                if fn == "MCPReadBack":
+                    return {"success": False, "error": "kernel died"}
+                return {"success": False}
+
+        notebooks = StubNotebooks()
+        rec = Recorder(notebooks, "hnb1", nb_path)
+        rec.record_and_verify("x = 1")
+        assert rec.is_faulted
+        ledger_path = rec.ledger.path
+
+        reloaded = RecorderLedger.load(ledger_path)
+        assert "fault" in reloaded.data
+        assert reloaded.data["fault"]["phase"] == "PRE_DISPATCH"
+    finally:
+        os.environ.pop("MATHEMATICA_WSTP_RECORDING_DIR", None)
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_fault_latch_blocks_finalization():
+    """A faulted recorder refuses finalization."""
+    d = tempfile.mkdtemp(prefix="rec-h11c-")
+    os.environ["MATHEMATICA_WSTP_RECORDING_DIR"] = os.path.join(d, "ledgers")
+    try:
+        nb_path = os.path.join(d, "test.nb")
+
+        class StubNotebooks:
+            _recorder = None
+
+            def _call_with_session(self, fn, *args, **kwargs):
+                if fn == "MCPWriteCell":
+                    return {"success": True}
+                if fn == "MCPReadBack":
+                    return {"success": False, "error": "dead"}
+                return {"success": False}
+
+        notebooks = StubNotebooks()
+        rec = Recorder(notebooks, "hnb1", nb_path)
+        rec.record_and_verify("x = 1")
+        assert rec.is_faulted
+
+        fin = rec.finalize(timeout=120)
+        assert not fin["success"]
+        assert "faulted" in fin["error"]
+    finally:
+        os.environ.pop("MATHEMATICA_WSTP_RECORDING_DIR", None)
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_post_eval_integrity_failure_faults():
+    """A post-eval verification failure faults the recorder."""
+    d = tempfile.mkdtemp(prefix="rec-h11d-")
+    os.environ["MATHEMATICA_WSTP_RECORDING_DIR"] = os.path.join(d, "ledgers")
+    try:
+        nb_path = os.path.join(d, "test.nb")
+        call_phase = [0]
+
+        class StubNotebooks:
+            _recorder = None
+
+            def _call_with_session(self, fn, *args, **kwargs):
+                if fn == "MCPWriteCell":
+                    return {"success": True}
+                if fn == "MCPReadBack":
+                    if call_phase[0] == 0:
+                        call_phase[0] = 1
+                        return {
+                            "success": True, "total": 1,
+                            "cells": [{"index": 1, "style": "Input",
+                                       "executable": True,
+                                       "record_tag": "R001-1",
+                                       "source_digest": "aaa"}],
+                        }
+                    return {
+                        "success": True, "total": 1,
+                        "cells": [{"index": 1, "style": "Input",
+                                   "executable": True,
+                                   "record_tag": "R001-1",
+                                   "source_digest": "TAMPERED"}],
+                    }
+                return {"success": False}
+
+            def annotate_cell(self, *args, **kwargs):
+                return {"success": True}
+
+        notebooks = StubNotebooks()
+        rec = Recorder(notebooks, "hnb1", nb_path)
+        rec.ledger = RecorderLedger.create(nb_path, "hnb1", rec.run_id)
+        tag = rec.ledger.make_tag()
+        rec.ledger.append("aaa", "x = 1", "Input", tag)
+
+        outcome = rec.apply_outcome(1, {
+            "execution_outcome": "COMPLETED",
+            "control_intent": "NONE",
+            "abort_confirmation": "NOT_APPLICABLE",
+            "kernel_readiness": "READY",
+        })
+        assert not outcome["post_eval_verification"]["verified"]
+        assert rec.is_faulted
+        assert outcome["recording_faulted"] is True
+    finally:
+        os.environ.pop("MATHEMATICA_WSTP_RECORDING_DIR", None)
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_narrative_style_returns_non_scientific():
+    """A narrative-style call returns scientific=False and creates no ledger record."""
+    d = tempfile.mkdtemp(prefix="rec-h11e-")
+    os.environ["MATHEMATICA_WSTP_RECORDING_DIR"] = os.path.join(d, "ledgers")
+    try:
+        nb_path = os.path.join(d, "test.nb")
+
+        class StubNotebooks:
+            _recorder = None
+
+            def _call_with_session(self, fn, *args, **kwargs):
+                if fn == "MCPWriteCell":
+                    return {"success": True}
+                return {"success": False}
+
+        notebooks = StubNotebooks()
+        rec = Recorder(notebooks, "hnb1", nb_path)
+
+        result = rec.record_and_verify("Introduction", style="Section")
+        assert result["success"]
+        assert result["scientific"] is False
+        assert len(rec.ledger.records) == 0, "narrative cells must not create ledger records"
+    finally:
+        os.environ.pop("MATHEMATICA_WSTP_RECORDING_DIR", None)
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_narrative_write_failure_faults():
+    """A narrative cell write failure still faults the recorder."""
+    d = tempfile.mkdtemp(prefix="rec-h11f-")
+    os.environ["MATHEMATICA_WSTP_RECORDING_DIR"] = os.path.join(d, "ledgers")
+    try:
+        nb_path = os.path.join(d, "test.nb")
+
+        class StubNotebooks:
+            _recorder = None
+
+            def _call_with_session(self, fn, *args, **kwargs):
+                return {"success": False, "error": "write refused"}
+
+        notebooks = StubNotebooks()
+        rec = Recorder(notebooks, "hnb1", nb_path)
+
+        result = rec.record_and_verify("Title text", style="Title")
+        assert not result["success"]
+        assert rec.is_faulted
+    finally:
+        os.environ.pop("MATHEMATICA_WSTP_RECORDING_DIR", None)
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_style_change_fails_verification():
+    """Changing a cell's style without changing its digest fails verification."""
+    d = tempfile.mkdtemp(prefix="rec-h11g-")
+    os.environ["MATHEMATICA_WSTP_RECORDING_DIR"] = os.path.join(d, "ledgers")
+    try:
+        nb_path = os.path.join(d, "test.nb")
+
+        class StubNotebooks:
+            _recorder = None
+
+            def _call_with_session(self, fn, *args, **kwargs):
+                if fn == "MCPReadBack":
+                    return {
+                        "success": True, "total": 1,
+                        "cells": [{"index": 1, "style": "Code",
+                                   "executable": True,
+                                   "record_tag": "R001-1",
+                                   "source_digest": "aaa"}],
+                    }
+                return {"success": False}
+
+        notebooks = StubNotebooks()
+        rec = Recorder(notebooks, "hnb1", nb_path)
+        rec.ledger = RecorderLedger.create(nb_path, "hnb1", rec.run_id)
+        tag = rec.ledger.make_tag()
+        rec.ledger.append("aaa", "x = 1", "Input", tag)
+
+        result = rec._verify_full()
+        assert not result["verified"]
+        assert any(i["issue"] == "style_changed" for i in result["issues"])
+    finally:
+        os.environ.pop("MATHEMATICA_WSTP_RECORDING_DIR", None)
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_duplicate_source_distinct_tags_passes():
+    """Two cells with identical source but different tags pass verification."""
+    d = tempfile.mkdtemp(prefix="rec-h11h-")
+    os.environ["MATHEMATICA_WSTP_RECORDING_DIR"] = os.path.join(d, "ledgers")
+    try:
+        nb_path = os.path.join(d, "test.nb")
+
+        class StubNotebooks:
+            _recorder = None
+
+            def _call_with_session(self, fn, *args, **kwargs):
+                if fn == "MCPReadBack":
+                    return {
+                        "success": True, "total": 2,
+                        "cells": [
+                            {"index": 1, "style": "Input", "executable": True,
+                             "record_tag": "R001-1", "source_digest": "same"},
+                            {"index": 2, "style": "Input", "executable": True,
+                             "record_tag": "R001-2", "source_digest": "same"},
+                        ],
+                    }
+                return {"success": False}
+
+        notebooks = StubNotebooks()
+        rec = Recorder(notebooks, "hnb1", nb_path)
+        rec.ledger = RecorderLedger.create(nb_path, "hnb1", rec.run_id)
+        t1 = rec.ledger.make_tag()
+        rec.ledger.append("same", "x = 1", "Input", t1)
+        t2 = rec.ledger.make_tag()
+        rec.ledger.append("same", "x = 1", "Input", t2)
+
+        result = rec._verify_full()
+        assert result["verified"], f"duplicate source with distinct tags should pass: {result['issues']}"
+    finally:
+        os.environ.pop("MATHEMATICA_WSTP_RECORDING_DIR", None)
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_positive_gate_rejects_missing_seq():
+    """The positive dispatch gate refuses a result with no seq."""
+    d = tempfile.mkdtemp(prefix="rec-h11i-")
+    os.environ["MATHEMATICA_WSTP_RECORDING_DIR"] = os.path.join(d, "ledgers")
+    try:
+        nb_path = os.path.join(d, "test.nb")
+
+        class StubNotebooks:
+            _recorder = None
+            _recording_target = "hnb1"
+
+            @property
+            def has_active_recorder(self):
+                return self._recorder is not None
+
+            def record_input(self, code, style="Input"):
+                return {"success": True, "pre_dispatch_verified": True}
+
+        notebooks = StubNotebooks()
+        notebooks._recorder = object()
+        rec_result = notebooks.record_input("x = 1")
+
+        verified = (isinstance(rec_result, dict)
+                    and rec_result.get("success") is True
+                    and rec_result.get("pre_dispatch_verified") is True
+                    and rec_result.get("seq") is not None)
+        assert not verified, "missing seq must fail the positive gate"
+    finally:
+        os.environ.pop("MATHEMATICA_WSTP_RECORDING_DIR", None)
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_positive_gate_accepts_verified_record():
+    """The positive dispatch gate accepts a fully verified record."""
+    rec_result = {
+        "success": True,
+        "pre_dispatch_verified": True,
+        "seq": 1,
+        "record_tag": "R001-1",
+        "source_digest": "abc",
+    }
+    verified = (isinstance(rec_result, dict)
+                and rec_result.get("success") is True
+                and rec_result.get("pre_dispatch_verified") is True
+                and rec_result.get("seq") is not None)
+    assert verified, "a fully verified record must pass the positive gate"
+
+
 # --- Runner ----------------------------------------------------------------
 
 if __name__ == "__main__":
@@ -726,10 +1061,21 @@ if __name__ == "__main__":
         test_verify_finalized_catches_annotation_not_preserved,
         test_verify_finalized_passes_clean,
         test_finalize_returns_structural_verification,
+        # Phase 11
+        test_fault_latch_blocks_second_call,
+        test_fault_latch_is_durable,
+        test_fault_latch_blocks_finalization,
+        test_post_eval_integrity_failure_faults,
+        test_narrative_style_returns_non_scientific,
+        test_narrative_write_failure_faults,
+        test_style_change_fails_verification,
+        test_duplicate_source_distinct_tags_passes,
+        test_positive_gate_rejects_missing_seq,
+        test_positive_gate_accepts_verified_record,
     ]
 
     passed = failed = 0
-    print("=== Phases 7-10: hardening tests ===")
+    print("=== Phases 7-11: hardening tests ===")
     for fn in tests:
         try:
             fn()

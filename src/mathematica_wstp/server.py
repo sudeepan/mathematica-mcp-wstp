@@ -150,15 +150,30 @@ def evaluate(code: str, timeout: float = 60.0,
     nb = get_headless_notebooks()
     rec = nb.record_input(code, style=style)
 
-    # Fail closed: when the integrity recorder is active, a recording
-    # failure prevents scientific dispatch.
-    if (nb.has_active_recorder
-            and isinstance(rec, dict) and not rec.get("success", True)):
-        return _fail(
-            "recording integrity: cell could not be verified before dispatch",
-            recording_error=rec.get("error"),
-            record_tag=rec.get("record_tag"),
-        )
+    if nb.has_active_recorder:
+        # Narrative path: cell was written as notebook structure, no science.
+        if isinstance(rec, dict) and rec.get("scientific") is False:
+            return _reply({
+                "success": True,
+                "output": f"[{style} cell written to recording notebook]",
+                "scientific": False,
+                "style": style,
+                "recorded": True,
+            })
+
+        # Positive gate: dispatch science ONLY after a verified durable record.
+        verified = (isinstance(rec, dict)
+                    and rec.get("success") is True
+                    and rec.get("pre_dispatch_verified") is True
+                    and rec.get("seq") is not None)
+        if not verified:
+            error = (rec.get("error", "unknown recording failure")
+                     if isinstance(rec, dict) else "recording returned no result")
+            return _fail(
+                f"recording integrity: {error}",
+                recording_error=error,
+                record_tag=rec.get("record_tag") if isinstance(rec, dict) else None,
+            )
 
     result = evaluate_text(code, timeout=timeout)
     notice = session.take_kernel_change_notice()

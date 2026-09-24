@@ -18,7 +18,7 @@ import time
 import uuid
 from typing import Any, TYPE_CHECKING
 
-from .recorder_ledger import RecorderLedger
+from .recorder_ledger import RecorderLedger, _write_atomically
 
 if TYPE_CHECKING:
     from .notebooks import HeadlessNotebooks
@@ -29,6 +29,14 @@ logger = logging.getLogger("mathematica_wstp.recorder")
 class Recorder:
     """One recording session's integrity verifier."""
 
+    _NARRATIVE_STYLES = frozenset({
+        "Title", "Subtitle", "Chapter", "Subchapter",
+        "Section", "Subsection", "Subsubsection",
+        "Text", "Item", "ItemNumbered", "ItemParagraph",
+        "Subitem", "SubitemNumbered", "SubitemParagraph",
+        "Output", "Print", "Message",
+    })
+
     def __init__(self, notebooks: HeadlessNotebooks, notebook_id: str,
                  notebook_path: str):
         self.notebooks = notebooks
@@ -38,26 +46,88 @@ class Recorder:
         self.ledger = RecorderLedger.create(notebook_path, notebook_id,
                                             self.run_id)
 
+    # -- fault latch --------------------------------------------------------
+
+    @property
+    def is_faulted(self) -> bool:
+        return "fault" in self.ledger.data
+
+    def _fault(self, phase: str, reason: str) -> None:
+        """Write a durable fault marker to the ledger.
+
+        Once faulted, all scientific dispatch and finalization are refused
+        for this run. The fault survives process restarts.
+        """
+        if self.is_faulted:
+            return
+        self.ledger.data["fault"] = {
+            "phase": phase,
+            "reason": reason,
+            "at": time.time(),
+        }
+        _write_atomically(self.ledger.path, self.ledger.data)
+        logger.warning("recorder FAULTED (%s): %s", phase, reason)
+
+    # -- recording ----------------------------------------------------------
+
     def record_and_verify(self, code: str, style: str = "Input"
                           ) -> dict[str, Any]:
-        """Write a tagged cell, append to ledger, verify via pre-dispatch read-back.
+        """Write a cell and verify it, or write narrative structure.
 
-        Returns success=False if any step fails. The caller must not dispatch
-        the scientific evaluation when success is False.
+        Scientific cells (Input/Code) are tagged, appended to the ledger,
+        and verified via read-back. The caller dispatches science only when
+        the result has success=True, pre_dispatch_verified=True, and a seq.
+
+        Narrative cells are written without a tag or ledger record. The
+        caller must not dispatch scientific evaluation for them.
+
+        Any failure faults the recorder for the remainder of this run.
         """
+        if self.is_faulted:
+            return {
+                "success": False,
+                "error": "recorder is faulted; no further science permitted",
+                "fault": self.ledger.data["fault"],
+            }
+
+        if style in self._NARRATIVE_STYLES:
+            return self._write_narrative(code, style)
+
+        return self._record_scientific(code, style)
+
+    def _write_narrative(self, code: str, style: str) -> dict[str, Any]:
+        """Write a narrative cell without creating a scientific record."""
+        write_result = self.notebooks._call_with_session(
+            "MCPWriteCell", self.notebook_id, code, style, "End", 0)
+        if not write_result.get("success"):
+            self._fault("PRE_DISPATCH",
+                        f"narrative write failed: {write_result.get('error')}")
+            return {
+                "success": False,
+                "error": f"narrative write failed: {write_result.get('error')}",
+            }
+        return {
+            "success": True,
+            "scientific": False,
+            "style": style,
+        }
+
+    def _record_scientific(self, code: str, style: str) -> dict[str, Any]:
+        """Tag, write, verify, and append a scientific cell to the ledger."""
         tag = self.ledger.make_tag()
 
         write_result = self.notebooks._call_with_session(
             "MCPWriteCell", self.notebook_id, code, style, "End", 0, tag)
         if not write_result.get("success"):
-            logger.warning("recorder write failed: %s", write_result.get("error"))
+            self._fault("PRE_DISPATCH",
+                        f"cell write failed: {write_result.get('error')}")
             return write_result
 
         readback = self.notebooks._call_with_session(
             "MCPReadBack", self.notebook_id, timeout=30)
         if not readback.get("success"):
-            logger.warning("pre-dispatch read-back failed: %s",
-                           readback.get("error"))
+            self._fault("PRE_DISPATCH",
+                        f"read-back failed: {readback.get('error')}")
             return {
                 "success": False,
                 "error": "pre-dispatch verification failed: read-back error",
@@ -72,6 +142,8 @@ class Recorder:
                 break
 
         if our_cell is None:
+            self._fault("PRE_DISPATCH",
+                        f"cell with tag {tag} not found in notebook")
             return {
                 "success": False,
                 "error": f"pre-dispatch verification failed: "
@@ -100,6 +172,10 @@ class Recorder:
 
         When the execution outcome is not COMPLETED, the cell is automatically
         annotated as non-evaluatable so finalization will not re-run it.
+
+        A post-eval verification failure faults the recorder: the execution
+        outcome is preserved (it already happened) but no further science
+        is permitted.
         """
         self.ledger.update_record(seq, disposition=disposition,
                                   disposition_at=time.time())
@@ -107,11 +183,18 @@ class Recorder:
         annotation = self._auto_annotate(seq, disposition)
 
         verification = self._verify_full()
+
+        if not verification.get("verified"):
+            self._fault("POST_EVAL",
+                        f"integrity verification failed after seq {seq}: "
+                        + str(verification.get("issues", [])[:3]))
+
         return {
             "seq": seq,
             "disposition": disposition,
             "annotation": annotation,
             "post_eval_verification": verification,
+            "recording_faulted": self.is_faulted,
         }
 
     def _auto_annotate(self, seq: int, disposition: dict[str, str]
@@ -178,9 +261,17 @@ class Recorder:
     def finalize(self, timeout: int = 600) -> dict[str, Any]:
         """Copy the recording notebook and evaluate it in a fresh kernel.
 
-        Preflight refuses when any record is unresolved (non-COMPLETED and
-        not yet annotated). The prototype kernel is never touched.
+        Preflight refuses when the recorder is faulted or any record is
+        unresolved (non-COMPLETED and not yet annotated). The prototype
+        kernel is never touched.
         """
+        if self.is_faulted:
+            return {
+                "success": False,
+                "error": "cannot finalize: recorder is faulted",
+                "fault": self.ledger.data["fault"],
+            }
+
         unresolved = self.unresolved_records()
         if unresolved:
             return {
@@ -239,10 +330,10 @@ class Recorder:
     def _verify_finalized(self, finalized_path: str) -> dict[str, Any]:
         """Open the finalized .nb as a temporary session and verify structure.
 
-        Checks: every ledger record has a matching cell (same tag and
-        digest), every executable cell has a ledger entry, annotated
-        cells remain non-evaluatable, and cell order matches ledger
-        sequence.
+        Checks: every ledger record has a matching cell (same tag, digest,
+        and style), every executable cell has a ledger entry, annotated
+        cells remain non-evaluatable with the correct reason, and cell
+        order matches ledger sequence.
 
         Uses the prototype kernel (not a fresh one) for the inert
         read-back. This is acceptable because MCPReadBack does not
@@ -285,11 +376,25 @@ class Recorder:
                                "expected": record["source_digest"],
                                "found": cell["source_digest"]})
 
-            if record.get("annotated") and cell.get("evaluatable", True):
+            if cell.get("style", "") != record.get("style", ""):
                 issues.append({"seq": record["seq"], "tag": tag,
-                               "issue": "annotation_not_preserved",
-                               "expected_evaluatable": False,
-                               "found_evaluatable": cell.get("evaluatable")})
+                               "issue": "style_changed_in_finalized",
+                               "expected": record.get("style"),
+                               "found": cell.get("style")})
+
+            if record.get("annotated"):
+                if cell.get("evaluatable", True):
+                    issues.append({"seq": record["seq"], "tag": tag,
+                                   "issue": "annotation_not_preserved",
+                                   "expected_evaluatable": False,
+                                   "found_evaluatable": cell.get("evaluatable")})
+                cell_reason = cell.get("annotation_reason", "")
+                ledger_reason = record.get("annotation_reason", "")
+                if cell_reason != ledger_reason:
+                    issues.append({"seq": record["seq"], "tag": tag,
+                                   "issue": "annotation_reason_changed",
+                                   "expected": ledger_reason,
+                                   "found": cell_reason})
 
         seen_tags: dict[str, int] = {}
         last_ledger_seq = -1
@@ -348,22 +453,13 @@ class Recorder:
             "success": success,
             "at": time.time(),
         }
-        from .recorder_ledger import _write_atomically
         _write_atomically(self.ledger.path, self.ledger.data)
-
-    _NARRATIVE_STYLES = frozenset({
-        "Title", "Subtitle", "Chapter", "Subchapter",
-        "Section", "Subsection", "Subsubsection",
-        "Text", "Item", "ItemNumbered", "ItemParagraph",
-        "Subitem", "SubitemNumbered", "SubitemParagraph",
-        "Output", "Print", "Message",
-    })
 
     def _verify_full(self) -> dict[str, Any]:
         """Bidirectional verification: ledger-to-notebook and notebook-to-ledger.
 
         Ledger-to-notebook: every ledger record has a matching cell with
-        the same source digest.
+        the same source digest and style.
 
         Notebook-to-ledger (the converse check): every executable cell in
         the notebook must carry a recorder tag that appears in the ledger.
@@ -390,11 +486,17 @@ class Recorder:
             if cell is None:
                 issues.append({"seq": record["seq"], "tag": tag,
                                "issue": "cell_missing"})
-            elif cell["source_digest"] != record["source_digest"]:
+                continue
+            if cell["source_digest"] != record["source_digest"]:
                 issues.append({"seq": record["seq"], "tag": tag,
                                "issue": "source_changed",
                                "expected": record["source_digest"],
                                "found": cell["source_digest"]})
+            if cell.get("style", "") != record.get("style", ""):
+                issues.append({"seq": record["seq"], "tag": tag,
+                               "issue": "style_changed",
+                               "expected": record.get("style"),
+                               "found": cell.get("style")})
 
         # Converse: every executable cell must have a ledger entry
         seen_tags: dict[str, int] = {}
@@ -453,11 +555,15 @@ class Recorder:
         }
 
     def summary(self) -> dict[str, Any]:
-        return {
+        result: dict[str, Any] = {
             "run_id": self.run_id,
             "notebook_id": self.notebook_id,
             "ledger": self.ledger.summary(),
         }
+        if self.is_faulted:
+            result["faulted"] = True
+            result["fault"] = self.ledger.data["fault"]
+        return result
 
 
 def _evaluate_in_fresh_kernel(nb_path: str, timeout: int = 600
