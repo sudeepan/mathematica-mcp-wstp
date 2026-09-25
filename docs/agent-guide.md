@@ -257,35 +257,30 @@ kernel while still being unsuitable as a desktop notebook.
 
 ## Recording every evaluation into a notebook
 
-Every `evaluate()` call can be automatically written as a cell into an open
-notebook. This gives a complete, auditable record of what the kernel ran.
-
-Start recording when you create or open the target notebook:
-
 ```text
 notebooks(action="create", title="Computation Log", path="/tmp/log.nb", record=True)
 ```
 
-Or start it later on an already-open notebook:
+Or on an already-open notebook: `notebooks(action="record", notebook="hnb1")`.
 
-```text
-notebooks(action="record", notebook="hnb1")
-```
+Integrity recording needs three things at the start:
 
-From that point on, every `evaluate(code)` call writes `code` as a cell
-into the recording notebook before the kernel evaluates it. The recording
-happens silently; a `recorded: true` flag in the evaluate reply confirms it.
+- a notebook with a disk path;
+- **zero pre-existing executable cells**, so the recorder ledger is the sole
+  authority for what was computed (resuming a partly filled notebook is a
+  separate operation);
+- the direct kernel. Recording is refused while a supervisor backend is
+  selected; switch back with `supervisor(action="use_direct")` first.
 
-### The recording lock
+Only one recording can be active at a time. The recorder cannot see
+definitions made before it started, so start from a fresh kernel when the
+record must stand on its own.
 
-While recording is active, `write_cell`, `edit_cells`, `execute_in_notebook`
-are **blocked** on the recording notebook. The only write path is `evaluate()`.
-This is enforced in code, not by convention.
+Every `evaluate(code)` call writes `code` as a cell before evaluating it.
+While recording, `write_cell`, `edit_cells`, `execute_in_notebook` are blocked
+on that notebook, and saving it under a different path is refused.
 
-### Cell styles
-
-By default, recorded cells are Input cells. Pass `style` to `evaluate()` to
-write a different cell style:
+Pass `style` to write structure cells:
 
 ```text
 evaluate("Diagrams", style="Chapter")
@@ -293,33 +288,107 @@ evaluate("Common setup", style="Section")
 evaluate("GraphGen[1]")
 ```
 
-The style string passes through to the notebook unchanged. The kernel still
-evaluates the code (a section title evaluates to the string itself), and the
-notebook gets a Chapter, Section, or Subsection cell instead of an Input cell.
+Only `Input` and `Code` are accepted as scientific styles. Narrative styles
+(Title, Subtitle, Section, Subsection, Subsubsection, Text, Item,
+ItemNumbered, ItemParagraph) write notebook structure but **skip scientific
+execution entirely**. No ledger record is created, so the scientific ledger
+contains only cells that actually computed. Any other style is rejected.
 
-### Stopping
+The recorder stamps the replay flag on every cell it writes:
+`Evaluatable -> True` on Input/Code cells and `Evaluatable -> False` on
+narrative cells. Verification checks these values exactly, so a flag that was
+flipped or removed is caught instead of being left to stylesheet defaults.
+
+### What is blocked during recording
+
+While an integrity recorder is active, every other way to run code or change
+kernel state is refused, because the recorder could not see it:
+
+- `evaluate_cells`, `replay(action="run")`
+- `vars(action="get/set/clear/clear_all")` - `get` evaluates whatever it is
+  given as a name
+- `kernel(action="restart/stop/close_subkernels")`
+- `render(action="expression")`, `verify_derivation`
+- `supervisor(action="use/use_direct")`
+
+All scientific work goes through `evaluate()`. Inspection tools (`vars list`,
+`cells`, `status`, `render(action="cell")`) and `abort()` remain available.
+
+### Fail-closed recording
+
+If any recording step fails - a cell write, a read-back verification, a
+source digest mismatch, a replay flag mismatch, an annotation failure, a
+session loss, an unexpected exception, or a post-evaluation integrity check -
+the recorder **faults the entire run**. Once faulted, all further scientific
+dispatch and finalization are refused for that recording. The fault is
+written into the recorder ledger on disk, so it survives process restarts.
+
+Before every scientific dispatch, the recorder:
+
+1. checks that every earlier record has a stored outcome
+2. verifies the written cell matches the intended source (digest comparison)
+3. verifies the cell style, executable flag, and `Evaluatable -> True` stamp
+4. verifies exactly one cell carries the new tag
+5. runs full bidirectional ledger/notebook verification
+
+Three phases can trigger a fault:
+
+- **Pre-dispatch**: the cell was written but its identity, content, or
+  notebook state could not be verified before execution. Science did not run.
+- **Post-dispatch**: the evaluation broke after dispatch without reporting
+  how it ended. The reply says `outcome_unknown`; no outcome is invented.
+- **Post-evaluation**: science ran and produced a result, but the notebook
+  no longer matches the ledger. The execution outcome is preserved and
+  returned, but the recording is marked integrity-faulted.
+
+The server dispatch gate is **positive**: science is dispatched only when the
+recorder returned a verified record with a sequence number. Missing keys,
+malformed results, or `None` refuse dispatch. Every fault is reported in the
+same tool reply as `recording_faulted` and `recording_fault`, so the caller
+knows immediately.
+
+Evaluations are serialized: two `evaluate()` calls at once run one after the
+other, and recorder lifecycle actions (start, save, finalize, stop, close,
+backend switch) wait for an evaluation in flight to finish. `abort()` never
+waits.
+
+### Finalization and structural verification
+
+Finalize **before** releasing the recorder:
 
 ```text
-notebooks(action="stop_recording")
+notebooks(action="save")
+notebooks(action="finalize")       # while the recorder is still active
+notebooks(action="close")          # after finalization; releases the recorder
 ```
 
-Closing the recording notebook also stops recording. Once stopped, the lock
-lifts and `write_cell`/`edit_cells` work again on that notebook.
+`stop_recording` and `close` on the recording notebook are refused before
+finalization. `stop_recording(force=True)` abandons the run: its ledger never
+gets a successful finalization, and a later `finalize` takes the ordinary path,
+which checks nothing against the ledger.
 
-### Finalizing
+`notebooks(action="finalize")` copies the notebook and re-runs every cell in
+a fresh kernel via `NotebookEvaluate`, so the notebook gets native
+`In[n]`/`Out[n]` labels. Cells marked `Evaluatable -> False` (for example a
+timed-out cell) are skipped. A Wolfram message from any cell during this run
+counts as a failed finalization.
 
-Once the prototyping session is complete and the recording notebook contains
-all the cells, `finalize` re-runs them via `NotebookEvaluate` so every
-cell gets native In[n]/Out[n] labels:
+After finalization, the server opens the finalized `.nb` as a temporary
+session and runs a structural comparison against the recorder ledger:
+tags, source digests, styles, replay flags, annotation reasons, and cell
+order. A mismatch means the finalized artifact does not faithfully represent
+the recorded computation.
 
-```text
-notebooks(action="finalize")
-```
+The finalized artifact is `<base>-<run_id>-finalized.nb`. A failed attempt
+can be retried: its artifact is kept as
+`<base>-<run_id>-finalized-failed-<n>.nb` and every attempt is listed in the
+ledger. A file at the artifact path that this run did not produce is never
+overwritten.
 
-This saves the notebook to disk, opens it in the offscreen front end, runs
-`NotebookEvaluate[nb, InsertResults -> True]`, and saves the result. The
-notebook on disk is then a self-contained document a human can open in
-Mathematica and see exactly what was computed.
+A successful finalization **seals** the run, durably in the ledger: no further
+scientific or narrative cells are accepted, and a second finalize is refused.
+Close the notebook, or call `stop_recording`, to release the recorder and use
+the kernel normally again.
 
 ## Parallel work
 
@@ -377,29 +446,14 @@ created here.
 
 ## Checking the record
 
-Do not judge a replay by page count and a success flag.
-
-Against a reference notebook:
-
 ```text
-notebooks(action="verify", path="/path/to/original.nb")
+notebooks(action="verify", path="/path/to/original.nb")   # against a reference
+notebooks(action="verify")                                  # self-consistency
 ```
 
-checks output shape and label behavior. It does **not** prove scientific
-correctness or value equality.
-
-Without a reference:
-
-```text
-notebooks(action="verify")
-```
-
-checks the record's own label consistency where the server is the author.
-
-For mathematical divergence, use explicit fingerprints chosen for the object:
-`Length`/`LeafCount` are useful tripwires for transparent expressions but can be
-misleading across serialization or opaque heads. Use `ByteCount` when
-appropriate.
+Neither proves scientific correctness. For mathematical divergence, use
+`Length`/`LeafCount` on transparent expressions and `ByteCount` on opaque
+ones (pitfall 7).
 
 ## Exporting for a human
 
@@ -433,12 +487,13 @@ Before a serious replay:
 For a from-scratch computation:
 
 ```text
-1. notebooks(action="create", ..., record=True) to start a recording notebook
-2. evaluate("Chapter Title", style="Chapter") for structure
-3. evaluate(code) for computation - every call is recorded
-4. write_cell/edit_cells are BLOCKED on the recording notebook
-5. notebooks(action="save") to persist the record
-6. notebooks(action="finalize") to re-run with native In/Out labels
+1. start from a fresh kernel if the record must stand on its own
+2. notebooks(action="create", ..., path=..., record=True)
+3. evaluate(code) - every call is recorded as a cell
+4. notebooks(action="save")
+5. notebooks(action="finalize") - while the recorder is still active;
+   re-evaluates in a fresh kernel, then verifies against the ledger
+6. notebooks(action="close") - releases the sealed recorder
 ```
 
 For the observed failure modes behind these rules, read

@@ -131,6 +131,16 @@ def _fail(error: str, **extra: Any) -> CallToolResult:
     return _reply({"success": False, "error": error, **extra})
 
 
+def _refuse_while_recording(what: str) -> CallToolResult | None:
+    """Refuse a tool that could run code or change kernel state behind the recorder."""
+    if get_headless_notebooks().has_active_recorder:
+        return _fail(
+            f"{what} is blocked during integrity recording: it would run code or "
+            "change kernel state the recorder cannot see. Use evaluate(), or "
+            "finalize and stop the recording first.")
+    return None
+
+
 # --- evaluation ------------------------------------------------------------
 
 @server.tool(
@@ -140,17 +150,77 @@ def _fail(error: str, **extra: Any) -> CallToolResult:
         "all its definitions survive, so you can retry a smaller piece.\n"
         "When recording is active, every call is written into the recording "
         "notebook. Pass style to control the cell style: 'Input' (default), "
-        "'Chapter', 'Section', 'Subsection', 'Item', etc. A non-Input style "
-        "is useful for structuring the recorded notebook with section headers "
-        "that still go through the kernel."
+        "'Chapter', 'Section', 'Subsection', 'Item', etc. Narrative styles "
+        "(Title, Section, Text, Item, etc.) write notebook structure but skip "
+        "scientific execution - no ledger record is created."
     )
 )
 def evaluate(code: str, timeout: float = 60.0,
              style: str = "Input") -> dict[str, Any]:
     nb = get_headless_notebooks()
+    with nb.recording_transaction():
+        return _evaluate_inner(nb, code, timeout, style)
+
+
+def _evaluate_inner(nb, code: str, timeout: float, style: str) -> dict[str, Any]:
     rec = nb.record_input(code, style=style)
-    result = evaluate_text(code, timeout=timeout)
-    notice = session.take_kernel_change_notice()
+
+    if nb.has_active_recorder:
+        if isinstance(rec, dict) and rec.get("scientific") is False:
+            return _reply({
+                "success": True,
+                "output": f"[{style} cell written to recording notebook]",
+                "scientific": False,
+                "style": style,
+                "recorded": True,
+            })
+
+        verified = (isinstance(rec, dict)
+                    and rec.get("success") is True
+                    and rec.get("pre_dispatch_verified") is True
+                    and rec.get("seq") is not None)
+        if not verified:
+            error = (rec.get("error", "unknown recording failure")
+                     if isinstance(rec, dict) else "recording returned no result")
+            fault = nb.recording_fault()
+            return _fail(
+                f"recording integrity: {error}",
+                recording_error=error,
+                record_tag=rec.get("record_tag") if isinstance(rec, dict) else None,
+                **({"recording_faulted": True, "recording_fault": fault} if fault else {}),
+            )
+
+    rec_seq = rec.get("seq") if isinstance(rec, dict) else None
+    try:
+        result = evaluate_text(code, timeout=timeout)
+        notice = session.take_kernel_change_notice()
+
+        # Kernel verification - computed once, used by both payload and recorder
+        kernel_verdict: str | None = None
+        kernel_detail = ""
+        if not result.success and result.timed_out:
+            kernel_verdict, kernel_detail = session.verify_current_kernel()
+    except Exception as exc:
+        if rec_seq is None:
+            raise
+        # The record is durable and the code may have run, but nothing says
+        # how it ended. Latch that instead of inventing an outcome.
+        fault = nb.fault_recording(
+            "POST_DISPATCH", f"outcome of seq {rec_seq} unknown: {exc!r}")
+        return _fail(f"evaluation outcome unknown: {exc!r}", outcome_unknown=True,
+                     record_seq=rec_seq, recording_faulted=True, recording_fault=fault)
+
+    # Post-eval recording: store disposition axes and verify notebook integrity
+    if rec_seq is not None:
+        outcome = nb.record_outcome(rec_seq, result, notice, kernel_verdict)
+        if outcome and isinstance(rec, dict):
+            rec["disposition"] = outcome.get("disposition")
+            rec["post_eval_verification"] = outcome.get(
+                "post_eval_verification")
+            if outcome.get("recording_faulted"):
+                rec["recording_faulted"] = True
+                rec["recording_fault"] = outcome.get("recording_fault")
+
     if not result.success:
         payload: dict[str, Any] = {
             "success": False,
@@ -162,16 +232,13 @@ def evaluate(code: str, timeout: float = 60.0,
             payload["kernel_replaced"] = True
             payload["kernel_notice"] = notice
         if result.timed_out:
-            # Ask the kernel rather than inferring from aborted_cleanly, which
-            # only ever meant "the evaluation released the lock".
-            verdict, detail = session.verify_current_kernel()
-            payload["kernel"] = verdict
+            payload["kernel"] = kernel_verdict
             payload["kernel_state"] = {
-                "alive": "intact -- the kernel answered a probe after the abort",
-                "dead": f"LOST -- the kernel did not survive ({detail}); every definition is gone",
-                "unverified": f"unverified -- no answer to a probe ({detail}); do not assume it survived",
+                "alive": "intact - the kernel answered a probe after the abort",
+                "dead": f"LOST - the kernel did not survive ({kernel_detail}); every definition is gone",
+                "unverified": f"unverified - no answer to a probe ({kernel_detail}); do not assume it survived",
                 "none": "no kernel is running",
-            }[verdict]
+            }[kernel_verdict]
             payload["next_step"] = (
                 "Retry with a smaller input, a larger timeout, or wrap the slow part "
                 "in TimeConstrained. Variables from earlier calls are still defined."
@@ -182,19 +249,15 @@ def evaluate(code: str, timeout: float = 60.0,
             payload["messages"] = result.messages
         if rec is not None:
             payload["recorded"] = rec.get("success", False)
+            if rec.get("recording_faulted"):
+                payload["recording_faulted"] = True
+                payload["recording_fault"] = rec.get("recording_fault")
         payload.update(result.extra)
         return _reply(payload)
 
     text, truncated = _truncate(result.text)
     payload: dict[str, Any] = {"success": True, "output": text}
     if result.abort_requested_during:
-        # An abort was asked for and a value came back regardless. Whether an
-        # out-of-band abort unwinds the whole expression or only the innermost
-        # one is version-dependent -- measured, 15.0.1 unwinds and 14.0.0 leaves
-        # the enclosing CompoundExpression to continue -- so this result may be
-        # the tail of a computation whose earlier part was cut off. Saying so is
-        # the whole point: a partial execution reported as a clean success is
-        # indistinguishable from a real answer.
         payload["abort_requested_during"] = True
         payload["result_may_be_partial"] = True
         payload["note"] = (
@@ -205,16 +268,11 @@ def evaluate(code: str, timeout: float = 60.0,
             "if the value matters, and check any state it assigned."
         )
     if notice:
-        # The case that matters: a SUCCESSFUL call against a kernel that was
-        # silently swapped underneath it. Without this the reply is
-        # indistinguishable from one against the session you thought you had.
         payload["kernel_replaced"] = True
         payload["kernel_notice"] = notice
     if truncated:
         payload["truncated"] = True
         payload["note"] = "Full value is still in the kernel; ask for a part of it."
-    # Messages and Print output are the difference between a wrong answer you
-    # can explain and one you cannot. Always surface them.
     if result.prints:
         payload["printed"] = result.prints
     if result.messages:
@@ -222,6 +280,9 @@ def evaluate(code: str, timeout: float = 60.0,
         payload["message_names"] = sorted({m["name"] for m in result.messages if m.get("name")})
     if rec is not None:
         payload["recorded"] = rec.get("success", False)
+        if rec.get("recording_faulted"):
+            payload["recording_faulted"] = True
+            payload["recording_fault"] = rec.get("recording_fault")
     flags = [k for k in ("truncated", "kernel_replaced", "result_may_be_partial")
              if payload.get(k)]
     if result.messages:
@@ -267,6 +328,10 @@ def kernel(
     action: Literal["state", "restart", "stop", "abort", "subkernels",
                     "close_subkernels", "reap"] = "state",
 ) -> dict[str, Any]:
+    if action in ("restart", "stop", "close_subkernels"):
+        refused = _refuse_while_recording(f"kernel {action}")
+        if refused:
+            return refused
     if action == "state":
         return _reply({"success": True, **session.kernel_status()})
     if action == "stop":
@@ -320,10 +385,15 @@ def status() -> dict[str, Any]:
         "Notebook sessions over .nb files on disk. actions: open(path) | create(title,path) "
         "| list | info | save(path) | close | dependencies | record | stop_recording "
         "| finalize.\n"
-        "record: start recording every evaluate() call as an Input cell into this "
-        "notebook. Pass record=True with create or open to start recording immediately. "
-        "stop_recording: stop recording. finalize: save the notebook and run "
-        "NotebookEvaluate on it so every cell gets native In[n]/Out[n] labels.\n"
+        "record: start integrity recording of every evaluate() call into this "
+        "notebook (needs a disk path, no existing Input/Code cells, and the direct "
+        "kernel). Pass record=True with create or open to start immediately. While "
+        "recording, tools that would run code outside evaluate() are refused. "
+        "finalize: while recording, re-run the notebook in a fresh kernel, check it "
+        "against the recorder ledger and seal the run; otherwise save and run "
+        "NotebookEvaluate so every cell gets native In[n]/Out[n] labels. "
+        "stop_recording and close are refused before finalization (force=True "
+        "abandons the run); close after finalization releases the recorder.\n"
         "'dependencies' reports every file the notebook reads or writes, COMMENTED "
         "CELLS INCLUDED, and classifies each one: EXTERNAL_INPUT (must exist first), "
         "ROUND_TRIP (written then read back - never skip the write), "
@@ -341,6 +411,7 @@ def notebooks(
     title: str = "Untitled",
     notebook: str | None = None,
     record: bool = False,
+    force: bool = False,
 ) -> dict[str, Any]:
     nb = get_headless_notebooks()
     if action == "open":
@@ -348,8 +419,11 @@ def notebooks(
             return _fail("open requires a path")
         result = nb.open(path)
         if record and result.get("success"):
-            nb.start_recording(result.get("id"))
-            result["recording"] = True
+            rec_result = nb.start_recording(result.get("id"))
+            result["recording"] = rec_result.get("success", False)
+            if not result["recording"]:
+                result["recording_error"] = rec_result.get("error",
+                                                           "start_recording failed")
         return _reply(result)
     if action == "dependencies":
         # Run this BEFORE evaluating an unfamiliar notebook. A cell that loads
@@ -367,8 +441,11 @@ def notebooks(
     if action == "create":
         result = nb.create(title=title, path=path)
         if record and result.get("success"):
-            nb.start_recording(result.get("id"))
-            result["recording"] = True
+            rec_result = nb.start_recording(result.get("id"))
+            result["recording"] = rec_result.get("success", False)
+            if not result["recording"]:
+                result["recording_error"] = rec_result.get("error",
+                                                           "start_recording failed")
         return _reply(result)
     if action == "list":
         result = nb.list()
@@ -381,14 +458,22 @@ def notebooks(
     if action == "save":
         return _reply(nb.save(notebook, path))
     if action == "close":
-        if nb.recording == nb._resolve(notebook):
-            nb.stop_recording()
         return _reply(nb.close(notebook))
     if action == "record":
         return _reply(nb.start_recording(notebook))
     if action == "stop_recording":
-        return _reply(nb.stop_recording())
+        return _reply(nb.stop_recording(force=force))
     if action == "finalize":
+        if nb.has_active_recorder:
+            if notebook:
+                target = nb._resolve(notebook)
+                if target is None:
+                    return _fail(f"notebook {notebook!r} not found")
+                if target != nb.recording:
+                    return _fail(
+                        f"notebook {notebook} is not the recording target; "
+                        f"the active recording is on {nb.recording}")
+            return _reply(nb.finalize_recording(timeout=600))
         return _reply(nb.finalize(notebook=notebook, timeout=600))
     return _fail(f"unknown action: {action}")
 
@@ -573,6 +658,9 @@ def evaluate_cells(
     notebook: str | None = None,
 ) -> dict[str, Any]:
     nb = get_headless_notebooks()
+    refused = _refuse_while_recording("evaluate_cells")
+    if refused:
+        return refused
     if index is not None:
         if write_outputs:
             # index=N used to route to a separate single-cell path that never
@@ -680,6 +768,9 @@ def render(
             tex_math=tex_math, paper=paper, fit_width=fit_width))
 
     if action == "expression":
+        refused = _refuse_while_recording("render expression")
+        if refused:
+            return refused
         if not code:
             return _fail("expression requires code")
         out = render_mod.render_expression(code, dpi=dpi)
@@ -721,6 +812,11 @@ def vars(
     include_system: bool = False,
     full: bool = False,
 ) -> dict[str, Any]:
+    if action in ("get", "set", "clear", "clear_all"):
+        # get is included: it evaluates whatever it is given as the name.
+        refused = _refuse_while_recording(f"vars {action}")
+        if refused:
+            return refused
     if action == "list":
         ctx = '"Global`*"' if not include_system else '"System`*"'
         if pattern:
@@ -910,6 +1006,10 @@ def replay(
     from .replay_manifest import ReplayManifest
 
     nb = get_headless_notebooks()
+    if action == "run":
+        refused = _refuse_while_recording("replay run")
+        if refused:
+            return refused
 
     if action == "list":
         path = nb.session_path(notebook)
@@ -1025,32 +1125,39 @@ def supervisor(
             payload["error"] = f"not stopped: {info.detail}"
         return _reply(payload)
 
-    if action == "use":
-        try:
-            evaluator = use_supervisor(socket_path)
-        except SupervisorUnavailable as exc:
-            return _fail(str(exc))
-        stranded = getattr(evaluator, "stranded_notebooks", [])
-        payload = {
-            "success": True, "backend_in_use": evaluator.name,
-            "socket": evaluator.socket_path,
-            "note": ("Notebook execution now runs in the supervisor's kernel. "
-                     "evaluate() and vars() still use this process's own kernel, "
-                     "so the two hold different definitions."),
-        }
-        if stranded:
-            # A notebook lives in the kernel that opened it. Saying so here is
-            # the difference between a caller reopening it and a caller reading
-            # "no such session" later and not knowing why.
-            payload["stranded_notebooks"] = stranded
-            payload["action_required"] = (
-                f"{len(stranded)} notebook(s) were opened in the previous kernel and "
-                "are not reachable from this one. Reopen them before using them.")
-        return _reply(payload)
+    if action in ("use", "use_direct"):
+        # Held across check and switch, so a recording cannot start in between
+        # and then find its evaluations running in another kernel.
+        with get_headless_notebooks().recording_transaction():
+            refused = _refuse_while_recording(f"supervisor {action}")
+            if refused:
+                return refused
+            if action == "use":
+                try:
+                    evaluator = use_supervisor(socket_path)
+                except SupervisorUnavailable as exc:
+                    return _fail(str(exc))
+                stranded = getattr(evaluator, "stranded_notebooks", [])
+                payload = {
+                    "success": True, "backend_in_use": evaluator.name,
+                    "socket": evaluator.socket_path,
+                    "note": ("Notebook execution now runs in the supervisor's kernel. "
+                             "evaluate() and vars() still use this process's own kernel, "
+                             "so the two hold different definitions."),
+                }
+                if stranded:
+                    # A notebook lives in the kernel that opened it. Saying so here is
+                    # the difference between a caller reopening it and a caller reading
+                    # "no such session" later and not knowing why.
+                    payload["stranded_notebooks"] = stranded
+                    payload["action_required"] = (
+                        f"{len(stranded)} notebook(s) were opened in the previous kernel and "
+                        "are not reachable from this one. Reopen them before using them.")
+                return _reply(payload)
 
-    if action == "use_direct":
-        return _reply({"success": True, "backend_in_use": use_own().name,
-                       "note": "Notebook execution is back in this process's kernel."})
+            if action == "use_direct":
+                return _reply({"success": True, "backend_in_use": use_own().name,
+                               "note": "Notebook execution is back in this process's kernel."})
 
     if action in ("running", "abort"):
         # abort() and kernel(action="abort") reach THIS process's kernel. When
@@ -1192,6 +1299,9 @@ def read_notebook_file(
 )
 def verify_derivation(steps: list[str], timeout: float = 120.0,
                       assumptions: str = "") -> dict[str, Any]:
+    refused = _refuse_while_recording("verify_derivation")
+    if refused:
+        return refused
     if len(steps) < 2:
         return _fail("give at least two steps to compare")
     checks: list[dict[str, Any]] = []
