@@ -32,11 +32,13 @@ flowchart TB
     F["WolframNB<br/><i>offscreen front end</i>"]
     M[("replay manifest<br/><i>on disk</i>")]
     LED[("supervisor ledger<br/><i>on disk</i>")]
+    REC[("recorder ledger<br/><i>on disk</i>")]
 
     A <-->|"MCP / stdio"| S
     S --> N
     N --> EV
     N --> M
+    N --> REC
     EV --> D
     EV --> SUP
     D --> L
@@ -104,9 +106,9 @@ run to a sidecar manifest before the first child is submitted. That manifest is
 owned by the notebook layer, because the supervisor should not need to
 understand notebook ordinals or cell-source digests.
 
-## Three records, three questions
+## Four records, four questions
 
-A reconnecting client may need information from three places:
+A reconnecting client may need information from four places:
 
 ```text
 replay manifest
@@ -114,6 +116,10 @@ replay manifest
 
 supervisor ledger
     What execution was actually accepted, and what became of it?
+
+recorder ledger
+    What source was written, what disposition did each cell get,
+    and was the notebook verified before and after?
 
 current notebook session / file
     What source and output are present now?

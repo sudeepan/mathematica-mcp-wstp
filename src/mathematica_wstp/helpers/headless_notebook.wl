@@ -33,7 +33,7 @@ MCPEvaluateInput::usage = "MCPEvaluateInput[id, ordinal, timeout, writeOutputs, 
 MCPFileDependencies::usage = "MCPFileDependencies[id] reports every file a notebook reads or writes, including from commented cells.";
 MCPInputDigests::usage = "MCPInputDigests[id] hashes the stored boxes of every input cell, by ordinal.";
 MCPOutputProvenance::usage = "MCPOutputProvenance[id] reports which replay child wrote each output cell.";
-MCPWriteCell::usage = "MCPWriteCell[id, content, style, position, anchor] inserts a cell.";
+MCPWriteCell::usage = "MCPWriteCell[id, content, style, position, anchor, recordTag, evaluatable] inserts a cell. recordTag and evaluatable (\"True\" | \"False\" | \"\") are optional; a non-empty evaluatable stamps Evaluatable on the cell.";
 MCPDeleteCell::usage = "MCPDeleteCell[id, index] removes a cell.";
 MCPReplaceCell::usage = "MCPReplaceCell[id, index, content] replaces one cell's content, keeping its style and options.";
 MCPSave::usage = "MCPSave[id, path] writes the session's notebook expression to disk.";
@@ -47,6 +47,8 @@ MCPVerifyAgainst::usage = "MCPVerifyAgainst[id, refPath] compares the session's 
 MCPExportMarkdown::usage = "MCPExportMarkdown[id, path, texMath] writes the session notebook as all-text Markdown (no rasterised outputs).";
 MCPExportNotebook::usage = "MCPExportNotebook[id, path, openGroups] writes the session notebook through the front end (PDF, PNG, ...).";
 MCPFrontEndAvailable::usage = "MCPFrontEndAvailable[] reports whether a headless front end can be started.";
+MCPAnnotateCell::usage = "MCPAnnotateCell[id, index, evaluatable, reason] sets Evaluatable and stamps an annotation reason on a cell.";
+MCPReadBack::usage = "MCPReadBack[id] reads all cells with full metadata: source digest, TaggingRules, Evaluatable, CellTags.";
 MCPFinalize::usage = "MCPFinalize[id, path] saves, then runs NotebookEvaluate via UsingFrontEnd so cells get native In[n]/Out[n] labels.";
 MCPBindNotebookDirectory::usage = "MCPBindNotebookDirectory[dir, path] makes NotebookDirectory[] and friends resolve without a front end.";
 
@@ -939,10 +941,35 @@ MCPFindDefining[id_String, symbol_String] :=
 (* ------------------------------------------------------------------------ *)
 
 MCPWriteCell[id_String, content_String, style_String, position_String, anchor_Integer] :=
-  sessionOr[id, Module[{nb, pos, newCell, cells, at, updated},
+  MCPWriteCell[id, content, style, position, anchor, ""];
+
+MCPWriteCell[id_String, content_String, style_String, position_String, anchor_Integer, recordTag_String] :=
+  MCPWriteCell[id, content, style, position, anchor, recordTag, ""];
+
+(* Heading and prose cells hold plain text, the way the front end stores a
+   Section or Text cell typed by hand. Written as BoxData, their text was
+   typeset as code, in the code font. *)
+$textCellStyles = {"Title", "Subtitle", "Subsubtitle", "Chapter", "Subchapter",
+  "Section", "Subsection", "Subsubsection", "Subsubsubsection", "Text",
+  "Item", "ItemNumbered", "ItemParagraph", "Subitem", "SubitemNumbered",
+  "SubitemParagraph", "Subsubitem", "SubsubitemNumbered", "SubsubitemParagraph"};
+
+cellContent[content_String, style_String] :=
+  If[MemberQ[$textCellStyles, style], content, BoxData[content]];
+cellContent[content_String, _] := BoxData[content];
+
+(* The recorder stamps Evaluatable on every cell it writes (True for Input/Code,
+   False for narrative) so replay never depends on stylesheet defaults, and so
+   read-back can check the flag exactly instead of inferring it from style. *)
+MCPWriteCell[id_String, content_String, style_String, position_String, anchor_Integer, recordTag_String, evaluatable_String] :=
+  sessionOr[id, Module[{nb, pos, newCell, cells, at, updated, opts},
     nb = $Sessions[id, "nb"];
     pos = leafPositions[nb];
-    newCell = Cell[BoxData[content], style];
+    opts = Join[
+      If[recordTag === "", {}, {TaggingRules -> {"MCPRecordTag" -> recordTag}}],
+      Switch[evaluatable, "True", {Evaluatable -> True}, "False", {Evaluatable -> False}, _, {}]
+    ];
+    newCell = Cell[cellContent[content, style], style, Sequence @@ opts];
     (* Insertion only rewrites the TOP-LEVEL cell list. Splicing into a nested
        CellGroupData would need the group's own position and is deliberately
        not attempted: silently putting a cell in the wrong group is worse than
@@ -959,7 +986,11 @@ MCPWriteCell[id_String, content_String, style_String, position_String, anchor_In
     updated = Insert[cells, newCell, at + 1];
     setNotebook[id, ReplacePart[nb, 1 -> updated]];
     $Sessions[id, "dirty"] = True;
-    ok[<|"id" -> id, "inserted_at" -> at, "cell_count" -> Length[leafPositions[$Sessions[id, "nb"]]]|>]
+    ok[<|"id" -> id, "inserted_at" -> at,
+        "record_tag" -> recordTag,
+        "raw_digest" -> Hash[content, "SHA256", "HexString"],
+        "canonical_digest" -> Hash[canonText[content], "SHA256", "HexString"],
+        "cell_count" -> Length[leafPositions[$Sessions[id, "nb"]]]|>]
   ]];
 
 (* Replacing a cell's CONTENT, leaving its position, style and options alone.
@@ -988,7 +1019,7 @@ MCPReplaceCell[id_String, index_Integer, content_String] :=
     ];
     style = If[Length[target] >= 2, target[[2]], "Input"];
     options = If[Length[target] >= 3, Drop[List @@ target, 2], {}];
-    replacement = Cell[BoxData[content], style, Sequence @@ options];
+    replacement = Cell[cellContent[content, style], style, Sequence @@ options];
     setNotebook[id, ReplacePart[nb, pos[[index + 1]] -> replacement]];
     $Sessions[id, "dirty"] = True;
     ok[<|"id" -> id, "replaced" -> index, "style" -> ToString[style],
@@ -1148,6 +1179,22 @@ mdHeading[style_String] := Switch[style,
    StringJoin over the leaf strings is not enough either -- it renders a
    subscripted gamma and a squared Gamma as "gm" and "G2", losing exactly the
    structure a reader needs. *)
+(* Canonical text for recorder fingerprints. The front end rewrites character
+   escapes when it saves a notebook (\[Element] becomes the glyph itself), so a
+   fingerprint of the raw text changes on every save although the code does
+   not. Decoding every escape to its character first gives the same text
+   before and after a save. An escape that does not name a character is kept
+   as written, so nothing unknown is ever guessed. *)
+decodeNamedChar[name_String] := Module[{c},
+  c = Quiet[Check[ToExpression["\"\\[" <> name <> "]\"", InputForm], $Failed]];
+  If[StringQ[c] && StringLength[c] === 1, c, "\\[" <> name <> "]"]
+];
+canonText[s_String] := StringReplace[s, {
+  RegularExpression["\\\\\\[([A-Za-z0-9]+)\\]"] :> decodeNamedChar["$1"],
+  RegularExpression["\\\\:([0-9a-fA-F]{4})"] :> FromCharacterCode[FromDigits["$1", 16]],
+  RegularExpression["\\\\\\|([0-9a-fA-F]{6})"] :> FromCharacterCode[FromDigits["$1", 16]]
+}];
+
 boxText[str_String] := str;
 boxText[RowBox[l_List]] := StringJoin[boxText /@ l];
 boxText[SubscriptBox[a_, b_]] := "Subscript[" <> boxText[a] <> ", " <> boxText[b] <> "]";
@@ -1743,6 +1790,92 @@ MCPFinalize[id_String, path_String] := Module[
   ], {FrontEndObject::notavail}]
 ];
 
+
+(* ------------------------------------------------------------------------ *)
+(* Annotation: set Evaluatable and stamp a reason on a cell                 *)
+(* ------------------------------------------------------------------------ *)
+
+(* The recorder marks cells non-evaluatable after abort, timeout, or failure
+   so that NotebookEvaluate skips them during finalization. The reason is
+   stamped in TaggingRules so MCPReadBack can report it. *)
+
+MCPAnnotateCell[id_String, index_Integer, evaluatable : (True | False), reason_String] :=
+  sessionOr[id, Module[{nb, pos, target, args, opts, tr, newTr, newOpts, replacement},
+    nb = $Sessions[id, "nb"];
+    pos = leafPositions[nb];
+    If[index < 0 || index >= Length[pos],
+      Return[err["Cell index out of range", <|"index" -> index, "total" -> Length[pos]|>]]
+    ];
+    target = Extract[nb, pos[[index + 1]]];
+    If[Head[target] =!= Cell, Return[err["Not a cell"]]];
+    args = List @@ target;
+    If[Length[args] < 2 || !StringQ[args[[2]]], Return[err["malformed cell"]]];
+    opts = Drop[args, 2];
+    (* Update TaggingRules: preserve existing, add/replace MCPAnnotationReason *)
+    tr = FirstCase[opts, (TaggingRules -> v_) :> v, {}];
+    newTr = Prepend[
+      DeleteCases[Flatten[{tr}], ("MCPAnnotationReason" -> _)],
+      "MCPAnnotationReason" -> reason];
+    newOpts = Join[
+      DeleteCases[opts, (TaggingRules -> _) | (Evaluatable -> _)],
+      {TaggingRules -> newTr, Evaluatable -> evaluatable}];
+    replacement = Cell @@ Join[{args[[1]], args[[2]]}, newOpts];
+    setNotebook[id, ReplacePart[nb, pos[[index + 1]] -> replacement]];
+    $Sessions[id, "dirty"] = True;
+    ok[<|"id" -> id, "annotated" -> index, "evaluatable" -> evaluatable,
+        "reason" -> reason,
+        "cell_count" -> Length[leafPositions[$Sessions[id, "nb"]]]|>]
+  ]];
+
+(* ------------------------------------------------------------------------ *)
+(* Read-back: full cell metadata for recorder verification                  *)
+(* ------------------------------------------------------------------------ *)
+
+(* MCPCells reports style, executable, and a preview. The recorder needs more:
+   the source digest (same pipeline as MCPInputDigests / boxText), the
+   TaggingRules that carry the record identity, and the Evaluatable option
+   that controls whether NotebookEvaluate will skip a cell.
+
+   This is a verification tool, not a display tool. It returns every cell so
+   the recorder can detect injections, deletions, and reorderings by comparing
+   the full sequence against the durable ledger. *)
+
+MCPReadBack[id_String] :=
+  sessionOr[id, Module[{nb, pos, cells},
+    nb = $Sessions[id, "nb"];
+    pos = leafPositions[nb];
+    cells = Table[
+      Module[{c = Extract[nb, pos[[q]]], args, opts, tr, ev, ct, src, digest, tag, replayTag, annoReason},
+        args = List @@ c;
+        opts = If[Length[args] > 2 && StringQ[args[[2]]], Drop[args, 2], {}];
+        tr = FirstCase[opts, (TaggingRules -> v_) :> v, {}];
+        ev = FirstCase[opts, (Evaluatable -> v_) :> v, Null];
+        ct = FirstCase[opts, (CellTags -> v_) :> v, {}];
+        tag = FirstCase[Flatten[{tr}], ("MCPRecordTag" -> v_) :> v, ""];
+        replayTag = FirstCase[Flatten[{tr}], ("MCPReplayChild" -> v_) :> v, ""];
+        annoReason = FirstCase[Flatten[{tr}], ("MCPAnnotationReason" -> v_) :> v, ""];
+        src = boxText[First[c] /. BoxData[b_] :> b];
+        digest = Hash[canonText[src], "SHA256", "HexString"];
+        <|
+          "index" -> q - 1,
+          "style" -> cellStyle[c],
+          "executable" -> executableQ[c],
+          "source_digest" -> digest,
+          "source_chars" -> StringLength[src],
+          "source_preview" -> StringTake[src, UpTo[200]],
+          "evaluatable" -> ev,
+          "record_tag" -> tag,
+          "annotation_reason" -> annoReason,
+          "replay_tag" -> replayTag,
+          "cell_tags" -> Flatten[{ct}]
+        |>
+      ],
+      {q, Length[pos]}
+    ];
+    ok[<|"id" -> id, "total" -> Length[cells], "cells" -> cells|>]
+  ]];
+
+Protect[MCPAnnotateCell, MCPReadBack];
 
 End[];
 EndPackage[];
