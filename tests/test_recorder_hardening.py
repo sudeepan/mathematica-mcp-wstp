@@ -18,6 +18,7 @@ import contextlib
 import copy
 import hashlib
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -40,6 +41,16 @@ def sha(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+# The helper fingerprints text after decoding character escapes (canonText in
+# headless_notebook.wl); this table covers the escapes the tests use.
+NAMED = {"Element": "\u2208", "Alpha": "\u03b1"}
+
+
+def canon(text: str) -> str:
+    return re.sub(r"\\\[([A-Za-z0-9]+)\]",
+                  lambda m: NAMED.get(m.group(1), m.group(0)), text)
+
+
 def cell(style: str, source: str, tag: str = "", evaluatable=None,
          reason: str = "") -> dict:
     return {"style": style, "source": source, "tag": tag,
@@ -58,6 +69,8 @@ class FakeHelper:
         self.write_transform = None
         self.drop_writes = False
         self.ignore_stamp = False
+        self.transit_transform = None
+        self.old_helper = False
         self._recorder = None
         self._scratch = 0
 
@@ -74,12 +87,16 @@ class FakeHelper:
             content, style = args[0], args[1]
             tag = args[4] if len(args) > 4 else ""
             stamp = args[5] if len(args) > 5 else ""
-            if self.write_transform:
-                content = self.write_transform(content)
+            received = self.transit_transform(content) if self.transit_transform else content
+            stored = self.write_transform(received) if self.write_transform else received
             if not self.drop_writes:
                 evaluatable = None if self.ignore_stamp else {"True": True, "False": False}.get(stamp)
-                cells.append(cell(style, content, tag, evaluatable))
-            return {"success": True, "id": notebook_id, "record_tag": tag}
+                cells.append(cell(style, stored, tag, evaluatable))
+            reply = {"success": True, "id": notebook_id, "record_tag": tag}
+            if not self.old_helper:
+                reply["raw_digest"] = sha(received)
+                reply["canonical_digest"] = sha(canon(received))
+            return reply
         if fn == "MCPReadBack":
             return {"success": True, "id": notebook_id, "total": len(cells),
                     "cells": [self._readback(i, c) for i, c in enumerate(cells)]}
@@ -89,7 +106,7 @@ class FakeHelper:
     def _readback(index: int, c: dict) -> dict:
         return {"index": index, "style": c["style"],
                 "executable": c["style"] in EXECUTABLE_STYLES,
-                "source_digest": sha(c["source"]),
+                "source_digest": sha(canon(c["source"])),
                 "source_chars": len(c["source"]),
                 "source_preview": c["source"][:200],
                 "evaluatable": c["evaluatable"],
@@ -553,7 +570,7 @@ def test_source_digest_mismatch_faults():
         r = w.rec.record_and_verify("x = 1")
         assert r["success"] is False
         assert r["error"] == "pre-dispatch verification failed: source mismatch"
-        assert r["intended_digest"] == sha("x = 1")
+        assert r["expected_digest"] == sha("x = 1")
         assert w.rec.ledger.data["fault"]["phase"] == "PRE_DISPATCH"
         assert w.rec.ledger.records == []
 
@@ -826,6 +843,42 @@ def test_start_recording_refuses_supervisor_backend():
         assert refused["success"] is False
         assert "direct kernel" in refused["error"]
         assert nb._recorder is None
+
+
+# --- character escapes ------------------------------------------------------------
+
+def test_named_character_survives_front_end_save():
+    """A front-end save that turns \[Element] into the glyph is not a change."""
+    with workspace() as w:
+        r = w.record_ok("cond = pz \\[Element] Reals && m > 0")
+        stored = w.fake.cell_with_tag(r["record_tag"])
+        assert "\\[Element]" in stored["source"]
+        stored["source"] = stored["source"].replace("\\[Element]", "∈")
+        assert w.rec._verify_full()["verified"]
+        path = os.path.join(w.dir, "fin.nb")
+        w.fake.files[path] = copy.deepcopy(w.fake.cells)
+        assert w.rec._verify_finalized(path)["verified"]
+
+
+def test_source_altered_in_transit_faults():
+    """If the kernel received different text from what was sent, nothing runs."""
+    with workspace() as w:
+        w.fake.transit_transform = lambda s: s.replace("1", "2")
+        r = w.rec.record_and_verify("x = 1")
+        assert r["success"] is False
+        assert r["error"] == "pre-dispatch verification failed: source altered in transit"
+        assert r["intended_digest"] == sha("x = 1") and r["received_digest"] == sha("x = 2")
+        assert w.rec.ledger.data["fault"]["phase"] == "PRE_DISPATCH"
+
+
+def test_helper_without_digests_faults():
+    """An older helper that returns no digests fails closed and says why."""
+    with workspace() as w:
+        w.fake.old_helper = True
+        r = w.rec.record_and_verify("x = 1")
+        assert r["success"] is False
+        assert "restart the kernel" in r["error"]
+        assert w.rec.ledger.records == []
 
 
 # --- Runner ----------------------------------------------------------------

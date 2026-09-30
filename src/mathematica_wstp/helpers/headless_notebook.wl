@@ -976,6 +976,8 @@ MCPWriteCell[id_String, content_String, style_String, position_String, anchor_In
     $Sessions[id, "dirty"] = True;
     ok[<|"id" -> id, "inserted_at" -> at,
         "record_tag" -> recordTag,
+        "raw_digest" -> Hash[content, "SHA256", "HexString"],
+        "canonical_digest" -> Hash[canonText[content], "SHA256", "HexString"],
         "cell_count" -> Length[leafPositions[$Sessions[id, "nb"]]]|>]
   ]];
 
@@ -1165,6 +1167,22 @@ mdHeading[style_String] := Switch[style,
    StringJoin over the leaf strings is not enough either -- it renders a
    subscripted gamma and a squared Gamma as "gm" and "G2", losing exactly the
    structure a reader needs. *)
+(* Canonical text for recorder fingerprints. The front end rewrites character
+   escapes when it saves a notebook (\[Element] becomes the glyph itself), so a
+   fingerprint of the raw text changes on every save although the code does
+   not. Decoding every escape to its character first gives the same text
+   before and after a save. An escape that does not name a character is kept
+   as written, so nothing unknown is ever guessed. *)
+decodeNamedChar[name_String] := Module[{c},
+  c = Quiet[Check[ToExpression["\"\\[" <> name <> "]\"", InputForm], $Failed]];
+  If[StringQ[c] && StringLength[c] === 1, c, "\\[" <> name <> "]"]
+];
+canonText[s_String] := StringReplace[s, {
+  RegularExpression["\\\\\\[([A-Za-z0-9]+)\\]"] :> decodeNamedChar["$1"],
+  RegularExpression["\\\\:([0-9a-fA-F]{4})"] :> FromCharacterCode[FromDigits["$1", 16]],
+  RegularExpression["\\\\\\|([0-9a-fA-F]{6})"] :> FromCharacterCode[FromDigits["$1", 16]]
+}];
+
 boxText[str_String] := str;
 boxText[RowBox[l_List]] := StringJoin[boxText /@ l];
 boxText[SubscriptBox[a_, b_]] := "Subscript[" <> boxText[a] <> ", " <> boxText[b] <> "]";
@@ -1825,7 +1843,7 @@ MCPReadBack[id_String] :=
         replayTag = FirstCase[Flatten[{tr}], ("MCPReplayChild" -> v_) :> v, ""];
         annoReason = FirstCase[Flatten[{tr}], ("MCPAnnotationReason" -> v_) :> v, ""];
         src = boxText[First[c] /. BoxData[b_] :> b];
-        digest = Hash[src, "SHA256", "HexString"];
+        digest = Hash[canonText[src], "SHA256", "HexString"];
         <|
           "index" -> q - 1,
           "style" -> cellStyle[c],

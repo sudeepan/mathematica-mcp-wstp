@@ -299,6 +299,25 @@ def test_state_changing_tools_blocked_while_recording():
         assert ctx.nb.has_active_recorder and not ctx.nb._recorder.is_faulted
 
 
+def test_named_characters_survive_real_save_and_finalize():
+    """Cells written with \[...] escapes finalize although the front end saves glyphs."""
+    with recording_session("named") as ctx:
+        cells = [fresh_symbol("mcpElem") + " = (pz \\[Element] Reals) && (\\[Alpha] > 0)",
+                 fresh_symbol("mcpRule") + " = {a \\[Rule] 1}"]
+        for code in cells:
+            reply = payload(server.evaluate(code))
+            assert reply["success"] and not reply.get("recording_faulted"), reply
+        saved = payload(server.notebooks(action="save"))
+        assert saved["success"], saved
+        on_disk = payload(server.read_notebook_file(path=ctx.path, mode="wolfram"))
+        text = " ".join(c["source"] for c in on_disk["code"])
+        assert "\\[Element]" not in text and "∈" in text, text
+
+        fin = payload(server.notebooks(action="finalize"))
+        assert fin["success"], fin
+        assert fin["structural_verification"]["verified"] is True, fin
+
+
 if __name__ == "__main__":
     import traceback
 

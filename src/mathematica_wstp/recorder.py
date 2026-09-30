@@ -217,14 +217,39 @@ class Recorder:
                          f"tag {tag} is not unique ({tag_count} occurrences)",
             }
 
-        if our_cell["source_digest"] != intended_digest:
+        # Two facts, both from the kernel: it received exactly the text sent
+        # (raw digest), and the read-back matches that text after character
+        # escapes are decoded (canonical digest), which is the form every
+        # later check uses, because a front-end save rewrites the escapes.
+        raw_digest = write_result.get("raw_digest")
+        expected_digest = write_result.get("canonical_digest")
+        if not raw_digest or not expected_digest:
             self._fault("PRE_DISPATCH",
-                        f"source digest mismatch: intended {intended_digest[:12]} "
+                        "cell write returned no source digests; the kernel's "
+                        "notebook helper is older than this server")
+            return {
+                "success": False,
+                "error": ("pre-dispatch verification failed: helper returned no "
+                          "digests; restart the kernel to load the current helper"),
+            }
+        if raw_digest != intended_digest:
+            self._fault("PRE_DISPATCH",
+                        f"source altered in transit: sent {intended_digest[:12]} "
+                        f"vs received {raw_digest[:12]}")
+            return {
+                "success": False,
+                "error": "pre-dispatch verification failed: source altered in transit",
+                "intended_digest": intended_digest,
+                "received_digest": raw_digest,
+            }
+        if our_cell["source_digest"] != expected_digest:
+            self._fault("PRE_DISPATCH",
+                        f"source digest mismatch: expected {expected_digest[:12]} "
                         f"vs read-back {our_cell['source_digest'][:12]}")
             return {
                 "success": False,
                 "error": "pre-dispatch verification failed: source mismatch",
-                "intended_digest": intended_digest,
+                "expected_digest": expected_digest,
                 "readback_digest": our_cell["source_digest"],
             }
 

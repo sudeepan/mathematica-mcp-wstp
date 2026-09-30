@@ -299,6 +299,11 @@ The recorder stamps the replay flag on every cell it writes:
 narrative cells. Verification checks these values exactly, so a flag that was
 flipped or removed is caught instead of being left to stylesheet defaults.
 
+Source fingerprints are taken after decoding character escapes (`\[Element]`,
+`\:2208`) to the characters themselves, because the front end writes the glyph
+when it saves a notebook. A cell written with escapes therefore still matches
+its ledger record after a save and after finalization.
+
 ### What is blocked during recording
 
 While an integrity recorder is active, every other way to run code or change
