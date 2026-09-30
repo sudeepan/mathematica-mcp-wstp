@@ -24,7 +24,7 @@ import uuid
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from mathematica_wstp import notebooks, server, session
-from mathematica_wstp.evaluator import evaluate_text
+from mathematica_wstp.evaluator import evaluate_json, evaluate_text
 
 
 def payload(result) -> dict:
@@ -354,6 +354,61 @@ def test_finalize_refuses_message_not_given_when_recorded():
             {"seq": 1, "record_tag": ctx.nb._recorder.ledger.records[0]["record_tag"],
              "messages": ["Power::infy"], "recorded": []}], fin
         assert not ctx.nb._recorder.is_sealed
+
+
+def cell_forms(path: str) -> list[list[str]]:
+    """[style, head of the content] for every cell of the notebook file on disk."""
+    escaped = path.replace("\\", "\\\\").replace('"', '\\"')
+    got = evaluate_json(f'<|"cells" -> Cases[Get["{escaped}"], '
+                        'Cell[c_, s_String, ___] :> {s, ToString[Head[c]]}, Infinity]|>',
+                        timeout=60)
+    assert got.get("success"), got
+    return got["cells"]
+
+
+def test_narrative_cells_are_stored_as_text():
+    """Headings and prose are stored as plain text, as typed; Input cells as code boxes."""
+    with recording_session("text") as ctx:
+        for text, style in [("Diagrams", "Chapter"), ("Common setup", "Section"),
+                            ("A note on the gauge choice.", "Text")]:
+            assert payload(server.evaluate(text, style=style))["success"]
+        assert payload(server.evaluate(fresh_symbol("mcpText") + " = 1"))["success"]
+        assert payload(server.notebooks(action="save"))["success"]
+        assert cell_forms(ctx.path) == [
+            ["Title", "String"], ["Chapter", "String"], ["Section", "String"],
+            ["Text", "String"], ["Input", "BoxData"]], cell_forms(ctx.path)
+
+        fin = payload(server.notebooks(action="finalize"))
+        assert fin["success"], fin
+        assert fin["structural_verification"]["verified"] is True, fin
+
+
+def test_replacing_a_heading_keeps_it_text():
+    """Replacing a heading's content keeps it plain text; an Input cell stays code."""
+    notebooks.reset_headless_notebooks()
+    tmp = tempfile.mkdtemp(prefix="rec-srv-replace-")
+    path = os.path.join(tmp, "replace.nb")
+    nb = notebooks.get_headless_notebooks()
+    nbid = None
+    try:
+        made = nb.create(title="Replace", path=path)
+        assert made["success"], made
+        nbid = made["id"]
+        assert nb.write_cell("Old heading", style="Section", notebook=nbid)["success"]
+        assert nb.write_cell("x = 1", style="Input", notebook=nbid)["success"]
+        assert nb.replace_cell(1, "New heading", notebook=nbid)["success"]
+        assert nb.replace_cell(2, "x = 2", notebook=nbid)["success"]
+        assert nb.save(notebook=nbid)["success"]
+        assert cell_forms(path) == [
+            ["Title", "String"], ["Section", "String"], ["Input", "BoxData"]], cell_forms(path)
+        with open(path) as fh:
+            assert '"New heading"' in fh.read()
+    finally:
+        with contextlib.suppress(Exception):
+            if nbid:
+                nb.close(nbid)
+        notebooks.reset_headless_notebooks()
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 if __name__ == "__main__":

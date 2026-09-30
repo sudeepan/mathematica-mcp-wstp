@@ -946,6 +946,18 @@ MCPWriteCell[id_String, content_String, style_String, position_String, anchor_In
 MCPWriteCell[id_String, content_String, style_String, position_String, anchor_Integer, recordTag_String] :=
   MCPWriteCell[id, content, style, position, anchor, recordTag, ""];
 
+(* Heading and prose cells hold plain text, the way the front end stores a
+   Section or Text cell typed by hand. Written as BoxData, their text was
+   typeset as code, in the code font. *)
+$textCellStyles = {"Title", "Subtitle", "Subsubtitle", "Chapter", "Subchapter",
+  "Section", "Subsection", "Subsubsection", "Subsubsubsection", "Text",
+  "Item", "ItemNumbered", "ItemParagraph", "Subitem", "SubitemNumbered",
+  "SubitemParagraph", "Subsubitem", "SubsubitemNumbered", "SubsubitemParagraph"};
+
+cellContent[content_String, style_String] :=
+  If[MemberQ[$textCellStyles, style], content, BoxData[content]];
+cellContent[content_String, _] := BoxData[content];
+
 (* The recorder stamps Evaluatable on every cell it writes (True for Input/Code,
    False for narrative) so replay never depends on stylesheet defaults, and so
    read-back can check the flag exactly instead of inferring it from style. *)
@@ -957,7 +969,7 @@ MCPWriteCell[id_String, content_String, style_String, position_String, anchor_In
       If[recordTag === "", {}, {TaggingRules -> {"MCPRecordTag" -> recordTag}}],
       Switch[evaluatable, "True", {Evaluatable -> True}, "False", {Evaluatable -> False}, _, {}]
     ];
-    newCell = Cell[BoxData[content], style, Sequence @@ opts];
+    newCell = Cell[cellContent[content, style], style, Sequence @@ opts];
     (* Insertion only rewrites the TOP-LEVEL cell list. Splicing into a nested
        CellGroupData would need the group's own position and is deliberately
        not attempted: silently putting a cell in the wrong group is worse than
@@ -1007,7 +1019,7 @@ MCPReplaceCell[id_String, index_Integer, content_String] :=
     ];
     style = If[Length[target] >= 2, target[[2]], "Input"];
     options = If[Length[target] >= 3, Drop[List @@ target, 2], {}];
-    replacement = Cell[BoxData[content], style, Sequence @@ options];
+    replacement = Cell[cellContent[content, style], style, Sequence @@ options];
     setNotebook[id, ReplacePart[nb, pos[[index + 1]] -> replacement]];
     $Sessions[id, "dirty"] = True;
     ok[<|"id" -> id, "replaced" -> index, "style" -> ToString[style],
