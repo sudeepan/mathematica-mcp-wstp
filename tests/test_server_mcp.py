@@ -345,6 +345,13 @@ async def run_checks() -> list[tuple[str, bool, str]]:
             r = _payload(await sess.call_tool("evaluate", {"code": "marker"}))
             check("restart really cleared state",
                   r.get("output", "").strip() == "marker", str(r))
+            check("the first evaluate after a restart says the kernel is fresh",
+                  r.get("fresh_kernel") is True
+                  and "Nothing from before it started" in r.get("fresh_kernel_note", ""),
+                  str(r)[:300])
+            r = _payload(await sess.call_tool("evaluate", {"code": "1 + 1"}))
+            check("the next evaluate in the same kernel does not",
+                  "fresh_kernel" not in r, str(r)[:200])
 
     return out
 

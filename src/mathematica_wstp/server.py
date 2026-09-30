@@ -162,6 +162,27 @@ def evaluate(code: str, timeout: float = 60.0,
         return _evaluate_inner(nb, code, timeout, style)
 
 
+# Kernel generation the previous evaluate() ran in. A kernel restarted by
+# another tool, or a server restarted by the client, gives the caller no other
+# sign that every earlier definition is gone.
+_last_evaluate_generation = 0
+
+
+def _fresh_kernel_note() -> str | None:
+    """A note when this is the first evaluate() in the current direct kernel."""
+    global _last_evaluate_generation
+    from .evaluator import get_evaluator
+    if get_evaluator().name != "direct":
+        return None
+    gen = session.generation()
+    if gen == _last_evaluate_generation:
+        return None
+    _last_evaluate_generation = gen
+    return (f"First evaluate() in this kernel (generation {gen} of this server "
+            "process). Nothing from before it started is defined here: load "
+            "packages before using their symbols.")
+
+
 def _evaluate_inner(nb, code: str, timeout: float, style: str) -> dict[str, Any]:
     rec = nb.record_input(code, style=style)
 
@@ -194,6 +215,7 @@ def _evaluate_inner(nb, code: str, timeout: float, style: str) -> dict[str, Any]
     try:
         result = evaluate_text(code, timeout=timeout)
         notice = session.take_kernel_change_notice()
+        fresh_note = _fresh_kernel_note()
 
         # Kernel verification - computed once, used by both payload and recorder
         kernel_verdict: str | None = None
@@ -231,6 +253,9 @@ def _evaluate_inner(nb, code: str, timeout: float, style: str) -> dict[str, Any]
         if notice:
             payload["kernel_replaced"] = True
             payload["kernel_notice"] = notice
+        if fresh_note:
+            payload["fresh_kernel"] = True
+            payload["fresh_kernel_note"] = fresh_note
         if result.timed_out:
             payload["kernel"] = kernel_verdict
             payload["kernel_state"] = {
@@ -270,6 +295,9 @@ def _evaluate_inner(nb, code: str, timeout: float, style: str) -> dict[str, Any]
     if notice:
         payload["kernel_replaced"] = True
         payload["kernel_notice"] = notice
+    if fresh_note:
+        payload["fresh_kernel"] = True
+        payload["fresh_kernel_note"] = fresh_note
     if truncated:
         payload["truncated"] = True
         payload["note"] = "Full value is still in the kernel; ask for a part of it."
@@ -283,7 +311,8 @@ def _evaluate_inner(nb, code: str, timeout: float, style: str) -> dict[str, Any]
         if rec.get("recording_faulted"):
             payload["recording_faulted"] = True
             payload["recording_fault"] = rec.get("recording_fault")
-    flags = [k for k in ("truncated", "kernel_replaced", "result_may_be_partial")
+    flags = [k for k in ("fresh_kernel", "truncated", "kernel_replaced",
+                         "result_may_be_partial")
              if payload.get(k)]
     if result.messages:
         flags.append(f"{len(result.messages)} message(s)")

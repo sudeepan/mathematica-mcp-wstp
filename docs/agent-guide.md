@@ -48,6 +48,14 @@ in its own call: symbol names are resolved when the expression is parsed, before
 the body runs. Referring to a package symbol in the same call that loads the
 package can silently bind the wrong symbol.
 
+The first `evaluate` in a new kernel carries `fresh_kernel: true` and a
+`fresh_kernel_note`. The kernel may have been restarted by another tool, or the
+server itself restarted by the client, since your last call: nothing you defined
+before exists. The flag comes with the result, so the call that carries it has
+already run. If that call named a package symbol before the package was loaded,
+the name is now a `Global` symbol that shadows the package's; restart the kernel
+and load the package first.
+
 Ask for measurements rather than enormous expressions when possible:
 `Length`, `LeafCount`, `ByteCount`, `Short`, `Part`. `vars(action="get")` omits
 very large values unless `full=True`.
@@ -375,8 +383,16 @@ which checks nothing against the ledger.
 `notebooks(action="finalize")` copies the notebook and re-runs every cell in
 a fresh kernel via `NotebookEvaluate`, so the notebook gets native
 `In[n]`/`Out[n]` labels. Cells marked `Evaluatable -> False` (for example a
-timed-out cell) are skipped. A Wolfram message from any cell during this run
-counts as a failed finalization.
+timed-out cell) are skipped.
+
+The ledger stores the names of the messages each cell gave when it was
+recorded. In the fresh run a cell may give those messages again: they are
+listed under `repeated_messages` and do not fail finalization. Any other
+message fails it, and `unexpected_messages` names the cell (`seq`,
+`record_tag`) and the message. A new message usually means the cell relied on
+something the fresh kernel does not have, such as a definition made before
+recording started. A message that belongs to no recorded cell, for instance
+while the notebook is opened or saved, also fails finalization.
 
 After finalization, the server opens the finalized `.nb` as a temporary
 session and runs a structural comparison against the recorder ledger:
@@ -394,6 +410,19 @@ A successful finalization **seals** the run, durably in the ledger: no further
 scientific or narrative cells are accepted, and a second finalize is refused.
 Close the notebook, or call `stop_recording`, to release the recorder and use
 the kernel normally again.
+
+### What the finalized notebook shows
+
+The recording notebook holds only the input cells. The output cells of the
+finalized notebook are written by the fresh-kernel run, and by default they
+are plain text; a plot shows as `-Graphics-`. For a typeset output, end the
+cell with `// TraditionalForm` or `// StandardForm`. Graphics need the same
+wrapper: `Plot[...] // StandardForm` puts the plot itself in the finalized
+notebook. The wrapper is part of the recorded cell, so add it when you
+evaluate the cell; it cannot be added afterwards.
+
+The `evaluate` reply is `InputForm` text either way, so for a wrapped cell it
+shows box markup (`FractionBox[...]`) instead of the plain value.
 
 ## Parallel work
 

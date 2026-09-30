@@ -881,6 +881,87 @@ def test_helper_without_digests_faults():
         assert w.rec.ledger.records == []
 
 
+def record_with_messages(w: Workspace, code: str, names: list[str]) -> dict:
+    r = w.rec.record_and_verify(code)
+    assert r.get("success") and r.get("pre_dispatch_verified"), r
+    outcome = w.rec.apply_outcome(r["seq"], dict(COMPLETED), message_names=names)
+    assert not outcome["recording_faulted"], outcome
+    return r
+
+
+def fresh_run(messages: list, labels: list) -> dict:
+    return {"success": True, "finalized": True,
+            "messages": messages, "labels": labels}
+
+
+def test_outcome_stores_message_names():
+    """Message names are stored once each, without the symbol's context."""
+    with workspace() as w:
+        r = record_with_messages(w, "N[Sin[10^30], 20]",
+                                 ["N::meprec", "MyPackage`f::x", "N::meprec"])
+        assert w.rec.ledger.record_by_seq(r["seq"])["message_names"] == [
+            "N::meprec", "f::x"]
+
+
+def test_finalize_accepts_messages_seen_at_record_time():
+    """A cell that gave a message when recorded may give it again at finalization."""
+    with workspace() as w:
+        a = record_with_messages(w, "y = 1/0", ["Power::infy"])
+        b = record_with_messages(w, "z = 3", [])
+        run = fresh_run([["cells", 7, "Power::infy"]],
+                        [[7, a["record_tag"]], [8, b["record_tag"]]])
+        with fresh_kernel_stub(run):
+            fin = w.rec.finalize(timeout=5)
+        assert fin["success"], fin
+        assert fin["repeated_messages"] == [
+            {"seq": a["seq"], "record_tag": a["record_tag"], "messages": ["Power::infy"]}]
+        assert w.rec.is_sealed
+
+
+def test_finalize_refuses_new_message():
+    """A message a cell did not give when recorded fails finalization, and says where."""
+    with workspace() as w:
+        a = record_with_messages(w, "y = 1/0", ["Power::infy"])
+        b = record_with_messages(w, "z = 3", [])
+        run = fresh_run([["cells", 1, "Power::infy"], ["cells", 2, "Part::partw"]],
+                        [[1, a["record_tag"]], [2, b["record_tag"]]])
+        with fresh_kernel_stub(run):
+            fin = w.rec.finalize(timeout=5)
+        assert fin["success"] is False and "not seen when the cells were recorded" in fin["error"]
+        assert fin["unexpected_messages"] == [
+            {"seq": b["seq"], "record_tag": b["record_tag"],
+             "messages": ["Part::partw"], "recorded": []}]
+        assert not w.rec.is_sealed
+        assert w.rec.ledger.data["finalization"]["success"] is False
+        with fresh_kernel_stub():
+            assert w.rec.finalize(timeout=5)["success"]
+
+
+def test_finalize_refuses_message_outside_recorded_cells():
+    """A message while opening or saving the notebook belongs to no cell and fails."""
+    with workspace() as w:
+        a = record_with_messages(w, "y = 1/0", ["Power::infy"])
+        for phase, line in (("save", 1), ("cells", 99)):
+            run = fresh_run([[phase, line, "Power::infy"]], [[1, a["record_tag"]]])
+            with fresh_kernel_stub(run):
+                fin = w.rec.finalize(timeout=5)
+            assert fin["success"] is False, (phase, fin)
+            assert fin["unexpected_messages"][0]["issue"] == "not_from_a_recorded_cell"
+        assert not w.rec.is_sealed
+
+
+def test_record_without_message_names_tolerates_no_message():
+    """A record stored without message names (an older ledger) tolerates none."""
+    with workspace() as w:
+        r = w.record_ok("y = 1/0")
+        assert "message_names" not in w.rec.ledger.record_by_seq(r["seq"])
+        run = fresh_run([["cells", 1, "Power::infy"]], [[1, r["record_tag"]]])
+        with fresh_kernel_stub(run):
+            fin = w.rec.finalize(timeout=5)
+        assert fin["success"] is False
+        assert fin["unexpected_messages"][0]["messages"] == ["Power::infy"]
+
+
 # --- Runner ----------------------------------------------------------------
 
 if __name__ == "__main__":

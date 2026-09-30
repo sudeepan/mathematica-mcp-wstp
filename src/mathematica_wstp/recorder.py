@@ -307,19 +307,29 @@ class Recorder:
             "notebook_cell_count": readback["total"],
         }
 
-    def apply_outcome(self, seq: int, disposition: dict[str, str]
+    def apply_outcome(self, seq: int, disposition: dict[str, str],
+                      message_names: list[str] | None = None
                       ) -> dict[str, Any]:
         """Store the raw disposition axes for a record, then verify post-eval.
 
         When the execution outcome is not COMPLETED, the cell is automatically
         annotated as non-evaluatable so finalization will not re-run it.
 
+        message_names are the Wolfram messages the evaluation emitted. They
+        are stored with the record so finalization can tell a message the
+        cell already gave from a new one. A record stored without them
+        tolerates no message at finalization.
+
         A post-eval verification failure faults the recorder: the execution
         outcome is preserved (it already happened) but no further science
         is permitted.
         """
-        self.ledger.update_record(seq, disposition=disposition,
-                                  disposition_at=time.time())
+        fields: dict[str, Any] = {"disposition": disposition,
+                                  "disposition_at": time.time()}
+        if message_names is not None:
+            fields["message_names"] = sorted({_short_message_name(n)
+                                              for n in message_names})
+        self.ledger.update_record(seq, **fields)
 
         annotation = self._auto_annotate(seq, disposition)
 
@@ -483,6 +493,21 @@ class Recorder:
                 eval_result["run_id"] = self.run_id
                 return eval_result
 
+            unexpected, repeated = self._compare_messages(eval_result)
+            if unexpected:
+                error = ("the fresh-kernel run gave messages that were not seen "
+                         "when the cells were recorded")
+                self._record_finalization(finalized_path, success=False,
+                                          error=f"{error}: {unexpected}")
+                return {
+                    "success": False,
+                    "error": error,
+                    "unexpected_messages": unexpected,
+                    "recording_path": nb_path,
+                    "finalized_path": finalized_path,
+                    "run_id": self.run_id,
+                }
+
             structural = self._verify_finalized(finalized_path)
         except Exception as exc:
             self._record_finalization(finalized_path, success=False, error=repr(exc))
@@ -501,10 +526,49 @@ class Recorder:
             "finalized_path": finalized_path,
             "run_id": self.run_id,
             "sealed": self.is_sealed,
+            **({"repeated_messages": repeated} if repeated else {}),
             **({"previous_attempt_preserved_as": preserved} if preserved else {}),
             **({"error": "post-finalization structural verification failed"}
                if not overall_success else {}),
         }
+
+    def _compare_messages(self, eval_result: dict[str, Any]
+                          ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Match the fresh-kernel run's messages against the recorded ones.
+
+        Each message is attributed to a cell through the In[n] label that
+        NotebookEvaluate gave the cell. A message is expected only when the
+        same cell gave it at record time. One that cannot be attributed to a
+        recorded cell (while opening or saving the notebook, say) is never
+        expected. Returns (unexpected, repeated), both per cell.
+        """
+        line_tag = {entry[0]: entry[1] for entry in eval_result.get("labels", [])
+                    if isinstance(entry, list) and len(entry) == 2 and entry[1]}
+        by_tag: dict[str | None, set[str]] = {}
+        for phase, line, name in eval_result.get("messages", []):
+            tag = line_tag.get(line) if phase == "cells" else None
+            by_tag.setdefault(tag, set()).add(_short_message_name(name))
+
+        unexpected: list[dict[str, Any]] = []
+        repeated: list[dict[str, Any]] = []
+        for tag, names in by_tag.items():
+            record = self.ledger.record_by_tag(tag) if tag else None
+            if record is None:
+                unexpected.append({"record_tag": tag, "messages": sorted(names),
+                                   "issue": "not_from_a_recorded_cell"})
+                continue
+            allowed = set(record.get("message_names", []))
+            new = names - allowed
+            if new:
+                unexpected.append({"seq": record["seq"], "record_tag": tag,
+                                   "messages": sorted(new),
+                                   "recorded": sorted(allowed)})
+            else:
+                repeated.append({"seq": record["seq"], "record_tag": tag,
+                                 "messages": sorted(names)})
+        unexpected.sort(key=lambda u: u.get("seq", 0))
+        repeated.sort(key=lambda r: r["seq"])
+        return unexpected, repeated
 
     def _verify_finalized(self, finalized_path: str) -> dict[str, Any]:
         """Open the finalized .nb as a temporary session and verify structure.
@@ -831,6 +895,11 @@ def _evaluate_in_fresh_kernel(nb_path: str, timeout: int = 600
 
     Cells with Evaluatable->False are skipped by NotebookEvaluate. The
     prototype kernel is never touched.
+
+    Every message the run gives is logged with the phase ("open", "cells",
+    "save") and $Line, and "labels" pairs each cell's In[n] with its record
+    tag, so the caller can tell which cell gave which message. Asking the
+    front end for EvaluationCell[] instead deadlocks inside NotebookEvaluate.
     """
     from .kernel import Kernel, KernelError
 
@@ -842,28 +911,36 @@ def _evaluate_in_fresh_kernel(nb_path: str, timeout: int = 600
                 "error": f"could not start finalization kernel: {exc}"}
 
     escaped = nb_path.replace("\\", "\\\\").replace('"', '\\"')
-    code = (
-        'Module[{nbo, evalResult, ok = True, detail = ""},'
-        '  Quiet[Check['
-        f'    UsingFrontEnd['
-        f'      nbo = NotebookOpen["{escaped}", Visible -> False];'
-        '      If[Head[nbo] =!= NotebookObject,'
-        '        ok = False; detail = "NotebookOpen failed";,'
-        '        evalResult = NotebookEvaluate[nbo, InsertResults -> True];'
-        '        NotebookSave[nbo];'
-        '        NotebookClose[nbo]'
-        '      ]'
-        '    ],'
-        '    ok = False; detail = ToString[$MessageList]'
-        '  ], {FrontEndObject::notavail}];'
-        '  <|"success" -> ok, "detail" -> detail|>'
-        ']'
-    )
+    code = """
+Module[{nbo, ok = True, detail = "", phase = "open", log = {}, labels = {}, h},
+  h[Hold[Message[MessageName[s_, t_String, ___], ___], True]] :=
+    AppendTo[log, {phase, $Line, SymbolName[Unevaluated[s]] <> "::" <> t}];
+  h[_] := Null;
+  Quiet[Internal`HandlerBlock[{"Message", h},
+    UsingFrontEnd[
+      nbo = NotebookOpen["__PATH__", Visible -> False];
+      If[Head[nbo] =!= NotebookObject,
+        ok = False; detail = "NotebookOpen failed",
+        phase = "cells";
+        NotebookEvaluate[nbo, InsertResults -> True];
+        phase = "save";
+        labels = Cases[NotebookGet[nbo], Cell[_, "Input" | "Code", opts___] :> {
+            FirstCase[StringCases[FirstCase[{opts}, HoldPattern[CellLabel -> l_String] :> l, ""],
+              "In[" ~~ d : DigitCharacter .. ~~ "]" :> FromDigits[d]], _Integer, 0],
+            FirstCase[{opts}, HoldPattern[TaggingRules -> tr_] :>
+              FirstCase[Normal[tr], ("MCPRecordTag" -> v_String) :> v, ""], ""]}, Infinity];
+        NotebookSave[nbo];
+        NotebookClose[nbo]]]],
+    {FrontEndObject::notavail}];
+  <|"success" -> ok, "detail" -> detail, "messages" -> log, "labels" -> labels|>]
+""".replace("__PATH__", escaped)
 
     try:
         result = temp_kernel.evaluate_json(code, timeout=float(timeout))
         if isinstance(result, dict) and result.get("success"):
-            return {"success": True, "finalized": True}
+            return {"success": True, "finalized": True,
+                    "messages": result.get("messages", []),
+                    "labels": result.get("labels", [])}
         detail = result.get("detail", "") if isinstance(result, dict) else str(result)
         return {"success": False, "error": f"NotebookEvaluate: {detail}"}
     except Exception as exc:
@@ -889,6 +966,12 @@ def _annotation_reason(disposition: dict[str, str]) -> str:
     if readiness in ("FAULTED", "RESTARTED"):
         parts.append(f"kernel {readiness.lower()}")
     return "; ".join(parts)
+
+
+def _short_message_name(name: str) -> str:
+    """'MyPackage`f::fail' -> 'f::fail'; the two kernels print contexts differently."""
+    symbol, sep, tag = name.partition("::")
+    return symbol.rsplit("`", 1)[-1] + sep + tag
 
 
 def extract_disposition(result: Any, kernel_notice: str | None,

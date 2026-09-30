@@ -318,6 +318,44 @@ def test_named_characters_survive_real_save_and_finalize():
         assert fin["structural_verification"]["verified"] is True, fin
 
 
+def test_finalize_accepts_messages_given_when_recorded():
+    """Cells that gave messages when recorded finalize when they give the same again."""
+    with recording_session("msgs") as ctx:
+        infy = payload(server.evaluate(fresh_symbol("mcpInfy") + " = 1/0"))
+        assert infy.get("message_names") == ["Power::infy"], infy
+        part = payload(server.evaluate("{1, 2}[[5]]"))
+        assert part.get("message_names") == ["Part::partw"], part
+        clean = payload(server.evaluate(fresh_symbol("mcpClean") + " = 3"))
+        assert clean["success"] and not clean.get("messages"), clean
+        records = ctx.nb._recorder.ledger.records
+        assert [r["message_names"] for r in records] == [
+            ["Power::infy"], ["Part::partw"], []], records
+        assert payload(server.notebooks(action="save"))["success"]
+
+        fin = payload(server.notebooks(action="finalize"))
+        assert fin["success"], fin
+        assert fin["structural_verification"]["verified"] is True, fin
+        assert [(m["seq"], m["messages"]) for m in fin["repeated_messages"]] == [
+            (1, ["Power::infy"]), (2, ["Part::partw"])], fin
+
+
+def test_finalize_refuses_message_not_given_when_recorded():
+    """A cell that leaned on a definition made before recording fails in the fresh kernel."""
+    warm = fresh_symbol("mcpWarm")
+    assert evaluate_text(f"{warm} = True", timeout=30).success
+    with recording_session("warm") as ctx:
+        reply = payload(server.evaluate(f"If[TrueQ[{warm}], 1, 1/0]"))
+        assert reply["success"] and not reply.get("messages"), reply
+        assert payload(server.notebooks(action="save"))["success"]
+
+        fin = payload(server.notebooks(action="finalize"))
+        assert fin["success"] is False, fin
+        assert fin["unexpected_messages"] == [
+            {"seq": 1, "record_tag": ctx.nb._recorder.ledger.records[0]["record_tag"],
+             "messages": ["Power::infy"], "recorded": []}], fin
+        assert not ctx.nb._recorder.is_sealed
+
+
 if __name__ == "__main__":
     import traceback
 

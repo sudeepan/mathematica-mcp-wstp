@@ -1240,7 +1240,10 @@ class HeadlessNotebooks:
             from .recorder import extract_disposition
             disposition = extract_disposition(result, kernel_notice,
                                              kernel_verdict)
-            return self._recorder.apply_outcome(seq, disposition)
+            names = [m["name"] for m in getattr(result, "messages", None) or []
+                     if m.get("name")]
+            return self._recorder.apply_outcome(seq, disposition,
+                                                message_names=names)
         except Exception as exc:
             logger.warning("recording outcome failed", exc_info=True)
             fault = self.fault_recording("POST_EVAL", f"unhandled exception: {exc!r}")
