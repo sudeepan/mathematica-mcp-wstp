@@ -411,6 +411,39 @@ def test_replacing_a_heading_keeps_it_text():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_finalized_prints_and_outputs_are_typeset():
+    """Print cells keep their formatting and characters; outputs are typeset."""
+    cells = ['Print[Style["bold", Bold], " ", Hyperlink["a link", "https://example.org"], '
+             '" \\[Bullet] \\[Gamma]"]',
+             fresh_symbol("mcpFrac") + " = a^2/b + Sqrt[c]",
+             "Plot[Sin[t], {t, 0, 1}]",
+             "$PrePrint = TraditionalForm;",
+             "a^2/b"]
+    try:
+        with recording_session("typeset") as ctx:
+            for code in cells:
+                assert payload(server.evaluate(code))["success"], code
+            assert payload(server.notebooks(action="save"))["success"]
+            fin = payload(server.notebooks(action="finalize"))
+            assert fin["success"], fin
+            path = fin["finalized_path"].replace("\\", "\\\\").replace('"', '\\"')
+            got = evaluate_json(
+                '<|"prints" -> Cases[Get["' + path + '"], Cell[b_, "Print", ___] :> {'
+                'ToString[Head[b]], !FreeQ[b, FontWeight -> Bold], !FreeQ[b, "HyperlinkURL"], '
+                '!FreeQ[b, s_String /; StringContainsQ[s, FromCharacterCode[{8226, 32, 947}]]]}, '
+                'Infinity], '
+                '"outputs" -> Cases[Get["' + path + '"], Cell[b_, "Output", ___] :> Which['
+                '!FreeQ[b, FormBox[_, TraditionalForm]], "TraditionalForm", '
+                '!FreeQ[b, GraphicsBox], "Graphics", '
+                'MatchQ[b, _BoxData], "StandardForm", True, ToString[Head[b]]], Infinity]|>',
+                timeout=60)
+            assert got.get("success"), got
+            assert got["prints"] == [["BoxData", True, True, True]], got
+            assert got["outputs"] == ["StandardForm", "Graphics", "TraditionalForm"], got
+    finally:
+        evaluate_text("$PrePrint =.", timeout=30)
+
+
 if __name__ == "__main__":
     import traceback
 

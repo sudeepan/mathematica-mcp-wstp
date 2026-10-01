@@ -414,15 +414,18 @@ the kernel normally again.
 ### What the finalized notebook shows
 
 The recording notebook holds only the input cells. The output cells of the
-finalized notebook are written by the fresh-kernel run, and by default they
-are plain text; a plot shows as `-Graphics-`. For a typeset output, end the
-cell with `// TraditionalForm` or `// StandardForm`. Graphics need the same
-wrapper: `Plot[...] // StandardForm` puts the plot itself in the finalized
-notebook. The wrapper is part of the recorded cell, so add it when you
-evaluate the cell; it cannot be added afterwards.
+finalized notebook are written by the fresh-kernel run, in StandardForm, as a
+desktop run shows them: expressions are typeset and a plot is a plot. Print
+cells keep their formatting (styles, links, typeset expressions) and their
+characters. For TraditionalForm, end a cell with `// TraditionalForm`, or set
+`$PrePrint = TraditionalForm` in a cell for every later output. Either is part
+of the recorded cells, so it cannot be added afterwards. Typesetting a very
+large output takes time; end such a cell with `;`.
 
-The `evaluate` reply is `InputForm` text either way, so for a wrapped cell it
-shows box markup (`FractionBox[...]`) instead of the plain value.
+The `evaluate` reply is `InputForm` text either way, so for a cell ending in
+`// TraditionalForm` it shows box markup (`FormBox[...]`) instead of the plain
+value. Printed text and message text in the reply keep their characters
+(`•`, `γ`) and are not wrapped.
 
 ## Parallel work
 

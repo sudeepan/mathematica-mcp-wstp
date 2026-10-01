@@ -916,6 +916,8 @@ Module[{nbo, ok = True, detail = "", phase = "open", log = {}, labels = {}, h},
   h[Hold[Message[MessageName[s_, t_String, ___], ___], True]] :=
     AppendTo[log, {phase, $Line, SymbolName[Unevaluated[s]] <> "::" <> t}];
   h[_] := Null;
+  SetOptions[#, FormatType -> StandardForm, CharacterEncoding -> "Unicode",
+    PageWidth -> Infinity] & /@ $Output;
   Quiet[Internal`HandlerBlock[{"Message", h},
     UsingFrontEnd[
       nbo = NotebookOpen["__PATH__", Visible -> False];

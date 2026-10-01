@@ -49,6 +49,11 @@ logger = logging.getLogger("mathematica_wstp.kernel")
 DEFAULT_TIMEOUT = 60.0
 ACTIVATE_TIMEOUT = 45.0
 
+_TEXT_STREAM_SETUP = (
+    'SetOptions[#, CharacterEncoding -> "Unicode", PageWidth -> Infinity] & /@ '
+    'Join[$Output, $Messages]; 1'
+)
+
 
 class KernelError(RuntimeError):
     pass
@@ -237,6 +242,18 @@ class Kernel:
                 f"({exc}); refusing to report it ready, because a kernel that has "
                 "not completed a round trip cannot be interrupted"
             ) from exc
+
+        # Print output and message text are rendered by the kernel through
+        # $Output and $Messages, whose defaults suit a terminal: UTF-8 bytes
+        # sent as characters, so a bullet arrived here as "â€¢", and lines
+        # wrapped at 78 columns with ">" continuation marks. "Unicode" sends
+        # the characters themselves. A kernel that misses this still works, so
+        # failing it is logged rather than fatal.
+        try:
+            self._raw_eval(_TEXT_STREAM_SETUP, timeout=min(30.0, timeout))
+        except Exception:
+            logger.warning("kernel %s: could not set up its text streams", self.pid,
+                           exc_info=True)
 
         logger.info("kernel up: pid=%s pgid=%s link=%s", self.pid, self.pgid, linkname)
         return self

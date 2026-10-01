@@ -131,6 +131,26 @@ def test_messages_and_prints_are_kept_apart():
         assert [m["name"] for m in reply.messages] == ["Part::partw"], reply.messages
 
 
+def test_printed_and_message_text_keep_their_characters():
+    """Print and message text arrive as characters, not as their UTF-8 bytes."""
+    with Kernel() as k:
+        reply = k.evaluate_detailed(
+            'General::mcpenc = "gamma \\[Gamma] `1`"; '
+            'Print["bullet \\[Bullet] e-acute \\[EAcute]"]; '
+            'Message[General::mcpenc, "\\[Alpha]"]')
+        assert reply.prints == ["bullet • e-acute é"], reply.prints
+        assert [m["text"] for m in reply.messages] == [
+            "General::mcpenc: gamma γ α"], reply.messages
+
+
+def test_long_printed_lines_are_not_wrapped():
+    """A long Print line arrives whole, not cut at 78 columns with '>' marks."""
+    with Kernel() as k:
+        reply = k.evaluate_detailed(
+            'Print[StringRiffle[Table["word" <> ToString[i], {i, 30}], " "]]')
+        assert reply.prints == [" ".join(f"word{i}" for i in range(1, 31))], reply.prints
+
+
 def test_clean_evaluation_reports_nothing_extra():
     with Kernel() as k:
         reply = k.evaluate_detailed("2+2")

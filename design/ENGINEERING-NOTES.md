@@ -71,28 +71,13 @@ blocks. Two limits, both measured and both deliberate:
   Pagination itself is fine — 994 synthetic cells render to 31 pages.
   See [measurements §10](design/measurements.md).
 
-## Where this lives
-
-This tree sits on the container's **overlay** filesystem, not on the host mount
-(`/workspace/Claude_EFT` <- `/run/host_mark/home`, which is where the other git
-repos on this machine live). Two consequences:
-
-- It is not visible from the host, so it cannot be committed from there until it
-  is copied across. 740 KB without `.venv`.
-- Container-local storage is not the place for the only copy of anything.
-
-```bash
-cp -a /home/node/Softwares/Mathematica-MCP-WSTP /workspace/Claude_EFT/
-rm -rf /workspace/Claude_EFT/Mathematica-MCP-WSTP/.venv   # rebuild on the host
-```
-
 ## Install
 
 ```bash
-cd /home/node/Softwares/Mathematica-MCP-WSTP
+cd mathematica-mcp-wstp
 uv venv --python 3.12 .venv
 uv pip install --python .venv/bin/python -e .      # brings in mcp, adds the entry point
-claude mcp add --scope user mathematica-wstp -- /home/node/Softwares/Mathematica-MCP-WSTP/.venv/bin/mathematica-wstp
+claude mcp add --scope user mathematica-wstp -- "$PWD/.venv/bin/mathematica-wstp"
 ```
 
 `--scope user` is not optional. `claude mcp add` defaults to `--scope local`,
@@ -147,7 +132,10 @@ Three things here are load-bearing and were each found the hard way:
   uses `WSPutUTF8String` instead.
 - **`ExportString` returns encoded bytes rendered as characters**, so text with
   non-ASCII arrives as mojibake regardless of `CharacterEncoding`. Use
-  `ExportByteArray` and decode once, in Python.
+  `ExportByteArray` and decode once, in Python. `Print` and message text come
+  through the `$Output` and `$Messages` streams with the same mojibake, but
+  there the stream option works: `Kernel.start` sets `CharacterEncoding ->
+  "Unicode"` (and `PageWidth -> Infinity`) on both.
 - **An aborted evaluation still sends its `$Aborted`.** If nobody reads it, it
   is handed to the next caller as their result. `Kernel.abort` drains it when no
   other thread is positioned to.
