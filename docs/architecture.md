@@ -160,6 +160,37 @@ its execution identity can remain.
 
 `STILL_RUNNING` is therefore a normal reconciliation state, not a failure.
 
+## Recording and finalization
+
+Recording is the third kind of record: a notebook built from `evaluate` calls,
+where each call is checked into the notebook before it runs.
+
+```text
+evaluate(code)
+    write the cell (tagged, Evaluatable -> True)
+    read it back; compare its fingerprint with the source sent
+    append to the recorder ledger, on disk
+    verify every ledger entry against the notebook, both ways
+    run the code
+    store how it ended and which messages it gave; verify again
+
+notebooks(action="finalize")
+    save; copy to <name>-<run_id>-finalized.nb
+    re-run the copy in a fresh kernel (NotebookEvaluate under the front end)
+    fail on any message a cell did not give when recorded
+    compare the copy's cells with the ledger
+    seal the run in the ledger
+```
+
+Any check that fails latches a fault in the ledger, and a faulted run accepts no
+further science and cannot be finalized. The ledger, not the notebook, is the
+authority for what was recorded: a notebook edited outside the recorder no
+longer matches it, and verification says where.
+
+The fresh-kernel run is the one place where the front end drives evaluation. It
+runs in its own kernel, which is discarded afterwards, so the session's kernel
+never hands its evaluation to the front end.
+
 ## Direct versus supervised ownership
 
 The evaluator seam supports two ownership arrangements.
@@ -243,6 +274,7 @@ evaluation stopped merely because the waiting RPC disappeared.
 The architecture therefore tries to make each important claim checkable at a
 boundary owned by a different component.
 
-That is the reason for the manifest, ledger, output binding, link liveness,
-process census and notebook verification. They are not independent features;
-they are different applications of the same rule.
+That is the reason for the manifest, the ledgers, output binding, link
+liveness, process census, notebook verification and fresh-kernel finalization.
+They are not independent features; they are different applications of the same
+rule.

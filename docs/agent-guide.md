@@ -17,7 +17,7 @@ with 276 executable cells and a 20-way `LaunchKernels[]` fan-out. They establish
 that the mechanisms are real; they are not generic expectations for every
 notebook.
 
-## The five objects you need to keep separate
+## The six objects you need to keep separate
 
 **Kernel.** The persistent Wolfram process holding definitions and package state.
 
@@ -32,6 +32,11 @@ to run and what has happened so far.
 
 **Saved notebook.** The `.nb` file after an explicit save. Session-resident
 outputs are not automatically file-resident outputs.
+
+**Recorder ledger.** The durable record of an integrity recording: one entry per
+recorded cell, written before the cell runs, with its source fingerprint and how
+its evaluation ended. It sits in `.mcp-recordings/` next to the notebook, unless
+`MATHEMATICA_WSTP_RECORDING_DIR` names another directory.
 
 Confusing any two of these is the source of several observed failure modes.
 
@@ -83,6 +88,10 @@ document.
 
 For exactly the jobs where it matters what survived, prefer `replay` over
 `evaluate_cells`.
+
+To build a new notebook from `evaluate` calls, with every call recorded and the
+result re-run in a fresh kernel, see
+[Recording every evaluation into a notebook](#recording-every-evaluation-into-a-notebook).
 
 ## Choose direct or supervisor ownership before opening a notebook
 
@@ -298,8 +307,8 @@ evaluate("GraphGen[1]")
 
 Only `Input` and `Code` are accepted as scientific styles. Narrative styles
 (Title, Subtitle, Section, Subsection, Subsubsection, Text, Item,
-ItemNumbered, ItemParagraph) write notebook structure but **skip scientific
-execution entirely**. No ledger record is created, so the scientific ledger
+ItemNumbered, ItemParagraph) write notebook structure, as plain text in the
+style's own font, but **skip scientific execution entirely**. No ledger record is created, so the scientific ledger
 contains only cells that actually computed. Any other style is rejected.
 
 The recorder stamps the replay flag on every cell it writes:

@@ -1,5 +1,5 @@
-import sys, time
-sys.path.insert(0,"/tmp/claude-1000/-home-node-Softwares-Mathematica-MCP-WSTP/a5839c1e-76a0-4b7a-a5e4-c969bf1b5823/scratchpad")
+import os, sys, time
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from wstp_client import K
 def codes(s): return "{" + ",".join(str(ord(c)) for c in s) + "}"
 k = K(); print("pid", k.ev('$ProcessID'), flush=True)

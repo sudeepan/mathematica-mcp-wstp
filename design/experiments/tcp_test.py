@@ -1,5 +1,5 @@
-import ctypes, sys
-sys.path.insert(0,"/tmp/claude-1000/-home-node-Softwares-Mathematica-MCP-WSTP/a5839c1e-76a0-4b7a-a5e4-c969bf1b5823/scratchpad")
+import ctypes, os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import wstp_client as W
 w = W.w
 env = w.WSInitialize(None)

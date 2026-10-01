@@ -6,7 +6,7 @@
 
 **Auditable execution for agent-driven symbolic computation in Mathematica.**
 
-An agent can always *ask* a computer algebra system for an answer. The harder problem is to figure out what actually happened: which cell ran, in which kernel, whether an interrupt came from the user or the code itself, whether an output followed from this run or another one, and whether work survived when the client disappeared. Afterall, an agent's own report of what it did is not hard evidence for what actually transpired. Which has to do with the fact that all generative models can, and do lie.
+An agent can always *ask* a computer algebra system for an answer. The harder problem is to figure out what actually happened: which cell ran, in which kernel, whether an interrupt came from the user or the code itself, whether an output followed from this run or another one, and whether work survived when the client disappeared. After all, an agent's own report of what it did is not hard evidence for what actually transpired. Which has to do with the fact that all generative models can, and do lie.
 
 This server is built around that problem.
 
@@ -122,6 +122,8 @@ There are three levels to keep apart.
 2. **A notebook replay record.** `replay` runs executable cells one at a time, giving each one an identity and recording the plan in a durable manifest before execution begins.
 3. **Optional supervisor ownership.** The default server owns its kernel. With the supervisor selected, a separate process owns it, so a client can disappear while the computation continues.
 
+Alongside these, **integrity recording** turns a session of `evaluate` calls into a notebook that is checked against a ledger and re-run in a fresh kernel; see [Recording a computation](#recording-a-computation).
+
 A few terms appear throughout the documentation:
 
 - **ordinal**: the *nth* `Input` or `Code` cell, counting only executable cells. It is stable when output cells are inserted or deleted; raw notebook indices are not.
@@ -130,6 +132,7 @@ A few terms appear throughout the documentation:
 - **idempotency key**: a stable key for an intended child execution, so a reconnecting client can refer to the existing work rather than accidentally creating a duplicate.
 - **reconcile**: inspect a previous replay after interruption and distinguish completed, still-running, never-submitted, changed-source, and output-state cases.
 - **backend**: the component that owns execution: either this process's direct kernel or the separate supervisor-owned kernel.
+- **recorder ledger**: the on-disk record of a recording: one entry per recorded cell, with its source fingerprint and how its evaluation ended.
 
 The distinction between **ordinal** and **index** matters immediately. Evaluating an input can insert an output cell, shifting every later index. "The seventh input cell" remains the seventh input cell.
 
@@ -148,6 +151,23 @@ A replay provides:
 
 With the supervisor selected, reconciliation also survives loss of the client that originally submitted the work. The original MCP call does **not** survive a client/session exit; the scientific computation can. A new client asks the ledger what happened by durable key and continues from there.
 
+## Recording a computation
+
+When a calculation is built up through `evaluate` calls rather than replayed from an existing notebook, recording keeps the evidence:
+
+```text
+notebooks(action="create", path="calc.nb", record=True)
+evaluate("<< MyPackage`")          # each call becomes a cell in calc.nb
+evaluate("result = ...")
+notebooks(action="save")
+notebooks(action="finalize")       # re-run in a fresh kernel, check, seal
+notebooks(action="close")
+```
+
+Every recorded cell is written to the notebook, read back, fingerprinted and entered in the recorder ledger before its code runs. While recording, every other way to change kernel state is refused, and any failed check stops the run rather than letting an unverifiable cell through. `finalize` copies the notebook, re-runs it in a fresh kernel, compares the copy with the ledger, and fails if a cell gives a message it did not give when recorded, which usually means it leaned on something defined outside the record. A successful finalization seals the run. The finalized notebook shows typeset outputs and formatted `Print` cells, as a desktop run would.
+
+The details are in [`docs/agent-guide.md`](docs/agent-guide.md#recording-every-evaluation-into-a-notebook).
+
 ## Why use WSTP
 
 WSTP provides an evaluation channel and a separate out-of-band message channel. That lets the server interrupt a kernel that is currently busy without destroying the kernel merely to regain control.
@@ -159,7 +179,7 @@ That gives four practical properties:
 - **Keep process ownership explicit.** Subkernels are tracked and can be closed without throwing away the master kernel's definitions.
 - **Observe control separately from scientific output.** The execution layer can record that a user requested an abort even when Wolfram code catches that interrupt and returns a normal value.
 
-The architecture and its two channels are described in[`docs/architecture.md`](docs/architecture.md).
+The architecture and its two channels are described in [`docs/architecture.md`](docs/architecture.md).
 
 ## Quick start
 
@@ -188,7 +208,8 @@ The installation, kernel and WSTP library are discovered automatically, includin
 ```text
 evaluate("Integrate[Sqrt[1 + x^4], x]", timeout=10)
 => timed_out: true
-   kernel_state: "intact, the evaluation was aborted rather than the kernel"
+   kernel: "alive"
+   kernel_state: "intact - the kernel answered a probe after the abort"
 ```
 
 **"Replay this notebook so I can resume if something interrupts us."**
@@ -261,7 +282,7 @@ Sixteen consolidated tools rather than a wide flat surface:
 | `abort`              | Interrupt the running evaluation, keeping all state          |
 | `kernel`             | `state`, `restart`, `stop`, `abort`, `subkernels`, `close_subkernels`, `reap` |
 | `status`             | Kernel, installation and tracked-process health              |
-| `notebooks`          | `open`, `create`, `list`, `info`, `save`, `close`, `dependencies`, `verify` |
+| `notebooks`          | `open`, `create`, `list`, `info`, `save`, `close`, `dependencies`, `verify`, `record`, `stop_recording`, `finalize` |
 | `cells`              | List or read cells of an open notebook                       |
 | `evaluate_cells`     | Replay a span of cells, state carrying between them          |
 | `replay`             | Per-cell replay with identity and a resumable manifest       |
@@ -288,7 +309,7 @@ Run Wolfram's own MCP server alongside it and use `WolframLanguageContext` for q
 
 | Document                                                     | Start here when...                                           |
 | ------------------------------------------------------------ | ------------------------------------------------------------ |
-| [`docs/agent-guide.md`](docs/agent-guide.md)                 | You want to drive the server correctly and efficiently       |
+| [`docs/agent-guide.md`](docs/agent-guide.md)                 | You want to drive the server correctly and efficiently, or record a computation |
 | [`docs/replaying-a-notebook.md`](docs/replaying-a-notebook.md) | You are replaying a notebook or onboarding a fresh agent     |
 | [`docs/long-running-work.md`](docs/long-running-work.md)     | A cell may run for hours/days or must survive a dropped client |
 | [`docs/architecture.md`](docs/architecture.md)               | You want the execution, replay and supervisor model          |

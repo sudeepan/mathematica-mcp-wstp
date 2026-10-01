@@ -1,6 +1,6 @@
 """Does WSTP report a kernel that died mid-evaluation, or hang like wolframclient?"""
 import ctypes, time, os, signal, subprocess, sys
-exec(open("/tmp/claude-1000/-home-node-Softwares-Mathematica-MCP-WSTP/a5839c1e-76a0-4b7a-a5e4-c969bf1b5823/scratchpad/wstp_abort_test.py").read().split('env = w.WSInitialize')[0])
+exec(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "wstp_abort_test.py")).read().split('env = w.WSInitialize')[0])
 
 env = w.WSInitialize(None)
 err = ctypes.c_int(0)

@@ -50,6 +50,10 @@ Once the supervisor is selected, `evaluate`, `vars`, notebook replay and the
 rest of the execution surface use the supervisor's kernel. There is one
 scientific state, not a hidden direct copy and a supervised copy.
 
+Integrity recording (`record=True`) uses the direct kernel only: it is refused
+while the supervisor is selected, and switching backend is refused while a
+recording is active.
+
 ## What survives a client/session exit
 
 | | survives the client dying |

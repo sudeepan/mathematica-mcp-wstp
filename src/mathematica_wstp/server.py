@@ -1441,7 +1441,12 @@ _GUIDE: dict[str, str] = {
         "running:false, generation:0 -- 'not started', not 'broken'. The orphans "
         "list is a machine-wide census that includes other sessions' live kernels; "
         "check owner_alive before calling anything abandoned.\n"
-        "read_notebook_file() reads a .nb without opening a session."
+        "read_notebook_file() reads a .nb without opening a session.\n"
+        "To build a notebook from evaluate() calls with an audit trail: "
+        "notebooks(action='create', path=..., record=True), evaluate as usual, then "
+        "save and finalize, which re-runs the notebook in a fresh kernel, checks it "
+        "against the recorder ledger and seals it. While recording, other ways to run "
+        "code are refused; docs/agent-guide.md has the details."
     ),
     "state": (
         "The kernel is persistent and shared: everything you define stays until the "
@@ -1489,7 +1494,8 @@ _GUIDE: dict[str, str] = {
         "accept the missing content (not recommended). It is their document.\n"
         "render() drives a headless front end for typeset images. It RENDERS STORED "
         "CONTENT: rasterising a cell shows what is in the file, not what you just "
-        "computed -- evaluating cells never writes results back into the document. "
+        "computed -- evaluating cells writes results back into the document only "
+        "with evaluate_cells(write_outputs=True). "
         "For a fresh result use render(action='expression') on the live value.\n"
         "{Length, LeafCount} is a cheap fingerprint for spotting divergence between "
         "runs, with two traps: a value that has been through a serialise/deserialise "

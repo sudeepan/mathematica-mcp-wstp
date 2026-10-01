@@ -1,7 +1,7 @@
 # Mathematica-MCP-WSTP
 
-Design work for a WSTP-based replacement of the kernel transport in the
-Mathematica MCP server (`../Mathematica-MCP-Mod`, `../Mathematica-MCP-Sud`).
+Design work for a WSTP-based replacement of the kernel transport in an earlier,
+socket-based Mathematica MCP server.
 
 This directory is the design record: the architecture, the measurements behind
 it, and the throwaway experiments that produced them. **The server described

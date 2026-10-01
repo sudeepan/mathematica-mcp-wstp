@@ -64,12 +64,12 @@ blocks. Two limits, both measured and both deliberate:
 - It **renders only** — it never evaluates through the front end. Work dispatched
   that way does not run when an external WSTP client owns the kernel's main link:
   a 5.1s job had not started after 40s of link silence. See
-  [measurements §5](design/measurements.md).
+  [measurements §5](measurements.md).
 - **Export renders what is visible**, as printing from the GUI does: a collapsed
   cell group exports collapsed. A notebook with most of its groups closed
   therefore exports short. Pass `open_groups=True` for the whole document.
   Pagination itself is fine — 994 synthetic cells render to 31 pages.
-  See [measurements §10](design/measurements.md).
+  See [measurements §10](measurements.md).
 
 ## Install
 

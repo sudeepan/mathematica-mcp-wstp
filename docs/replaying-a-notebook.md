@@ -67,8 +67,10 @@ That preserves notebook fidelity and keeps a replay's execution count meaningful
 {
   "output": "{1, 2}[[5]]",
   "messages": [
-    {"name": "Part::partw", "text": "Part 5 of {1, 2} does not exist."}
-  ]
+    {"symbol": "Part", "tag": "partw", "name": "Part::partw",
+     "text": "Part::partw: Part 5 of {1, 2} does not exist."}
+  ],
+  "message_names": ["Part::partw"]
 }
 ```
 

@@ -59,7 +59,10 @@ in the document. Cold replay returned `0` for two terms that should have been
 non-zero. No message, no failure.
 
 **Do:** before calling a notebook reproducible, replay it in a kernel that has
-run nothing else, and compare against the warm result.
+run nothing else, and compare against the warm result. Finalizing a recording
+does this replay for you, and fails when a cell gives a message in the fresh
+kernel that it did not give when recorded. A silent zero gives no message, so
+still compare the values that matter.
 
 ## 4. `DumpSave` of a whole context shadowing a package
 
@@ -399,3 +402,19 @@ supposed to have survived. If only the file survived, say explicitly that you
 are reconstructing from saved state rather than inspecting the original live
 document. Never treat absence from a reopened file as proof that the prior
 session never contained the output.
+
+## 20. Running `NotebookEvaluate` inside the session's own kernel
+
+`NotebookEvaluate` runs another notebook by handing the kernel to the front end
+for the duration, and it can leave the kernel and its front end in a state that
+later operations trip over.
+
+Observed: a recorded cell `NotebookEvaluate["other.nb"]` was accepted and
+recorded as one cell, and its run looked fine, but finalizing the recording
+failed in 2 of 2 attempts (once at the check before finalizing, once with the
+front end not answering a save), while an identical recording without it
+finalized cleanly.
+
+**Do:** enter cells through `evaluate`, or open the other notebook with
+`notebooks(action="open")` and replay it. Finalizing a recording runs
+`NotebookEvaluate` in a fresh kernel of its own, which is the safe place for it.

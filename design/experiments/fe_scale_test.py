@@ -1,5 +1,5 @@
-import sys, time
-sys.path.insert(0,"/tmp/claude-1000/-home-node-Softwares-Mathematica-MCP-WSTP/a5839c1e-76a0-4b7a-a5e4-c969bf1b5823/scratchpad")
+import os, sys, tempfile, time
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from wstp_client import K
 import os
 NB = os.environ.get("MATHEMATICA_WSTP_TEST_NOTEBOOK", "")  # any large .nb
@@ -20,7 +20,7 @@ print("\n[C] typeset render of one real cell (headless 'screenshot')", flush=Tru
 t0=time.time()
 r3 = k.ev('UsingFrontEnd[img = Rasterize[NotebookRead[Cells[nb][[3]]], "Image", ImageResolution->96]; ImageDimensions[img]]', timeout=300)
 print(f"    cell 3 raster dims = {r3}  ({time.time()-t0:.1f}s)", flush=True)
-r3b = k.ev('UsingFrontEnd[Export["/tmp/claude-1000/-home-node-Softwares-Mathematica-MCP-WSTP/a5839c1e-76a0-4b7a-a5e4-c969bf1b5823/scratchpad/cell3.png", img]]', timeout=120)
+r3b = k.ev(f'UsingFrontEnd[Export["{os.path.join(tempfile.gettempdir(), "cell3.png")}", img]]', timeout=120)
 print(f"    exported: {r3b}", flush=True)
 
 print("\n[D] ABORT an evaluation dispatched through the front end", flush=True)
