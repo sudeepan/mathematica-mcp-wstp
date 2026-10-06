@@ -1,7 +1,7 @@
 # Runs on GitHub's machines, which have no Mathematica: every module and script
 # must compile, and the recorder suites run with the tests that need a Wolfram
-# kernel skipped. The kernel, server and supervisor suites run locally (see
-# README, Tests).
+# kernel skipped. The full suites need Mathematica and run locally before a
+# push (see docs/testing.md).
 name: tests
 
 on:
@@ -27,14 +27,6 @@ jobs:
       - name: Every module and script compiles
         run: python -W error::SyntaxWarning -m compileall -q src tests design/experiments
       - name: Recorder suites
-        run: |
-          failed=""
-          for t in foundation core annotations finalize adversarial hardening; do
-            echo "::group::test_recorder_$t"
-            python tests/test_recorder_$t.py || failed="$failed $t"
-            echo "::endgroup::"
-          done
-          if [ -n "$failed" ]; then
-            echo "::error::failed:$failed"
-            exit 1
-          fi
+        env:
+          PYTHON: python
+        run: tests/run_all.sh --no-kernel

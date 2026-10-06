@@ -317,6 +317,7 @@ Run Wolfram's own MCP server alongside it and use `WolframLanguageContext` for q
 | [`docs/architecture.md`](docs/architecture.md)               | You want the execution, replay and supervisor model          |
 | [`docs/pitfalls.md`](docs/pitfalls.md)                       | You want the observed ways a plausible result can still be wrong |
 | [`docs/benchmarks.md`](docs/benchmarks.md)                   | You want measured costs and trade-offs                       |
+| [`docs/testing.md`](docs/testing.md)                         | You want to run the tests                                    |
 
 `guide(topic=...)` carries the short form inside the server:
 `workflow · abort · errors · notebooks · state · parallel · performance`.
@@ -333,16 +334,8 @@ Run Wolfram's own MCP server alongside it and use `WolframLanguageContext` for q
 ## Tests
 
 ```bash
-python3 tests/test_kernel.py
-.venv/bin/python tests/test_server_mcp.py
-.venv/bin/python tests/test_supervisor.py
-python3 tests/test_recorder_foundation.py
-python3 tests/test_recorder_core.py
-python3 tests/test_recorder_annotations.py
-python3 tests/test_recorder_finalize.py
-python3 tests/test_recorder_adversarial.py
-python3 tests/test_recorder_hardening.py
-.venv/bin/python tests/test_recorder_server.py
+tests/run_all.sh              # every suite; needs Mathematica
+tests/run_all.sh --no-kernel  # only what runs without it
 ```
 
-GitHub Actions runs the recorder suites on every push and pull request, on a machine without Mathematica: tests that need a Wolfram kernel are skipped there, with that reason, and run here. The recorder tests use their own `__main__` runner and do not require pytest. `test_recorder_server.py` calls the server's tool functions against a live kernel, so it needs the `mcp` package. Point `MATHEMATICA_WSTP_TEST_NOTEBOOK` at any `.nb` to exercise notebook tools against a real document; those checks are skipped when it is unset.
+GitHub Actions runs the recorder suites on every push and pull request, on a machine without Mathematica: tests that need a Wolfram kernel are skipped there, with that reason. Run every suite locally before a push. [`docs/testing.md`](docs/testing.md) says what runs where, and why the full suites do not run on GitHub. The suites use their own `__main__` runners and do not require pytest. Point `MATHEMATICA_WSTP_TEST_NOTEBOOK` at any `.nb` to exercise notebook tools against a real document; those checks are skipped when it is unset.

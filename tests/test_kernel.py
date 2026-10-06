@@ -550,7 +550,10 @@ def test_the_replay_manifest_is_durable_before_the_first_cell_runs():
         found = []
         while time.time() < deadline and not found:
             if os.path.isdir(replay_dir):
-                found = [f for f in os.listdir(replay_dir) if f.endswith(".json")]
+                # Not the writer's .tmp- file: it is renamed into place, and
+                # opening it after the rename fails.
+                found = [f for f in os.listdir(replay_dir)
+                         if f.endswith(".json") and not f.startswith(".tmp-")]
             time.sleep(0.1)
         assert found, "no manifest on disk while the first cell was still running"
         assert not t.is_alive() or True

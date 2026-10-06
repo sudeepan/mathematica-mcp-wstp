@@ -720,8 +720,9 @@ def test_the_work_survives_the_death_of_the_server_that_asked_for_it():
         manifests: list[str] = []
         deadline = time.monotonic() + 90
         while time.monotonic() < deadline:
+            # Not the writer's .tmp- file, which is renamed into place.
             manifests = [os.path.join(replay_dir, f) for f in os.listdir(replay_dir)
-                         if f.endswith(".json")]
+                         if f.endswith(".json") and not f.startswith(".tmp-")]
             if manifests:
                 with open(manifests[0]) as fh:
                     children = json.load(fh)["children"]
