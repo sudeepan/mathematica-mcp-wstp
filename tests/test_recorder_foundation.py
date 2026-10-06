@@ -393,6 +393,7 @@ def test_readback_tag_survives_save():
 # --- Runner ----------------------------------------------------------------
 
 if __name__ == "__main__":
+    from wolfram_available import missing_wolfram
     import traceback
 
     pure_python = [
@@ -426,8 +427,13 @@ if __name__ == "__main__":
             print(f"  FAIL  {fn.__name__}")
             traceback.print_exc()
 
+    no_wolfram = missing_wolfram()
     print("\n=== Integration tests (MCPReadBack, tagged MCPWriteCell) ===")
     for fn in integration:
+        if no_wolfram:
+            skipped += 1
+            print(f"  SKIP  {fn.__name__} ({no_wolfram})")
+            continue
         try:
             fn()
             passed += 1

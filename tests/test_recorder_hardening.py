@@ -848,7 +848,7 @@ def test_start_recording_refuses_supervisor_backend():
 # --- character escapes ------------------------------------------------------------
 
 def test_named_character_survives_front_end_save():
-    """A front-end save that turns \[Element] into the glyph is not a change."""
+    r"""A front-end save that turns \[Element] into the glyph is not a change."""
     with workspace() as w:
         r = w.record_ok("cond = pz \\[Element] Reals && m > 0")
         stored = w.fake.cell_with_tag(r["record_tag"])

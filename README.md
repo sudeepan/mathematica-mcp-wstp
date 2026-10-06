@@ -345,4 +345,4 @@ python3 tests/test_recorder_hardening.py
 .venv/bin/python tests/test_recorder_server.py
 ```
 
-The recorder tests use their own `__main__` runner and do not require pytest. `test_recorder_server.py` calls the server's tool functions against a live kernel, so it needs the `mcp` package. Point `MATHEMATICA_WSTP_TEST_NOTEBOOK` at any `.nb` to exercise notebook tools against a real document; those checks are skipped when it is unset.
+GitHub Actions runs the recorder suites on every push and pull request, on a machine without Mathematica: tests that need a Wolfram kernel are skipped there, with that reason, and run here. The recorder tests use their own `__main__` runner and do not require pytest. `test_recorder_server.py` calls the server's tool functions against a live kernel, so it needs the `mcp` package. Point `MATHEMATICA_WSTP_TEST_NOTEBOOK` at any `.nb` to exercise notebook tools against a real document; those checks are skipped when it is unset.

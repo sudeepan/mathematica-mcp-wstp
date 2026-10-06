@@ -1,0 +1,40 @@
+# Runs on GitHub's machines, which have no Mathematica: every module and script
+# must compile, and the recorder suites run with the tests that need a Wolfram
+# kernel skipped. The kernel, server and supervisor suites run locally (see
+# README, Tests).
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  without-mathematica:
+    name: Python ${{ matrix.python }}, without Mathematica
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install
+        run: python -m pip install -e .
+      - name: Every module and script compiles
+        run: python -W error::SyntaxWarning -m compileall -q src tests design/experiments
+      - name: Recorder suites
+        run: |
+          failed=""
+          for t in foundation core annotations finalize adversarial hardening; do
+            echo "::group::test_recorder_$t"
+            python tests/test_recorder_$t.py || failed="$failed $t"
+            echo "::endgroup::"
+          done
+          if [ -n "$failed" ]; then
+            echo "::error::failed:$failed"
+            exit 1
+          fi

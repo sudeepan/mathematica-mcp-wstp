@@ -301,7 +301,7 @@ def test_state_changing_tools_blocked_while_recording():
 
 
 def test_named_characters_survive_real_save_and_finalize():
-    """Cells written with \[...] escapes finalize although the front end saves glyphs."""
+    r"""Cells written with \[...] escapes finalize although the front end saves glyphs."""
     with recording_session("named") as ctx:
         cells = [fresh_symbol("mcpElem") + " = (pz \\[Element] Reals) && (\\[Alpha] > 0)",
                  fresh_symbol("mcpRule") + " = {a \\[Rule] 1}"]

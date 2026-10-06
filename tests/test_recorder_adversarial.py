@@ -426,6 +426,7 @@ def test_finalize_no_recorder_active():
 # --- Runner ----------------------------------------------------------------
 
 if __name__ == "__main__":
+    from wolfram_available import missing_wolfram
     import traceback
 
     pure_python = [
@@ -433,6 +434,7 @@ if __name__ == "__main__":
         test_ledger_survives_reload,
         test_unresolved_includes_records_without_disposition,
         test_disposition_all_axis_combinations,
+        test_finalize_no_recorder_active,
     ]
     integration = [
         test_full_lifecycle_mixed_outcomes,
@@ -440,7 +442,6 @@ if __name__ == "__main__":
         test_deletion_blocks_finalization,
         test_injection_blocks_finalization,
         test_re_annotate_updates_reason,
-        test_finalize_no_recorder_active,
     ]
 
     passed = failed = skipped = 0
@@ -456,8 +457,13 @@ if __name__ == "__main__":
             print(f"  FAIL  {fn.__name__}")
             traceback.print_exc()
 
+    no_wolfram = missing_wolfram()
     print("\n=== Integration tests (cross-phase, adversarial) ===")
     for fn in integration:
+        if no_wolfram:
+            skipped += 1
+            print(f"  SKIP  {fn.__name__} ({no_wolfram})")
+            continue
         try:
             fn()
             passed += 1
