@@ -432,8 +432,8 @@ _RECORDING_START_FIELDS = ("run_id", "ledger", "kernel_not_fresh", "kernel_at_st
 @server.tool(
     description=(
         "Notebook sessions over .nb files on disk. actions: open(path) | create(title,path) "
-        "| list | info | save(path) | close | dependencies | record | stop_recording "
-        "| finalize.\n"
+        "| list | info | save(path) | close | verify | dependencies | record "
+        "| stop_recording | finalize(timeout) | verify_record(path).\n"
         "record: start integrity recording of every evaluate() call into this "
         "notebook (needs a disk path, no existing Input/Code cells, and the direct "
         "kernel). Pass record=True with create or open to start immediately. While "
@@ -444,6 +444,9 @@ _RECORDING_START_FIELDS = ("run_id", "ledger", "kernel_not_fresh", "kernel_at_st
         "timeout (seconds, default 600) bounds the fresh-kernel run; a recording "
         "whose cells took longer than that when recorded is refused up front, and "
         "the reply reports the estimate. "
+        "verify_record(path): check a finalized notebook file against the ledger of "
+        "its recording - recorded cells unchanged, whether the file changed since "
+        "finalization, and the finalization statuses.\n"
         "stop_recording and close are refused before finalization (force=True "
         "abandons the run); close after finalization releases the recorder.\n"
         "'dependencies' reports every file the notebook reads or writes, COMMENTED "
@@ -458,7 +461,8 @@ _RECORDING_START_FIELDS = ("run_id", "ledger", "kernel_not_fresh", "kernel_at_st
 )
 def notebooks(
     action: Literal["open", "create", "list", "info", "save", "close", "verify",
-                    "dependencies", "record", "stop_recording", "finalize"] = "list",
+                    "dependencies", "record", "stop_recording", "finalize",
+                    "verify_record"] = "list",
     path: str | None = None,
     title: str = "Untitled",
     notebook: str | None = None,
@@ -493,6 +497,10 @@ def notebooks(
         if not path:
             return _reply(nb.verify_self(notebook=notebook))
         return _reply(nb.verify_against(path, notebook=notebook))
+    if action == "verify_record":
+        if not path:
+            return _fail("verify_record requires the path of a finalized notebook")
+        return _reply(nb.verify_record(path))
     if action == "create":
         result = nb.create(title=title, path=path)
         if record and result.get("success"):

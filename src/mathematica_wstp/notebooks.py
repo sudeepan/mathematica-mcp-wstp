@@ -875,6 +875,73 @@ class HeadlessNotebooks:
             return self._no_session(notebook)
         return self._call_with_session("MCPVerifySelf", notebook_id, timeout=120)
 
+    _FINALIZED_NAME = re.compile(r"-(R[0-9a-f]{10})-finalized(?:-failed-\d+)?\.nb$")
+
+    def verify_record(self, path: str) -> dict[str, Any]:
+        """Check a finalized notebook file against the ledger of its recording.
+
+        The recorded code cells must still match the ledger. The file's
+        fingerprint from sealing tells whether anything else changed since:
+        an edit to narrative or output cells changes the file but not the
+        record, an edit to a recorded cell changes both.
+        """
+        from .recorder import _file_digest, verify_file_against_ledger
+        from .recorder_ledger import RecorderLedger, ledger_dir
+
+        target = os.path.abspath(os.path.expanduser(path))
+        match = self._FINALIZED_NAME.search(os.path.basename(target))
+        if not match:
+            return {"success": False,
+                    "error": ("not a finalized recording: expected a file named "
+                              "<name>-<run_id>-finalized.nb"),
+                    "path": target}
+        if not os.path.exists(target):
+            return {"success": False, "error": "file not found", "path": target}
+        run_id = match.group(1)
+        ledger_path = os.path.join(ledger_dir(target), f"{run_id}.json")
+        if not os.path.exists(ledger_path):
+            return {"success": False,
+                    "error": f"no ledger for run {run_id}",
+                    "looked_for": ledger_path}
+        ledger = RecorderLedger.load(ledger_path)
+
+        structural = verify_file_against_ledger(self, ledger, target)
+        attempt = next((a for a in reversed(ledger.data.get("finalization_attempts", []))
+                        if os.path.basename(str(a.get("path", ""))) == os.path.basename(target)
+                        or str(a.get("preserved_as", "")) == target), None)
+        sealed_digest = (attempt or {}).get("file_sha256")
+        current = _file_digest(target)
+        unchanged = None if sealed_digest is None else current == sealed_digest
+        if unchanged:
+            changes = "none"
+        elif not structural.get("verified"):
+            changes = "recorded_cells"
+        elif unchanged is False:
+            changes = "narrative_or_outputs_only"
+        else:
+            changes = "unknown"
+        latest = ledger.data.get("finalization") or {}
+        result: dict[str, Any] = {
+            "success": True,
+            "verified": bool(structural.get("verified")),
+            "run_id": run_id,
+            "ledger": ledger_path,
+            "sealed": latest.get("success") is True
+                      and os.path.basename(str(latest.get("path", ""))) == os.path.basename(target),
+            "file_unchanged_since_finalization": unchanged,
+            "changes": changes,
+            "structural_verification": structural,
+        }
+        if attempt:
+            for key in ("status", "reproduction", "checkpoints"):
+                if key in attempt:
+                    result[key] = attempt[key]
+        kernel_at_start = ledger.data.get("kernel_at_start")
+        if isinstance(kernel_at_start, dict) and (kernel_at_start.get("user_symbols")
+                                                  or kernel_at_start.get("packages")):
+            result["kernel_at_record_start"] = kernel_at_start
+        return result
+
     def find_defining(self, symbol: str, notebook: str | None = None) -> dict[str, Any]:
         """Find the cells of the open document that assign ``symbol``."""
         notebook_id = self._resolve(notebook)

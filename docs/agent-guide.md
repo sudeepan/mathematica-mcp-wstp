@@ -534,7 +534,14 @@ created here.
 ```text
 notebooks(action="verify", path="/path/to/original.nb")   # against a reference
 notebooks(action="verify")                                  # self-consistency
+notebooks(action="verify_record", path="/path/calc-R1234567890-finalized.nb")
 ```
+
+`verify_record` checks a finalized recording against the ledger of its run,
+found from the run id in the file name: the recorded code cells must still
+match, and `changes` says what differs from the file as it was sealed:
+`none`, `narrative_or_outputs_only` (text edited after sealing, for example),
+or `recorded_cells`. It also returns the statuses the finalization reported.
 
 Neither proves scientific correctness. For mathematical divergence, use
 `Length`/`LeafCount` on transparent expressions and `ByteCount` on opaque

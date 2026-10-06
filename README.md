@@ -166,6 +166,8 @@ notebooks(action="close")
 
 Every recorded cell is written to the notebook, read back, fingerprinted and entered in the recorder ledger before its code runs. While recording, every other way to change kernel state is refused, and any failed check stops the run rather than letting an unverifiable cell through. `finalize` copies the notebook, re-runs it in a fresh kernel, compares the copy with the ledger, and fails if a cell gives a message it did not give when recorded, which usually means it leaned on something defined outside the record. It also compares each cell's result with the one recorded and reports any difference, and a cell recorded with `evaluate(code, expect="True")` is a checkpoint: if its fresh result does not match, the run is not sealed. Recording warns when it starts on a kernel that already holds definitions or packages, and keeps the list in the ledger. A successful finalization seals the run. The finalized notebook shows typeset outputs and formatted `Print` cells, as a desktop run would.
 
+Later, `notebooks(action="verify_record", path=...)` checks a finalized file against its ledger and tells an edit to its text or outputs from a change to the recorded code.
+
 The details are in [`docs/agent-guide.md`](docs/agent-guide.md#recording-every-evaluation-into-a-notebook).
 
 ## Why use WSTP
@@ -282,7 +284,7 @@ Sixteen consolidated tools rather than a wide flat surface:
 | `abort`              | Interrupt the running evaluation, keeping all state          |
 | `kernel`             | `state`, `restart`, `stop`, `abort`, `subkernels`, `close_subkernels`, `reap` |
 | `status`             | Kernel, installation and tracked-process health              |
-| `notebooks`          | `open`, `create`, `list`, `info`, `save`, `close`, `dependencies`, `verify`, `record`, `stop_recording`, `finalize` |
+| `notebooks`          | `open`, `create`, `list`, `info`, `save`, `close`, `dependencies`, `verify`, `record`, `stop_recording`, `finalize`, `verify_record` |
 | `cells`              | List or read cells of an open notebook                       |
 | `evaluate_cells`     | Replay a span of cells, state carrying between them          |
 | `replay`             | Per-cell replay with identity and a resumable manifest       |

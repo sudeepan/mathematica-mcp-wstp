@@ -576,7 +576,8 @@ class Recorder:
             finalized_path, success=overall_success,
             error="; ".join(errors) or None,
             details={"status": status, "reproduction": reproduction,
-                     "checkpoints": checkpoints})
+                     "checkpoints": checkpoints,
+                     "file_sha256": _file_digest(finalized_path)})
 
         return {
             "success": overall_success,
@@ -718,137 +719,8 @@ class Recorder:
         return unexpected, repeated
 
     def _verify_finalized(self, finalized_path: str) -> dict[str, Any]:
-        """Open the finalized .nb as a temporary session and verify structure.
-
-        Checks: every ledger record has a matching cell (same tag, digest,
-        and style), every executable cell has a ledger entry, annotated
-        cells remain non-evaluatable with the correct reason, and cell
-        order matches ledger sequence.
-
-        Uses the prototype kernel (not a fresh one) for the inert
-        read-back. This is acceptable because MCPReadBack does not
-        evaluate anything - it only reads box structures and metadata.
-        """
-        borrowed = self.notebooks.is_open(finalized_path)
-        opened = self.notebooks.open(finalized_path)
-        if not opened.get("success"):
-            return {"verified": False,
-                    "error": f"could not open finalized notebook: {opened.get('error')}"}
-        scratch_id = opened.get("id")
-        try:
-            readback = self.notebooks._call_with_session(
-                "MCPReadBack", scratch_id, timeout=60)
-            if not readback.get("success"):
-                return {"verified": False,
-                        "error": f"could not read finalized notebook: {readback.get('error')}"}
-        finally:
-            if not borrowed and scratch_id:
-                self.notebooks.close(notebook=scratch_id)
-
-        cells = readback.get("cells", [])
-        tagged_cells = {c["record_tag"]: c for c in cells
-                        if c.get("record_tag")}
-        ledger_tags = {r["record_tag"] for r in self.ledger.records}
-
-        issues = []
-
-        for record in self.ledger.records:
-            tag = record["record_tag"]
-            cell = tagged_cells.get(tag)
-            if cell is None:
-                issues.append({"seq": record["seq"], "tag": tag,
-                               "issue": "cell_missing_in_finalized"})
-                continue
-
-            if cell["source_digest"] != record["source_digest"]:
-                issues.append({"seq": record["seq"], "tag": tag,
-                               "issue": "source_changed_in_finalized",
-                               "expected": record["source_digest"],
-                               "found": cell["source_digest"]})
-
-            if cell.get("style", "") != record.get("style", ""):
-                issues.append({"seq": record["seq"], "tag": tag,
-                               "issue": "style_changed_in_finalized",
-                               "expected": record.get("style"),
-                               "found": cell.get("style")})
-
-            found = cell.get("evaluatable")
-            if not record.get("annotated") and found is not True:
-                issues.append({"seq": record["seq"], "tag": tag,
-                               "issue": "completed_cell_disabled_in_finalized",
-                               "expected_evaluatable": True,
-                               "found_evaluatable": found})
-            if record.get("annotated"):
-                if found is not False:
-                    issues.append({"seq": record["seq"], "tag": tag,
-                                   "issue": "annotation_not_preserved",
-                                   "expected_evaluatable": False,
-                                   "found_evaluatable": cell.get("evaluatable")})
-                cell_reason = cell.get("annotation_reason", "")
-                ledger_reason = record.get("annotation_reason", "")
-                if cell_reason != ledger_reason:
-                    issues.append({"seq": record["seq"], "tag": tag,
-                                   "issue": "annotation_reason_changed",
-                                   "expected": ledger_reason,
-                                   "found": cell_reason})
-
-        seen_tags: dict[str, int] = {}
-        last_ledger_seq = -1
-        for cell in cells:
-            style = cell.get("style", "")
-            tag = cell.get("record_tag")
-            executable = cell.get("executable", False)
-
-            if cell.get("evaluatable") is True and tag not in ledger_tags:
-                issues.append({
-                    "index": cell.get("index"),
-                    "issue": "unrecorded_cell_evaluatable_in_finalized",
-                    "style": style,
-                    "tag": tag,
-                })
-                continue
-
-            if style in self._NARRATIVE_STYLES:
-                continue
-
-            if not tag and executable:
-                issues.append({
-                    "index": cell.get("index"),
-                    "issue": "untagged_executable_in_finalized",
-                    "style": style,
-                })
-
-            if tag:
-                if tag in seen_tags:
-                    issues.append({
-                        "tag": tag,
-                        "issue": "duplicate_tag_in_finalized",
-                    })
-                seen_tags[tag] = cell.get("index", 0)
-
-                if tag in ledger_tags:
-                    record = self.ledger.record_by_tag(tag)
-                    if record:
-                        seq = record["seq"]
-                        if seq < last_ledger_seq:
-                            issues.append({
-                                "tag": tag, "seq": seq,
-                                "issue": "out_of_order_in_finalized",
-                            })
-                        last_ledger_seq = max(last_ledger_seq, seq)
-                elif executable:
-                    issues.append({
-                        "tag": tag,
-                        "index": cell.get("index"),
-                        "issue": "tag_not_in_ledger_in_finalized",
-                    })
-
-        return {
-            "verified": len(issues) == 0,
-            "finalized_cells": readback.get("total", len(cells)),
-            "ledger_records": len(self.ledger.records),
-            "issues": issues,
-        }
+        """Open the finalized .nb as a temporary session and verify structure."""
+        return verify_file_against_ledger(self.notebooks, self.ledger, finalized_path)
 
     def _record_finalization(self, finalized_path: str, success: bool,
                              error: str | None = None,
@@ -1039,6 +911,142 @@ class Recorder:
         return result
 
 
+def verify_file_against_ledger(notebooks: HeadlessNotebooks, ledger: RecorderLedger,
+                               finalized_path: str) -> dict[str, Any]:
+    """Compare a finalized notebook file with the ledger of its recording.
+
+    Checks: every ledger record has a matching cell (same tag, digest,
+    and style), every executable cell has a ledger entry, annotated
+    cells remain non-evaluatable with the correct reason, and cell
+    order matches ledger sequence. Narrative and output cells are not
+    in the ledger, so editing them does not count.
+
+    Uses the session kernel for the inert read-back. This is acceptable
+    because MCPReadBack does not evaluate anything - it only reads box
+    structures and metadata.
+    """
+    borrowed = notebooks.is_open(finalized_path)
+    opened = notebooks.open(finalized_path)
+    if not opened.get("success"):
+        return {"verified": False,
+                "error": f"could not open finalized notebook: {opened.get('error')}"}
+    scratch_id = opened.get("id")
+    try:
+        readback = notebooks._call_with_session(
+            "MCPReadBack", scratch_id, timeout=60)
+        if not readback.get("success"):
+            return {"verified": False,
+                    "error": f"could not read finalized notebook: {readback.get('error')}"}
+    finally:
+        if not borrowed and scratch_id:
+            notebooks.close(notebook=scratch_id)
+
+    cells = readback.get("cells", [])
+    tagged_cells = {c["record_tag"]: c for c in cells
+                    if c.get("record_tag")}
+    ledger_tags = {r["record_tag"] for r in ledger.records}
+
+    issues = []
+
+    for record in ledger.records:
+        tag = record["record_tag"]
+        cell = tagged_cells.get(tag)
+        if cell is None:
+            issues.append({"seq": record["seq"], "tag": tag,
+                           "issue": "cell_missing_in_finalized"})
+            continue
+
+        if cell["source_digest"] != record["source_digest"]:
+            issues.append({"seq": record["seq"], "tag": tag,
+                           "issue": "source_changed_in_finalized",
+                           "expected": record["source_digest"],
+                           "found": cell["source_digest"]})
+
+        if cell.get("style", "") != record.get("style", ""):
+            issues.append({"seq": record["seq"], "tag": tag,
+                           "issue": "style_changed_in_finalized",
+                           "expected": record.get("style"),
+                           "found": cell.get("style")})
+
+        found = cell.get("evaluatable")
+        if not record.get("annotated") and found is not True:
+            issues.append({"seq": record["seq"], "tag": tag,
+                           "issue": "completed_cell_disabled_in_finalized",
+                           "expected_evaluatable": True,
+                           "found_evaluatable": found})
+        if record.get("annotated"):
+            if found is not False:
+                issues.append({"seq": record["seq"], "tag": tag,
+                               "issue": "annotation_not_preserved",
+                               "expected_evaluatable": False,
+                               "found_evaluatable": cell.get("evaluatable")})
+            cell_reason = cell.get("annotation_reason", "")
+            ledger_reason = record.get("annotation_reason", "")
+            if cell_reason != ledger_reason:
+                issues.append({"seq": record["seq"], "tag": tag,
+                               "issue": "annotation_reason_changed",
+                               "expected": ledger_reason,
+                               "found": cell_reason})
+
+    seen_tags: dict[str, int] = {}
+    last_ledger_seq = -1
+    for cell in cells:
+        style = cell.get("style", "")
+        tag = cell.get("record_tag")
+        executable = cell.get("executable", False)
+
+        if cell.get("evaluatable") is True and tag not in ledger_tags:
+            issues.append({
+                "index": cell.get("index"),
+                "issue": "unrecorded_cell_evaluatable_in_finalized",
+                "style": style,
+                "tag": tag,
+            })
+            continue
+
+        if style in Recorder._NARRATIVE_STYLES:
+            continue
+
+        if not tag and executable:
+            issues.append({
+                "index": cell.get("index"),
+                "issue": "untagged_executable_in_finalized",
+                "style": style,
+            })
+
+        if tag:
+            if tag in seen_tags:
+                issues.append({
+                    "tag": tag,
+                    "issue": "duplicate_tag_in_finalized",
+                })
+            seen_tags[tag] = cell.get("index", 0)
+
+            if tag in ledger_tags:
+                record = ledger.record_by_tag(tag)
+                if record:
+                    seq = record["seq"]
+                    if seq < last_ledger_seq:
+                        issues.append({
+                            "tag": tag, "seq": seq,
+                            "issue": "out_of_order_in_finalized",
+                        })
+                    last_ledger_seq = max(last_ledger_seq, seq)
+            elif executable:
+                issues.append({
+                    "tag": tag,
+                    "index": cell.get("index"),
+                    "issue": "tag_not_in_ledger_in_finalized",
+                })
+
+    return {
+        "verified": len(issues) == 0,
+        "finalized_cells": readback.get("total", len(cells)),
+        "ledger_records": len(ledger.records),
+        "issues": issues,
+    }
+
+
 def _evaluate_in_fresh_kernel(nb_path: str, timeout: int = 600
                               ) -> dict[str, Any]:
     """Spin up a temporary kernel, run NotebookEvaluate, shut it down.
@@ -1150,6 +1158,15 @@ def _line_to_cell(labels: list) -> Callable[[Any], str | None]:
 
 
 _PREVIEW = 200
+
+
+def _file_digest(path: str) -> str | None:
+    """SHA-256 of a file's bytes, so a later check can tell whether it changed."""
+    try:
+        with open(path, "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()
+    except OSError:
+        return None
 
 
 def _text_digest(text: str) -> str:

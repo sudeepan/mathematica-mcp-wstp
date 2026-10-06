@@ -535,6 +535,60 @@ def test_expect_needs_a_recording():
     assert reply["success"] is False and "start a recording" in reply["error"], reply
 
 
+def sealed_recording(ctx) -> str:
+    """Record a text cell and one computation, finalize, release; return the file."""
+    for code, style in (("Setup", "Text"), (fresh_symbol("mcpVr") + " = 2 + 3", "Input")):
+        assert payload(server.evaluate(code, style=style))["success"], code
+    assert payload(server.notebooks(action="save"))["success"]
+    fin = payload(server.notebooks(action="finalize"))
+    assert fin["success"], fin
+    assert payload(server.notebooks(action="close"))["success"]
+    ctx.nbid = None
+    return fin["finalized_path"]
+
+
+def test_verify_record_on_a_sealed_file():
+    with recording_session("vr") as ctx:
+        path = sealed_recording(ctx)
+        v = payload(server.notebooks(action="verify_record", path=path))
+        assert v["success"] and v["verified"] and v["sealed"], v
+        assert v["file_unchanged_since_finalization"] is True and v["changes"] == "none", v
+        assert v["status"]["reproduction"] == "same", v
+        assert v["status"]["checkpoints"] == "none", v
+
+
+def test_verify_record_tells_narrative_edits_from_code_edits():
+    with recording_session("vredit") as ctx:
+        path = sealed_recording(ctx)
+        nb = notebooks.get_headless_notebooks()
+
+        def edit(style: str, content: str) -> None:
+            sid = nb.open(path)["id"]
+            try:
+                cells = nb.read_back(notebook=sid)["cells"]
+                index = next(c["index"] for c in cells if c["style"] == style)
+                assert nb.replace_cell(index, content, notebook=sid)["success"]
+                assert nb.save(notebook=sid)["success"]
+            finally:
+                nb.close(notebook=sid)
+
+        edit("Text", "Setup, explained better")
+        v = payload(server.notebooks(action="verify_record", path=path))
+        assert v["verified"] and v["file_unchanged_since_finalization"] is False, v
+        assert v["changes"] == "narrative_or_outputs_only", v
+
+        edit("Input", fresh_symbol("mcpVrChanged") + " = 7")
+        v = payload(server.notebooks(action="verify_record", path=path))
+        assert v["verified"] is False and v["changes"] == "recorded_cells", v
+        assert any(i["issue"] == "source_changed_in_finalized"
+                   for i in v["structural_verification"]["issues"]), v
+
+
+def test_verify_record_needs_a_finalized_file():
+    v = payload(server.notebooks(action="verify_record", path="/tmp/plain.nb"))
+    assert v["success"] is False and "not a finalized recording" in v["error"], v
+
+
 if __name__ == "__main__":
     import traceback
 
