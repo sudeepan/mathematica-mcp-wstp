@@ -187,6 +187,14 @@ def generation() -> int:
     return _generation
 
 
+def initial_packages() -> list[str] | None:
+    """The contexts the current kernel held when it started, if known."""
+    with _kernel_lock:
+        if _kernel is None or _kernel.initial_packages is None:
+            return None
+        return list(_kernel.initial_packages)
+
+
 def has_kernel() -> bool:
     with _kernel_lock:
         return _kernel is not None and _kernel.is_alive()

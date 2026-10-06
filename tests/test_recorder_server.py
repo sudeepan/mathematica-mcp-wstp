@@ -56,6 +56,7 @@ def recording_session(label: str):
         made = payload(server.notebooks(action="create", title=f"Server {label}",
                                         path=ctx.path, record=True))
         assert made["success"] and made["recording"] is True, made
+        ctx.made = made
         ctx.nbid = made["id"]
         ctx.nb = notebooks.get_headless_notebooks()
         yield ctx
@@ -442,6 +443,47 @@ def test_finalized_prints_and_outputs_are_typeset():
             assert got["outputs"] == ["StandardForm", "Graphics", "TraditionalForm"], got
     finally:
         evaluate_text("$PrePrint =.", timeout=30)
+
+
+def test_record_start_reports_existing_definitions():
+    """Definitions made before recording are reported and kept in the ledger."""
+    name = fresh_symbol("recWarn")
+    assert evaluate_text(f"{name} = 3", timeout=30).success
+    try:
+        with recording_session("warn") as ctx:
+            made = ctx.made
+            assert made.get("run_id") == ctx.nb._recorder.run_id, made
+            assert made.get("kernel_not_fresh") is True, made
+            assert name in made["kernel_at_start"]["user_symbols"], made
+            assert "restart" in made["warning"], made
+            assert not any(n.startswith(("mcp", "$MCP"))
+                           for n in made["kernel_at_start"]["user_symbols"]), made
+            stored = ctx.nb._recorder.ledger.data["kernel_at_start"]
+            assert name in stored["user_symbols"], stored
+    finally:
+        evaluate_text(f"Remove[{name}]", timeout=30)
+
+
+def test_fresh_kernel_records_without_a_warning():
+    """A recording started in a fresh kernel reports nothing the server made itself."""
+    session.close_kernel()
+    with recording_session("clean") as ctx:
+        assert "kernel_not_fresh" not in ctx.made, ctx.made
+        stored = ctx.nb._recorder.ledger.data["kernel_at_start"]
+        assert stored == {"user_symbols": [], "packages": []}, stored
+
+
+def test_multi_statement_cell_with_a_message_finalizes():
+    """A message from the second statement of a recorded cell belongs to that cell."""
+    with recording_session("multi") as ctx:
+        reply = payload(server.evaluate(fresh_symbol("mcpMultiA") + " = 1\n"
+                                        + fresh_symbol("mcpMultiB") + " = 1/0"))
+        assert reply.get("message_names") == ["Power::infy"], reply
+        assert payload(server.notebooks(action="save"))["success"]
+        fin = payload(server.notebooks(action="finalize", timeout=900))
+        assert fin["success"], fin
+        assert [m["seq"] for m in fin["repeated_messages"]] == [1], fin
+        assert fin["timeout"] == 900 and fin["estimated_seconds"] < 900, fin
 
 
 if __name__ == "__main__":

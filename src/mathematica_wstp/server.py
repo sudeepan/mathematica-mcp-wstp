@@ -409,6 +409,11 @@ def status() -> dict[str, Any]:
 
 # --- notebooks -------------------------------------------------------------
 
+# What start_recording reports that create/open with record=True pass on.
+_RECORDING_START_FIELDS = ("run_id", "ledger", "kernel_not_fresh", "kernel_at_start",
+                           "warning")
+
+
 @server.tool(
     description=(
         "Notebook sessions over .nb files on disk. actions: open(path) | create(title,path) "
@@ -421,6 +426,9 @@ def status() -> dict[str, Any]:
         "finalize: while recording, re-run the notebook in a fresh kernel, check it "
         "against the recorder ledger and seal the run; otherwise save and run "
         "NotebookEvaluate so every cell gets native In[n]/Out[n] labels. "
+        "timeout (seconds, default 600) bounds the fresh-kernel run; a recording "
+        "whose cells took longer than that when recorded is refused up front, and "
+        "the reply reports the estimate. "
         "stop_recording and close are refused before finalization (force=True "
         "abandons the run); close after finalization releases the recorder.\n"
         "'dependencies' reports every file the notebook reads or writes, COMMENTED "
@@ -441,6 +449,7 @@ def notebooks(
     notebook: str | None = None,
     record: bool = False,
     force: bool = False,
+    timeout: float | None = None,
 ) -> dict[str, Any]:
     nb = get_headless_notebooks()
     if action == "open":
@@ -453,6 +462,8 @@ def notebooks(
             if not result["recording"]:
                 result["recording_error"] = rec_result.get("error",
                                                            "start_recording failed")
+            result.update({k: rec_result[k] for k in _RECORDING_START_FIELDS
+                           if k in rec_result})
         return _reply(result)
     if action == "dependencies":
         # Run this BEFORE evaluating an unfamiliar notebook. A cell that loads
@@ -475,6 +486,8 @@ def notebooks(
             if not result["recording"]:
                 result["recording_error"] = rec_result.get("error",
                                                            "start_recording failed")
+            result.update({k: rec_result[k] for k in _RECORDING_START_FIELDS
+                           if k in rec_result})
         return _reply(result)
     if action == "list":
         result = nb.list()
@@ -493,6 +506,7 @@ def notebooks(
     if action == "stop_recording":
         return _reply(nb.stop_recording(force=force))
     if action == "finalize":
+        finalize_timeout = int(timeout) if timeout else 600
         if nb.has_active_recorder:
             if notebook:
                 target = nb._resolve(notebook)
@@ -502,8 +516,8 @@ def notebooks(
                     return _fail(
                         f"notebook {notebook} is not the recording target; "
                         f"the active recording is on {nb.recording}")
-            return _reply(nb.finalize_recording(timeout=600))
-        return _reply(nb.finalize(notebook=notebook, timeout=600))
+            return _reply(nb.finalize_recording(timeout=finalize_timeout))
+        return _reply(nb.finalize(notebook=notebook, timeout=finalize_timeout))
     return _fail(f"unknown action: {action}")
 
 

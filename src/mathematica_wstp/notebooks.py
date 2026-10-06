@@ -24,6 +24,7 @@ import functools
 import json
 import logging
 import os
+import re
 import tempfile
 import uuid
 import time
@@ -1138,9 +1139,10 @@ class HeadlessNotebooks:
                 "error": "integrity recording requires a notebook with a disk path",
             }
 
+        snapshot = self._kernel_snapshot()
         self._recording_target = notebook_id
-        self._recorder = Recorder(self, notebook_id, nb_path)
-        return {
+        self._recorder = Recorder(self, notebook_id, nb_path, kernel_snapshot=snapshot)
+        reply = {
             "success": True,
             "recording": True,
             "notebook": notebook_id,
@@ -1149,6 +1151,56 @@ class HeadlessNotebooks:
             "ledger": self._recorder.ledger.path,
             "headless": True,
         }
+        if snapshot.get("user_symbols") or snapshot.get("packages") or snapshot.get("error"):
+            reply["kernel_not_fresh"] = True
+            reply["kernel_at_start"] = snapshot
+            reply["warning"] = (
+                "The kernel already holds definitions or packages from before this "
+                "recording. The record does not contain them, so the fresh kernel at "
+                "finalize will not have them either, and a cell that uses them can "
+                "give a different result there without any message. For a record that "
+                "stands on its own: stop_recording(force=True), kernel(action='restart'), "
+                "then start the recording again.")
+        return reply
+
+    # Names the server itself creates in Global`: Module locals such as mcpRes
+    # and the helper's load flag $MCPHeadlessNotebookLoaded.
+    _SERVER_SYMBOL = re.compile(r"^(\$MCP|mcp[A-Z])")
+
+    def _kernel_snapshot(self) -> dict[str, Any]:
+        """What the kernel holds before a recording starts.
+
+        Global` symbols with definitions, and packages loaded since the kernel
+        started. A recording cannot see either, so a cell relying on one can
+        give a different result in the fresh kernel at finalize, often without
+        any message. Reported, and stored in the ledger, rather than refused.
+        """
+        from . import session
+        from .evaluator import evaluate_json
+        code = (
+            '<|"symbols" -> Select[Names["Global`*"], '
+            'Quiet[ToExpression[If[StringContainsQ[#, "`"], #, "Global`" <> #], InputForm, '
+            'Function[s, OwnValues[s] =!= {} || DownValues[s] =!= {} || '
+            'UpValues[s] =!= {} || SubValues[s] =!= {}, HoldAllComplete]]] &], '
+            '"packages" -> $Packages|>')
+        try:
+            got = evaluate_json(code, timeout=60)
+        except Exception as exc:
+            return {"error": f"could not inspect the kernel: {exc!r}"}
+        if not got.get("success"):
+            return {"error": f"could not inspect the kernel: {got.get('error')}"}
+        symbols = sorted(n for n in got.get("symbols", [])
+                         if not self._SERVER_SYMBOL.match(n.split("`")[-1]))
+        baseline = session.initial_packages()
+        snapshot: dict[str, Any] = {"user_symbols": symbols}
+        if baseline is None:
+            snapshot["packages"] = []
+            snapshot["packages_checked"] = False
+        else:
+            snapshot["packages"] = sorted(
+                p for p in got.get("packages", [])
+                if p not in baseline and p != "MCPHeadlessNotebook`")
+        return snapshot
 
     @_under_recording_lock
     def stop_recording(self, force: bool = False) -> dict[str, Any]:

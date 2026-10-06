@@ -941,8 +941,8 @@ def test_finalize_refuses_message_outside_recorded_cells():
     """A message while opening or saving the notebook belongs to no cell and fails."""
     with workspace() as w:
         a = record_with_messages(w, "y = 1/0", ["Power::infy"])
-        for phase, line in (("save", 1), ("cells", 99)):
-            run = fresh_run([[phase, line, "Power::infy"]], [[1, a["record_tag"]]])
+        for phase, line in (("save", 6), ("cells", 3)):
+            run = fresh_run([[phase, line, "Power::infy"]], [[5, a["record_tag"]]])
             with fresh_kernel_stub(run):
                 fin = w.rec.finalize(timeout=5)
             assert fin["success"] is False, (phase, fin)
@@ -960,6 +960,52 @@ def test_record_without_message_names_tolerates_no_message():
             fin = w.rec.finalize(timeout=5)
         assert fin["success"] is False
         assert fin["unexpected_messages"][0]["messages"] == ["Power::infy"]
+
+
+
+def test_messages_from_later_statements_belong_to_their_cell():
+    """A cell with several statements uses several lines; all of them are its own."""
+    with workspace() as w:
+        a = record_with_messages(w, "x = 1\ny = 1/0", ["Power::infy"])
+        b = record_with_messages(w, "z = 3", [])
+        run = fresh_run([["cells", 8, "Power::infy"]],
+                        [[7, a["record_tag"]], [10, b["record_tag"]]])
+        with fresh_kernel_stub(run):
+            fin = w.rec.finalize(timeout=5)
+        assert fin["success"], fin
+        assert [m["seq"] for m in fin["repeated_messages"]] == [a["seq"]], fin
+
+
+def test_finalize_refuses_when_recorded_cells_outlast_the_timeout():
+    """A run whose cells took longer than the timeout is refused before it starts."""
+    with workspace() as w:
+        for code in ("slow1 = 1", "slow2 = 2"):
+            r = w.record_ok(code)
+            rec = w.rec.ledger.record_by_seq(r["seq"])
+            w.rec.ledger.update_record(r["seq"], disposition_at=rec["appended_at"] + 400.0)
+        with fresh_kernel_stub():
+            refused = w.rec.finalize(timeout=600)
+        assert refused["success"] is False and "pass a larger timeout" in refused["error"]
+        assert refused["estimated_seconds"] >= 800 and refused["timeout"] == 600, refused
+        assert "finalization" not in w.rec.ledger.data
+        assert not w.rec.is_faulted
+        with fresh_kernel_stub():
+            fin = w.rec.finalize(timeout=1000)
+        assert fin["success"] and fin["timeout"] == 1000, fin
+
+
+def test_kernel_state_at_start_is_kept_in_the_ledger():
+    """What the kernel held before recording is stored and reported at finalize."""
+    with workspace() as w:
+        snapshot = {"user_symbols": ["a", "f1"], "packages": ["MyPackage`"]}
+        rec = Recorder(w.fake, "hnb1", w.nb_path, kernel_snapshot=snapshot)
+        w.fake._recorder = rec
+        w.rec = rec
+        assert RecorderLedger.load(rec.ledger.path).data["kernel_at_start"] == snapshot
+        w.record_ok("result = a + 1")
+        with fresh_kernel_stub():
+            fin = rec.finalize(timeout=5)
+        assert fin["success"] and fin["kernel_at_record_start"] == snapshot, fin
 
 
 # --- Runner ----------------------------------------------------------------

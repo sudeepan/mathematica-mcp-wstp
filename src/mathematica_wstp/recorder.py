@@ -11,13 +11,14 @@ verifies that the notebook still matches the ledger afterwards.
 
 from __future__ import annotations
 
+import bisect
 import hashlib
 import logging
 import os
 import shutil
 import time
 import uuid
-from typing import Any, TYPE_CHECKING
+from typing import Any, Callable, TYPE_CHECKING
 
 from .recorder_ledger import RecorderLedger, _write_atomically
 
@@ -41,13 +42,18 @@ class Recorder:
     _SCIENTIFIC_STYLES = frozenset({"Input", "Code"})
 
     def __init__(self, notebooks: HeadlessNotebooks, notebook_id: str,
-                 notebook_path: str):
+                 notebook_path: str, kernel_snapshot: dict[str, Any] | None = None):
         self.notebooks = notebooks
         self.notebook_id = notebook_id
         self.notebook_path = notebook_path
         self.run_id = f"R{uuid.uuid4().hex[:10]}"
         self.ledger = RecorderLedger.create(notebook_path, notebook_id,
                                             self.run_id)
+        if kernel_snapshot is not None:
+            # What the kernel already held: the fresh kernel at finalize will
+            # not have it, so a reviewer of the record needs to know.
+            self.ledger.data["kernel_at_start"] = kernel_snapshot
+            _write_atomically(self.ledger.path, self.ledger.data)
 
     # -- fault latch --------------------------------------------------------
 
@@ -450,6 +456,17 @@ class Recorder:
                                for r in unresolved],
             }
 
+        estimate = self.estimated_seconds()
+        if estimate > timeout:
+            return {
+                "success": False,
+                "error": (f"the recorded cells took about {estimate:.0f} s to run, "
+                          f"longer than the finalize timeout of {timeout} s; "
+                          "pass a larger timeout"),
+                "estimated_seconds": round(estimate, 1),
+                "timeout": timeout,
+            }
+
         verification = self._verify_full()
         if not verification.get("verified"):
             self._fault("PRE_FINALIZE",
@@ -491,6 +508,8 @@ class Recorder:
                 eval_result["recording_path"] = nb_path
                 eval_result["finalized_path"] = finalized_path
                 eval_result["run_id"] = self.run_id
+                eval_result["estimated_seconds"] = round(estimate, 1)
+                eval_result["timeout"] = timeout
                 return eval_result
 
             unexpected, repeated = self._compare_messages(eval_result)
@@ -526,11 +545,36 @@ class Recorder:
             "finalized_path": finalized_path,
             "run_id": self.run_id,
             "sealed": self.is_sealed,
+            "estimated_seconds": round(estimate, 1),
+            "timeout": timeout,
+            **({"kernel_at_record_start": self.kernel_at_start}
+               if self.kernel_at_start else {}),
             **({"repeated_messages": repeated} if repeated else {}),
             **({"previous_attempt_preserved_as": preserved} if preserved else {}),
             **({"error": "post-finalization structural verification failed"}
                if not overall_success else {}),
         }
+
+    @property
+    def kernel_at_start(self) -> dict[str, Any] | None:
+        """Definitions or packages the kernel held when recording started, if any."""
+        snap = self.ledger.data.get("kernel_at_start")
+        if isinstance(snap, dict) and (snap.get("user_symbols") or snap.get("packages")
+                                       or snap.get("error")):
+            return snap
+        return None
+
+    def estimated_seconds(self) -> float:
+        """How long the cells the fresh kernel will re-run took when recorded."""
+        total = 0.0
+        for r in self.ledger.records:
+            disp = r.get("disposition") or {}
+            if disp.get("execution_outcome") != "COMPLETED":
+                continue
+            start, end = r.get("appended_at"), r.get("disposition_at")
+            if isinstance(start, (int, float)) and isinstance(end, (int, float)):
+                total += max(0.0, end - start)
+        return total
 
     def _compare_messages(self, eval_result: dict[str, Any]
                           ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -542,11 +586,10 @@ class Recorder:
         recorded cell (while opening or saving the notebook, say) is never
         expected. Returns (unexpected, repeated), both per cell.
         """
-        line_tag = {entry[0]: entry[1] for entry in eval_result.get("labels", [])
-                    if isinstance(entry, list) and len(entry) == 2 and entry[1]}
+        cell_at = _line_to_cell(eval_result.get("labels", []))
         by_tag: dict[str | None, set[str]] = {}
         for phase, line, name in eval_result.get("messages", []):
-            tag = line_tag.get(line) if phase == "cells" else None
+            tag = cell_at(line) if phase == "cells" else None
             by_tag.setdefault(tag, set()).add(_short_message_name(name))
 
         unexpected: list[dict[str, Any]] = []
@@ -968,6 +1011,28 @@ def _annotation_reason(disposition: dict[str, str]) -> str:
     if readiness in ("FAULTED", "RESTARTED"):
         parts.append(f"kernel {readiness.lower()}")
     return "; ".join(parts)
+
+
+def _line_to_cell(labels: list) -> Callable[[Any], str | None]:
+    """Map a fresh-run $Line to the record tag of the cell that ran it.
+
+    A cell takes one line number per statement, and its In[n] label carries
+    only the first, so a line belongs to the cell with the largest label at
+    or below it. Mapping by the label alone attributed a message from the
+    second statement of a cell to no cell at all, and failed finalization.
+    """
+    starts = sorted((entry[0], entry[1]) for entry in labels
+                    if isinstance(entry, list) and len(entry) == 2 and entry[1]
+                    and isinstance(entry[0], int) and entry[0] > 0)
+    first_lines = [line for line, _ in starts]
+
+    def cell_at(line: Any) -> str | None:
+        if not isinstance(line, int):
+            return None
+        i = bisect.bisect_right(first_lines, line) - 1
+        return starts[i][1] if i >= 0 else None
+
+    return cell_at
 
 
 def _short_message_name(name: str) -> str:

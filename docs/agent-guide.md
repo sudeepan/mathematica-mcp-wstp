@@ -291,7 +291,11 @@ Integrity recording needs three things at the start:
 
 Only one recording can be active at a time. The recorder cannot see
 definitions made before it started, so start from a fresh kernel when the
-record must stand on its own.
+record must stand on its own. If the kernel already holds `Global`` symbols
+with definitions, or packages loaded since it started, the reply to `record`
+says so (`kernel_not_fresh`, `kernel_at_start`, `warning`) and the ledger keeps
+the list. To start clean: `stop_recording(force=True)`,
+`kernel(action="restart")`, then record again.
 
 Every `evaluate(code)` call writes `code` as a cell before evaluating it.
 While recording, `write_cell`, `edit_cells`, `execute_in_notebook` are blocked
@@ -401,7 +405,20 @@ message fails it, and `unexpected_messages` names the cell (`seq`,
 `record_tag`) and the message. A new message usually means the cell relied on
 something the fresh kernel does not have, such as a definition made before
 recording started. A message that belongs to no recorded cell, for instance
-while the notebook is opened or saved, also fails finalization.
+while the notebook is opened or saved, also fails finalization. A cell holding
+several statements takes one line number per statement in the fresh run; its
+messages are matched to it all the same.
+
+Finalization does not compare results. A cell that uses a definition made
+before recording can give a different value in the fresh kernel without any
+message, and the run still seals. The finalized notebook shows the fresh
+values, so read them, and start from a fresh kernel.
+
+The fresh run is bounded by `timeout` (seconds, default 600):
+`notebooks(action="finalize", timeout=1800)`. Before it starts, finalization
+adds up how long the recorded cells took; a recording that took longer than
+the timeout is refused with `estimated_seconds`, so you can pass a larger one
+instead of waiting for the run to fail.
 
 After finalization, the server opens the finalized `.nb` as a temporary
 session and runs a structural comparison against the recorder ledger:

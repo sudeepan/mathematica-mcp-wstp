@@ -161,6 +161,9 @@ class Kernel:
         # sent in the gap reaches an idle kernel, which wedges it.
         self._in_flight = threading.Event()
         self.subkernel_pids_cached: list[int] = []
+        # The contexts a kernel holds before anyone uses it, so a recording can
+        # tell which packages were loaded since. None if it could not be read.
+        self.initial_packages: list[str] | None = None
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -253,6 +256,12 @@ class Kernel:
             self._raw_eval(_TEXT_STREAM_SETUP, timeout=min(30.0, timeout))
         except Exception:
             logger.warning("kernel %s: could not set up its text streams", self.pid,
+                           exc_info=True)
+        try:
+            self.initial_packages = list(
+                self.evaluate_json('<|"p" -> $Packages|>', timeout=min(30.0, timeout))["p"])
+        except Exception:
+            logger.warning("kernel %s: could not read its initial packages", self.pid,
                            exc_info=True)
 
         logger.info("kernel up: pid=%s pgid=%s link=%s", self.pid, self.pgid, linkname)
