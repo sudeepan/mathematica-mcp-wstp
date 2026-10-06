@@ -486,6 +486,55 @@ def test_multi_statement_cell_with_a_message_finalizes():
         assert fin["timeout"] == 900 and fin["estimated_seconds"] < 900, fin
 
 
+def test_checkpoint_catches_a_definition_made_before_recording():
+    """The reported repro: definitions made outside the record change the fresh results."""
+    a, f1, f2 = (fresh_symbol(p) for p in ("cpA", "cpTermOne", "cpTermTwo"))
+    assert evaluate_text(f"{a} = 3; {f1} = 1/(u - v); {f2} = -1/(u - v);",
+                         timeout=30).success
+    try:
+        with recording_session("cpfail") as ctx:
+            assert ctx.made.get("kernel_not_fresh") is True, ctx.made
+            first = payload(server.evaluate(f"{a} + 1"))
+            assert first["output"].strip() == "4", first
+            check = payload(server.evaluate(f"TrueQ[Together[{f1} + {f2}] === 0]",
+                                            expect="True"))
+            assert check["checkpoint"]["status"] == "pass", check
+            assert payload(server.notebooks(action="save"))["success"]
+            fin = payload(server.notebooks(action="finalize"))
+            assert fin["success"] is False and fin["sealed"] is False, fin
+            assert fin["status"]["checkpoints"] == "fail", fin
+            assert fin["checkpoints"]["results"][0]["got"] == "False", fin
+            assert [(d["seq"], d["recorded"]) for d in fin["reproduction"]["differs"]] == [
+                (1, "4"), (2, "True")], fin
+    finally:
+        evaluate_text(f"Remove[{a}, {f1}, {f2}]", timeout=30)
+
+
+def test_reproduced_results_seal_with_passing_checkpoint():
+    """Defined inside the record, the same cells reproduce and the checkpoint passes."""
+    session.close_kernel()
+    with recording_session("cpok") as ctx:
+        cells = [("cpa = 3; f1 = 1/(u - v); f2 = -1/(u - v);", {}),
+                 ("cpa + 1", {}),
+                 ("TrueQ[Together[f1 + f2] === 0]", {"expect": "True"}),
+                 ("m1 = 2\nm2 = m1 + 1", {}),
+                 ("AbsoluteTime[]", {"volatile": True})]
+        for code, kw in cells:
+            assert payload(server.evaluate(code, **kw))["success"], code
+        assert payload(server.notebooks(action="save"))["success"]
+        fin = payload(server.notebooks(action="finalize"))
+        assert fin["success"] and fin["sealed"], fin
+        assert fin["status"]["reproduction"] == "same", fin
+        assert fin["reproduction"] == {"status": "same", "same": 4, "volatile": [5]}, fin
+        assert fin["checkpoints"]["status"] == "pass", fin
+
+
+def test_expect_needs_a_recording():
+    notebooks.reset_headless_notebooks()
+    reply = payload(server.evaluate("1 + 1", expect="2"))
+    assert reply["success"] is False and "start a recording" in reply["error"], reply
+
+
 if __name__ == "__main__":
     import traceback
 

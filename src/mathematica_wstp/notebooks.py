@@ -1256,7 +1256,8 @@ class HeadlessNotebooks:
             self._recorder._fault(phase, reason)
         return self.recording_fault()
 
-    def record_input(self, code: str, style: str = "Input") -> dict[str, Any] | None:
+    def record_input(self, code: str, style: str = "Input", expect: str | None = None,
+                     volatile: bool = False) -> dict[str, Any] | None:
         """Write a cell into the recording notebook, if one is active.
 
         Returns None when recording is off, the write result otherwise.
@@ -1269,7 +1270,8 @@ class HeadlessNotebooks:
             return None
         try:
             if self._recorder:
-                return self._recorder.record_and_verify(code, style)
+                return self._recorder.record_and_verify(code, style, expect=expect,
+                                                        volatile=volatile)
             return self._call_with_session(
                 "MCPWriteCell", target, code, style, "End", 0)
         except Exception as exc:
@@ -1294,8 +1296,10 @@ class HeadlessNotebooks:
                                              kernel_verdict)
             names = [m["name"] for m in getattr(result, "messages", None) or []
                      if m.get("name")]
+            text = result.text if getattr(result, "success", False) else None
             return self._recorder.apply_outcome(seq, disposition,
-                                                message_names=names)
+                                                message_names=names,
+                                                output_text=text)
         except Exception as exc:
             logger.warning("recording outcome failed", exc_info=True)
             fault = self.fault_recording("POST_EVAL", f"unhandled exception: {exc!r}")

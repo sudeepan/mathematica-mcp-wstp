@@ -94,7 +94,8 @@ class Recorder:
 
     # -- recording ----------------------------------------------------------
 
-    def record_and_verify(self, code: str, style: str = "Input"
+    def record_and_verify(self, code: str, style: str = "Input",
+                          expect: str | None = None, volatile: bool = False
                           ) -> dict[str, Any]:
         """Write a cell and verify it, or write narrative structure.
 
@@ -135,6 +136,12 @@ class Recorder:
                 "fault": self.ledger.data["fault"],
             }
 
+        if (expect is not None or volatile) and style not in self._SCIENTIFIC_STYLES:
+            return {
+                "success": False,
+                "error": "expect and volatile apply only to Input or Code cells",
+            }
+
         if style in self._NARRATIVE_STYLES:
             return self._write_narrative(code, style)
 
@@ -145,7 +152,7 @@ class Recorder:
                           f"(allowed: {sorted(self._SCIENTIFIC_STYLES)})"),
             }
 
-        return self._record_scientific(code, style)
+        return self._record_scientific(code, style, expect, volatile)
 
     def _write_narrative(self, code: str, style: str) -> dict[str, Any]:
         """Write a narrative cell without creating a scientific record."""
@@ -167,7 +174,8 @@ class Recorder:
             "style": style,
         }
 
-    def _record_scientific(self, code: str, style: str) -> dict[str, Any]:
+    def _record_scientific(self, code: str, style: str, expect: str | None = None,
+                           volatile: bool = False) -> dict[str, Any]:
         """Tag, write, verify, and append a scientific cell to the ledger."""
         tag = self.ledger.make_tag()
         intended_digest = hashlib.sha256(code.encode("utf-8")).hexdigest()
@@ -291,6 +299,8 @@ class Recorder:
             source_preview=our_cell.get("source_preview", code[:200]),
             style=style,
             record_tag=tag,
+            expect=expect,
+            volatile=True if volatile else None,
         )
 
         full_check = self._verify_full()
@@ -314,7 +324,8 @@ class Recorder:
         }
 
     def apply_outcome(self, seq: int, disposition: dict[str, str],
-                      message_names: list[str] | None = None
+                      message_names: list[str] | None = None,
+                      output_text: str | None = None
                       ) -> dict[str, Any]:
         """Store the raw disposition axes for a record, then verify post-eval.
 
@@ -335,6 +346,19 @@ class Recorder:
         if message_names is not None:
             fields["message_names"] = sorted({_short_message_name(n)
                                               for n in message_names})
+        checkpoint = None
+        if output_text is not None:
+            # The InputForm text of the result, which the fresh run reproduces
+            # with ToString[result, InputForm]; the typeset look differs between
+            # the two runs, this text does not.
+            fields["output_digest"] = _text_digest(output_text)
+            fields["output_preview"] = output_text[:_PREVIEW]
+            expect = (self.ledger.record_by_seq(seq) or {}).get("expect")
+            if expect is not None:
+                status = "pass" if _same_literal(output_text, expect) else "fail"
+                fields["checkpoint_at_record"] = status
+                checkpoint = {"expected": expect, "got": output_text[:_PREVIEW],
+                              "status": status}
         self.ledger.update_record(seq, **fields)
 
         annotation = self._auto_annotate(seq, disposition)
@@ -356,6 +380,7 @@ class Recorder:
         result = {
             "seq": seq,
             "disposition": disposition,
+            **({"checkpoint": checkpoint} if checkpoint else {}),
             "annotation": annotation,
             "post_eval_verification": verification,
             "recording_faulted": self.is_faulted,
@@ -505,6 +530,7 @@ class Recorder:
             if not eval_result.get("success"):
                 self._record_finalization(finalized_path, success=False,
                                           error=eval_result.get("error"))
+                eval_result["status"] = {"fresh_run": "failed"}
                 eval_result["recording_path"] = nb_path
                 eval_result["finalized_path"] = finalized_path
                 eval_result["run_id"] = self.run_id
@@ -521,6 +547,7 @@ class Recorder:
                 return {
                     "success": False,
                     "error": error,
+                    "status": {"fresh_run": "completed", "messages": "new"},
                     "unexpected_messages": unexpected,
                     "recording_path": nb_path,
                     "finalized_path": finalized_path,
@@ -528,18 +555,35 @@ class Recorder:
                 }
 
             structural = self._verify_finalized(finalized_path)
+            reproduction, checkpoints = self._compare_results(eval_result)
         except Exception as exc:
             self._record_finalization(finalized_path, success=False, error=repr(exc))
             raise
-        overall_success = structural.get("verified", False)
+        structure_ok = structural.get("verified", False)
+        checkpoints_ok = checkpoints["status"] in ("pass", "none")
+        overall_success = structure_ok and checkpoints_ok
+        status = {
+            "structure": "verified" if structure_ok else "failed",
+            "fresh_run": "completed",
+            "messages": "as_recorded",
+            "reproduction": reproduction["status"],
+            "checkpoints": checkpoints["status"],
+        }
+        errors = ([] if structure_ok else ["post-finalization structural verification failed"]) \
+            + ([] if checkpoints_ok else ["a checkpoint did not pass in the fresh run"])
 
         self._record_finalization(
             finalized_path, success=overall_success,
-            error=None if overall_success else "structural verification failed")
+            error="; ".join(errors) or None,
+            details={"status": status, "reproduction": reproduction,
+                     "checkpoints": checkpoints})
 
         return {
             "success": overall_success,
             "finalized": True,
+            "status": status,
+            "reproduction": reproduction,
+            "checkpoints": checkpoints,
             "structural_verification": structural,
             "recording_path": nb_path,
             "finalized_path": finalized_path,
@@ -551,9 +595,69 @@ class Recorder:
                if self.kernel_at_start else {}),
             **({"repeated_messages": repeated} if repeated else {}),
             **({"previous_attempt_preserved_as": preserved} if preserved else {}),
-            **({"error": "post-finalization structural verification failed"}
-               if not overall_success else {}),
+            **({"error": "; ".join(errors)} if errors else {}),
         }
+
+    def _compare_results(self, eval_result: dict[str, Any]
+                         ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Compare each cell's fresh-run result with the one recorded.
+
+        Reproduction is reported, never enforced: a result can differ for
+        reasons the recording cannot know (a timing, a process id), and a
+        volatile cell says so up front. A checkpoint is enforced: its fresh
+        result must match the expectation stored before the cell first ran.
+        """
+        cell_at = _line_to_cell(eval_result.get("labels", []))
+        fresh: dict[str, dict[str, Any]] = {}
+        for entry in eval_result.get("outputs", []):
+            line, digest, preview, length = entry
+            tag = cell_at(line)
+            if tag is not None:
+                # A cell's result is its last statement's.
+                fresh[tag] = {"digest": digest, "preview": preview, "length": length}
+
+        same, differs, missing, volatile, unrecorded = [], [], [], [], []
+        results = []
+        for r in self.ledger.records:
+            if (r.get("disposition") or {}).get("execution_outcome") != "COMPLETED":
+                continue
+            tag, seq = r["record_tag"], r["seq"]
+            got = fresh.get(tag)
+            if "expect" in r:
+                status = ("missing" if got is None
+                          else "pass" if _fresh_matches(got, r["expect"]) else "fail")
+                results.append({"seq": seq, "record_tag": tag, "expected": r["expect"],
+                                "got": None if got is None else got["preview"],
+                                "status": status})
+            if "output_digest" not in r:
+                unrecorded.append(seq)
+            elif r.get("volatile"):
+                volatile.append(seq)
+            elif got is None:
+                missing.append(seq)
+            elif got["digest"] == r["output_digest"]:
+                same.append(seq)
+            else:
+                differs.append({"seq": seq, "record_tag": tag,
+                                "recorded": r.get("output_preview"),
+                                "fresh": got["preview"]})
+
+        reproduction: dict[str, Any] = {
+            "status": "differs" if differs else "incomplete" if missing else "same",
+            "same": len(same),
+        }
+        for key, value in (("differs", differs), ("missing", missing),
+                           ("volatile", volatile), ("not_recorded", unrecorded)):
+            if value:
+                reproduction[key] = value
+        checkpoints: dict[str, Any] = {
+            "status": ("none" if not results
+                       else "pass" if all(c["status"] == "pass" for c in results)
+                       else "fail"),
+        }
+        if results:
+            checkpoints["results"] = results
+        return reproduction, checkpoints
 
     @property
     def kernel_at_start(self) -> dict[str, Any] | None:
@@ -747,7 +851,8 @@ class Recorder:
         }
 
     def _record_finalization(self, finalized_path: str, success: bool,
-                             error: str | None = None) -> None:
+                             error: str | None = None,
+                             details: dict[str, Any] | None = None) -> None:
         """Append this attempt to the ledger; a successful one seals the run."""
         if self.ledger.records:
             self.ledger.update_record(
@@ -765,6 +870,8 @@ class Recorder:
         }
         if error:
             attempt["error"] = error
+        if details:
+            attempt.update(details)
         self.ledger.add_finalization_attempt(attempt)
 
     def _move_aside_failed_artifact(self, finalized_path: str, base: str,
@@ -955,10 +1062,15 @@ def _evaluate_in_fresh_kernel(nb_path: str, timeout: int = 600
 
     escaped = nb_path.replace("\\", "\\\\").replace('"', '\\"')
     code = """
-Module[{nbo, ok = True, detail = "", phase = "open", log = {}, labels = {}, h},
+Module[{nbo, ok = True, detail = "", phase = "open", log = {}, labels = {}, outs = {},
+    h, post},
   h[Hold[Message[MessageName[s_, t_String, ___], ___], True]] :=
     AppendTo[log, {phase, $Line, SymbolName[Unevaluated[s]] <> "::" <> t}];
   h[_] := Null;
+  post = Function[r, (If[phase === "cells",
+      With[{t = ToString[r, InputForm]},
+        AppendTo[outs, {$Line, Hash[StringToByteArray[t, "UTF-8"], "SHA256", "HexString"],
+          StringTake[t, UpTo[200]], StringLength[t]}]]]; r)];
   SetOptions[#, FormatType -> StandardForm, CharacterEncoding -> "Unicode",
     PageWidth -> Infinity] & /@ $Output;
   Quiet[Internal`HandlerBlock[{"Message", h},
@@ -967,7 +1079,7 @@ Module[{nbo, ok = True, detail = "", phase = "open", log = {}, labels = {}, h},
       If[Head[nbo] =!= NotebookObject,
         ok = False; detail = "NotebookOpen failed",
         phase = "cells";
-        NotebookEvaluate[nbo, InsertResults -> True];
+        Block[{$Post = post}, NotebookEvaluate[nbo, InsertResults -> True]];
         phase = "save";
         labels = Cases[NotebookGet[nbo], Cell[_, "Input" | "Code", opts___] :> {
             FirstCase[StringCases[FirstCase[{opts}, HoldPattern[CellLabel -> l_String] :> l, ""],
@@ -977,7 +1089,8 @@ Module[{nbo, ok = True, detail = "", phase = "open", log = {}, labels = {}, h},
         NotebookSave[nbo];
         NotebookClose[nbo]]]],
     {FrontEndObject::notavail}];
-  <|"success" -> ok, "detail" -> detail, "messages" -> log, "labels" -> labels|>]
+  <|"success" -> ok, "detail" -> detail, "messages" -> log, "labels" -> labels,
+    "outputs" -> outs|>]
 """.replace("__PATH__", escaped)
 
     try:
@@ -985,7 +1098,8 @@ Module[{nbo, ok = True, detail = "", phase = "open", log = {}, labels = {}, h},
         if isinstance(result, dict) and result.get("success"):
             return {"success": True, "finalized": True,
                     "messages": result.get("messages", []),
-                    "labels": result.get("labels", [])}
+                    "labels": result.get("labels", []),
+                    "outputs": result.get("outputs", [])}
         detail = result.get("detail", "") if isinstance(result, dict) else str(result)
         return {"success": False, "error": f"NotebookEvaluate: {detail}"}
     except Exception as exc:
@@ -1033,6 +1147,45 @@ def _line_to_cell(labels: list) -> Callable[[Any], str | None]:
         return starts[i][1] if i >= 0 else None
 
     return cell_at
+
+
+_PREVIEW = 200
+
+
+def _text_digest(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _normalise_literal(text: str) -> str:
+    """Drop whitespace outside string literals: '{0,0, 0}' and '{0, 0, 0}' agree."""
+    out: list[str] = []
+    in_string = escaped = False
+    for ch in text:
+        if in_string:
+            out.append(ch)
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+        elif ch == '"':
+            in_string = True
+            out.append(ch)
+        elif not ch.isspace():
+            out.append(ch)
+    return "".join(out)
+
+
+def _same_literal(text: str, expect: str) -> bool:
+    return _normalise_literal(text) == _normalise_literal(expect)
+
+
+def _fresh_matches(got: dict[str, Any], expect: str) -> bool:
+    """Compare a fresh-run result with an expectation, from its preview when whole."""
+    if got.get("length", 0) <= _PREVIEW:
+        return _same_literal(got.get("preview", ""), expect)
+    return got.get("digest") == _text_digest(expect)
 
 
 def _short_message_name(name: str) -> str:

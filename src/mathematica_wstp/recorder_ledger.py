@@ -107,7 +107,8 @@ class RecorderLedger:
         return sorted(found, key=os.path.getmtime)
 
     def append(self, source_digest: str, source_preview: str,
-               style: str, record_tag: str) -> dict[str, Any]:
+               style: str, record_tag: str, **spec: Any) -> dict[str, Any]:
+        """Append a record; spec holds a checkpoint expectation or a volatile mark."""
         seq = self.data["next_seq"]
         record: dict[str, Any] = {
             "seq": seq,
@@ -116,6 +117,7 @@ class RecorderLedger:
             "source_preview": source_preview[:200],
             "style": style,
             "appended_at": time.time(),
+            **{k: v for k, v in spec.items() if v is not None},
         }
         self.data["records"].append(record)
         self.data["next_seq"] = seq + 1

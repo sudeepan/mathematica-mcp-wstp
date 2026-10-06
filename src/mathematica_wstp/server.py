@@ -152,14 +152,19 @@ def _refuse_while_recording(what: str) -> CallToolResult | None:
         "notebook. Pass style to control the cell style: 'Input' (default), "
         "'Chapter', 'Section', 'Subsection', 'Item', etc. Narrative styles "
         "(Title, Section, Text, Item, etc.) write notebook structure but skip "
-        "scientific execution - no ledger record is created."
+        "scientific execution - no ledger record is created.\n"
+        "While recording, expect makes the cell a checkpoint: its result (InputForm, "
+        "whitespace ignored) must equal expect, e.g. expect='True' or expect='{0, 0}', "
+        "here and again in the fresh kernel at finalize, or finalization fails. "
+        "volatile=True marks a cell whose result may legitimately differ in the "
+        "fresh run (a timing, a process id), so a difference there is not reported."
     )
 )
-def evaluate(code: str, timeout: float = 60.0,
-             style: str = "Input") -> dict[str, Any]:
+def evaluate(code: str, timeout: float = 60.0, style: str = "Input",
+             expect: str | None = None, volatile: bool = False) -> dict[str, Any]:
     nb = get_headless_notebooks()
     with nb.recording_transaction():
-        return _evaluate_inner(nb, code, timeout, style)
+        return _evaluate_inner(nb, code, timeout, style, expect, volatile)
 
 
 # Kernel generation the previous evaluate() ran in. A kernel restarted by
@@ -183,8 +188,12 @@ def _fresh_kernel_note() -> str | None:
             "packages before using their symbols.")
 
 
-def _evaluate_inner(nb, code: str, timeout: float, style: str) -> dict[str, Any]:
-    rec = nb.record_input(code, style=style)
+def _evaluate_inner(nb, code: str, timeout: float, style: str,
+                    expect: str | None = None, volatile: bool = False) -> dict[str, Any]:
+    if (expect is not None or volatile) and not nb.has_active_recorder:
+        return _fail("expect and volatile apply to recorded cells; start a recording "
+                     "first: notebooks(action='create', path=..., record=True)")
+    rec = nb.record_input(code, style=style, expect=expect, volatile=volatile)
 
     if nb.has_active_recorder:
         if isinstance(rec, dict) and rec.get("scientific") is False:
@@ -237,6 +246,8 @@ def _evaluate_inner(nb, code: str, timeout: float, style: str) -> dict[str, Any]
         outcome = nb.record_outcome(rec_seq, result, notice, kernel_verdict)
         if outcome and isinstance(rec, dict):
             rec["disposition"] = outcome.get("disposition")
+            if outcome.get("checkpoint"):
+                rec["checkpoint"] = outcome["checkpoint"]
             rec["post_eval_verification"] = outcome.get(
                 "post_eval_verification")
             if outcome.get("recording_faulted"):
@@ -274,6 +285,8 @@ def _evaluate_inner(nb, code: str, timeout: float, style: str) -> dict[str, Any]
             payload["messages"] = result.messages
         if rec is not None:
             payload["recorded"] = rec.get("success", False)
+            if rec.get("checkpoint"):
+                payload["checkpoint"] = rec["checkpoint"]
             if rec.get("recording_faulted"):
                 payload["recording_faulted"] = True
                 payload["recording_fault"] = rec.get("recording_fault")
@@ -308,6 +321,8 @@ def _evaluate_inner(nb, code: str, timeout: float, style: str) -> dict[str, Any]
         payload["message_names"] = sorted({m["name"] for m in result.messages if m.get("name")})
     if rec is not None:
         payload["recorded"] = rec.get("success", False)
+        if rec.get("checkpoint"):
+            payload["checkpoint"] = rec["checkpoint"]
         if rec.get("recording_faulted"):
             payload["recording_faulted"] = True
             payload["recording_fault"] = rec.get("recording_fault")

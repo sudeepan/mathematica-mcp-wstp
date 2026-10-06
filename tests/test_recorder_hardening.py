@@ -1008,6 +1008,121 @@ def test_kernel_state_at_start_is_kept_in_the_ledger():
         assert fin["success"] and fin["kernel_at_record_start"] == snapshot, fin
 
 
+
+def record_result(w: Workspace, code: str, text: str, expect: str | None = None,
+                  volatile: bool = False) -> tuple[dict, dict]:
+    r = w.rec.record_and_verify(code, expect=expect, volatile=volatile)
+    assert r.get("success") and r.get("pre_dispatch_verified"), r
+    outcome = w.rec.apply_outcome(r["seq"], dict(COMPLETED), message_names=[],
+                                  output_text=text)
+    assert not outcome["recording_faulted"], outcome
+    return r, outcome
+
+
+def fresh_output(line: int, text: str) -> list:
+    return [line, sha(text), text[:200], len(text)]
+
+
+def test_outcome_stores_result_fingerprint_and_checkpoint():
+    """The result's fingerprint is kept, and a checkpoint is judged at record time."""
+    with workspace() as w:
+        r, out = record_result(w, "residues = {0, 0, 0}", "{0, 0, 0}", expect="{0,0,0}")
+        rec = w.rec.ledger.record_by_seq(r["seq"])
+        assert rec["output_digest"] == sha("{0, 0, 0}") and rec["expect"] == "{0,0,0}"
+        assert rec["checkpoint_at_record"] == "pass"
+        assert out["checkpoint"] == {"expected": "{0,0,0}", "got": "{0, 0, 0}", "status": "pass"}
+        r2, out2 = record_result(w, "ok = False", "False", expect="True")
+        assert out2["checkpoint"]["status"] == "fail"
+
+
+def test_finalize_reports_reproduced_results_and_seals():
+    with workspace() as w:
+        a, _ = record_result(w, "x = 2", "2")
+        b, _ = record_result(w, "ok = True", "True", expect="True")
+        run = {"success": True, "finalized": True, "messages": [],
+               "labels": [[1, a["record_tag"]], [2, b["record_tag"]]],
+               "outputs": [fresh_output(1, "2"), fresh_output(2, "True")]}
+        with fresh_kernel_stub(run):
+            fin = w.rec.finalize(timeout=5)
+        assert fin["success"] and w.rec.is_sealed, fin
+        assert fin["status"] == {"structure": "verified", "fresh_run": "completed",
+                                 "messages": "as_recorded", "reproduction": "same",
+                                 "checkpoints": "pass"}, fin
+        assert fin["reproduction"] == {"status": "same", "same": 2}, fin
+
+
+def test_finalize_reports_a_changed_result_without_failing():
+    """A result that differs in the fresh kernel is reported, not enforced."""
+    with workspace() as w:
+        a, _ = record_result(w, "result = a + 1", "4")
+        run = {"success": True, "finalized": True, "messages": [],
+               "labels": [[1, a["record_tag"]]], "outputs": [fresh_output(1, "1 + a")]}
+        with fresh_kernel_stub(run):
+            fin = w.rec.finalize(timeout=5)
+        assert fin["success"] and fin["status"]["reproduction"] == "differs", fin
+        assert fin["reproduction"]["differs"] == [
+            {"seq": a["seq"], "record_tag": a["record_tag"], "recorded": "4",
+             "fresh": "1 + a"}], fin
+
+
+def test_failed_checkpoint_blocks_sealing():
+    """A checkpoint that fails in the fresh kernel stops the seal and keeps the file."""
+    with workspace() as w:
+        a, _ = record_result(w, "checkPassed = TrueQ[res === 0]", "True", expect="True")
+        run = {"success": True, "finalized": True, "messages": [],
+               "labels": [[1, a["record_tag"]]], "outputs": [fresh_output(1, "False")]}
+        with fresh_kernel_stub(run):
+            fin = w.rec.finalize(timeout=5)
+        assert fin["success"] is False and not w.rec.is_sealed, fin
+        assert "checkpoint did not pass" in fin["error"], fin
+        assert fin["checkpoints"] == {"status": "fail", "results": [
+            {"seq": a["seq"], "record_tag": a["record_tag"], "expected": "True",
+             "got": "False", "status": "fail"}]}, fin
+        assert os.path.exists(fin["finalized_path"])
+        attempt = w.rec.ledger.data["finalization"]
+        assert attempt["success"] is False and attempt["status"]["checkpoints"] == "fail"
+
+
+def test_missing_checkpoint_result_fails():
+    """No fresh result for a checkpoint cell is not a pass."""
+    with workspace() as w:
+        a, _ = record_result(w, "ok = True", "True", expect="True")
+        run = {"success": True, "finalized": True, "messages": [],
+               "labels": [[1, a["record_tag"]]], "outputs": []}
+        with fresh_kernel_stub(run):
+            fin = w.rec.finalize(timeout=5)
+        assert fin["success"] is False, fin
+        assert fin["checkpoints"]["results"][0]["status"] == "missing", fin
+        assert fin["reproduction"]["status"] == "incomplete", fin
+
+
+def test_volatile_cell_difference_is_not_reported():
+    with workspace() as w:
+        a, _ = record_result(w, "t = AbsoluteTime[]", "3.9e9", volatile=True)
+        assert w.rec.ledger.record_by_seq(a["seq"])["volatile"] is True
+        run = {"success": True, "finalized": True, "messages": [],
+               "labels": [[1, a["record_tag"]]], "outputs": [fresh_output(1, "4.0e9")]}
+        with fresh_kernel_stub(run):
+            fin = w.rec.finalize(timeout=5)
+        assert fin["success"], fin
+        assert fin["reproduction"] == {"status": "same", "same": 0,
+                                       "volatile": [a["seq"]]}, fin
+
+
+def test_expect_on_narrative_cell_is_refused():
+    with workspace() as w:
+        r = w.rec.record_and_verify("Results", style="Section", expect="True")
+        assert r["success"] is False and "Input or Code" in r["error"], r
+        assert not w.rec.is_faulted and w.rec.ledger.records == []
+
+
+def test_literal_comparison_ignores_whitespace_outside_strings():
+    assert recorder_mod._same_literal("{0, 0, 0}", "{0,0,0}")
+    assert recorder_mod._same_literal('"pass"', ' "pass" ')
+    assert not recorder_mod._same_literal('"a b"', '"ab"')
+    assert not recorder_mod._same_literal("1 + a", "4")
+
+
 # --- Runner ----------------------------------------------------------------
 
 if __name__ == "__main__":

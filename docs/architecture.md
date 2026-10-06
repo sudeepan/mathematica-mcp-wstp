@@ -172,13 +172,16 @@ evaluate(code)
     append to the recorder ledger, on disk
     verify every ledger entry against the notebook, both ways
     run the code
-    store how it ended and which messages it gave; verify again
+    store how it ended, which messages it gave and a fingerprint of its result;
+    verify again
 
 notebooks(action="finalize")
     save; copy to <name>-<run_id>-finalized.nb
     re-run the copy in a fresh kernel (NotebookEvaluate under the front end)
     fail on any message a cell did not give when recorded
     compare the copy's cells with the ledger
+    report each cell whose result differs from the recorded one
+    fail on any checkpoint whose fresh result does not match its expectation
     seal the run in the ledger
 ```
 

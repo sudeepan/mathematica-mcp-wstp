@@ -409,11 +409,6 @@ while the notebook is opened or saved, also fails finalization. A cell holding
 several statements takes one line number per statement in the fresh run; its
 messages are matched to it all the same.
 
-Finalization does not compare results. A cell that uses a definition made
-before recording can give a different value in the fresh kernel without any
-message, and the run still seals. The finalized notebook shows the fresh
-values, so read them, and start from a fresh kernel.
-
 The fresh run is bounded by `timeout` (seconds, default 600):
 `notebooks(action="finalize", timeout=1800)`. Before it starts, finalization
 adds up how long the recorded cells took; a recording that took longer than
@@ -436,6 +431,33 @@ A successful finalization **seals** the run, durably in the ledger: no further
 scientific or narrative cells are accepted, and a second finalize is refused.
 Close the notebook, or call `stop_recording`, to release the recorder and use
 the kernel normally again.
+
+### Results and checkpoints
+
+The ledger also keeps a fingerprint and a short preview of each cell's result,
+taken from the `InputForm` text the reply shows. The fresh run captures each
+cell's result the same way, so typesetting differences between the two runs do
+not matter, and finalization reports the comparison under `reproduction`:
+`same`, `differs` (each changed cell with its recorded and fresh preview) or
+`incomplete` (a cell with no fresh result). A difference is reported, not
+enforced: a cell that leans on a definition made before recording, or that
+returns a timing, differs for different reasons, and only you can tell them
+apart. Mark a cell whose result legitimately changes from run to run with
+`evaluate(code, volatile=True)`; it is listed as volatile instead.
+
+A checkpoint is enforced. `evaluate(code, expect="True")` stores the
+expectation in the ledger before the cell runs, reports `checkpoint` in the
+reply, and at finalization compares the cell's fresh result with it, ignoring
+whitespace outside strings (`expect="{0, 0, 0}"`, `expect="\"pass\""`). A
+checkpoint whose fresh result differs, or is missing, fails finalization and
+the run is not sealed; the finalized file is kept as a failed attempt. Put the
+logic of the check in the cell and let the checkpoint compare one literal: a
+predicate that cannot decide should return something other than its pass value.
+
+The finalize reply reports each check separately under `status`: `structure`,
+`fresh_run`, `messages`, `reproduction` and `checkpoints`. The fresh run
+captures results through `$Post`; a notebook that sets `$Post` itself stops
+that capture for later cells, which then show as missing.
 
 ### What the finalized notebook shows
 
@@ -552,10 +574,12 @@ For a from-scratch computation:
 ```text
 1. start from a fresh kernel if the record must stand on its own
 2. notebooks(action="create", ..., path=..., record=True)
-3. evaluate(code) - every call is recorded as a cell
+3. evaluate(code) - every call is recorded as a cell; give the checks that
+   matter an expectation: evaluate(code, expect="True")
 4. notebooks(action="save")
 5. notebooks(action="finalize") - while the recorder is still active;
-   re-evaluates in a fresh kernel, then verifies against the ledger
+   re-evaluates in a fresh kernel, verifies against the ledger, reports
+   results that differ and fails on a checkpoint that does not pass
 6. notebooks(action="close") - releases the sealed recorder
 ```
 
