@@ -60,9 +60,11 @@ non-zero. No message, no failure.
 
 **Do:** before calling a notebook reproducible, replay it in a kernel that has
 run nothing else, and compare against the warm result. Finalizing a recording
-does this replay for you, and fails when a cell gives a message in the fresh
-kernel that it did not give when recorded. A silent zero gives no message, so
-still compare the values that matter.
+does this replay for you: it fails when a cell gives a message in the fresh
+kernel that it did not give when recorded, and when a cell's result differs
+from the recorded one, so a silent zero that replaced a recorded value is
+caught. It cannot tell whether the recorded value itself was right: for that,
+give the checks that matter a checkpoint (`expect=`).
 
 ## 4. `DumpSave` of a whole context shadowing a package
 

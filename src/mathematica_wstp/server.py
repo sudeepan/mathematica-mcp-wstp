@@ -149,15 +149,23 @@ def _refuse_while_recording(what: str) -> CallToolResult | None:
         "between calls. On timeout the evaluation is ABORTED but the kernel and "
         "all its definitions survive, so you can retry a smaller piece.\n"
         "When recording is active, every call is written into the recording "
-        "notebook. Pass style to control the cell style: 'Input' (default), "
+        "notebook; without a recording, a style other than Input or Code is refused "
+        "(write prose into an open notebook with edit_cells). "
+        "Pass style to control the cell style: 'Input' (default), "
         "'Chapter', 'Section', 'Subsection', 'Item', etc. Narrative styles "
         "(Title, Section, Text, Item, etc.) write notebook structure but skip "
-        "scientific execution - no ledger record is created.\n"
+        "scientific execution - no ledger record is created. Their text may hold "
+        "\\[Name] characters, inline formulas in Wolfram syntax between $ ... $ "
+        "(== for an equation) and in TeX between \\( ... \\); \\$ is a literal "
+        "dollar sign. Style DisplayFormula or DisplayFormulaNumbered holds one "
+        "formula, Wolfram syntax or \\( TeX \\). Formulas are typeset, never "
+        "evaluated, in the order written; one that cannot be read is refused.\n"
         "While recording, expect makes the cell a checkpoint: its result (InputForm, "
         "whitespace ignored) must equal expect, e.g. expect='True' or expect='{0, 0}', "
         "here and again in the fresh kernel at finalize, or finalization fails. "
         "volatile=True marks a cell whose result may legitimately differ in the "
-        "fresh run (a timing, a process id), so a difference there is not reported."
+        "fresh run (a timing, a process id), so a difference there does not fail "
+        "finalization."
     )
 )
 def evaluate(code: str, timeout: float = 60.0, style: str = "Input",
@@ -193,9 +201,19 @@ def _evaluate_inner(nb, code: str, timeout: float, style: str,
     if (expect is not None or volatile) and not nb.has_active_recorder:
         return _fail("expect and volatile apply to recorded cells; start a recording "
                      "first: notebooks(action='create', path=..., record=True)")
+    if style not in ("Input", "Code") and nb.recording is None:
+        # Without a recording the style has no cell to apply to, and the text
+        # would otherwise run as Wolfram code: "x = 5" sent as prose assigned x.
+        return _fail(f"no recording is active, so style {style!r} has no cell to write and "
+                     "the text would run as code. To write it into an open notebook use "
+                     f"edit_cells(action='write', style={style!r}, content=...); to record, "
+                     "start a recording with notebooks(action='create', path=..., record=True).",
+                     style=style)
     rec = nb.record_input(code, style=style, expect=expect, volatile=volatile)
 
     if nb.has_active_recorder:
+        if isinstance(rec, dict) and rec.get("refused"):
+            return _fail(rec["error"], refused=True, style=style)
         if isinstance(rec, dict) and rec.get("scientific") is False:
             return _reply({
                 "success": True,
@@ -436,17 +454,27 @@ _RECORDING_START_FIELDS = ("run_id", "ledger", "kernel_not_fresh", "kernel_at_st
         "| stop_recording | finalize(timeout) | verify_record(path).\n"
         "record: start integrity recording of every evaluate() call into this "
         "notebook (needs a disk path, no existing Input/Code cells, and the direct "
-        "kernel). Pass record=True with create or open to start immediately. While "
+        "kernel). Pass record=True with create or open to start immediately. A kernel "
+        "that already holds definitions or packages gets a warning; "
+        "require_fresh_kernel=True refuses to start instead. While "
         "recording, tools that would run code outside evaluate() are refused. "
         "finalize: while recording, re-run the notebook in a fresh kernel, check it "
         "against the recorder ledger and seal the run; otherwise save and run "
         "NotebookEvaluate so every cell gets native In[n]/Out[n] labels. "
         "timeout (seconds, default 600) bounds the fresh-kernel run; a recording "
         "whose cells took longer than that when recorded is refused up front, and "
-        "the reply reports the estimate. "
+        "the reply reports the estimate. A result that differs from the recorded one "
+        "fails finalization unless its cell was recorded with volatile=True; to "
+        "accept the differences the last attempt reported, finalize again with "
+        "accept_differences=[{seq, fresh_digest, reason}] naming every one of them, "
+        "taken from that reply; the fresh run must then give the same results again "
+        "(never for a checkpoint cell). "
         "verify_record(path): check a finalized notebook file against the ledger of "
         "its recording - recorded cells unchanged, whether the file changed since "
-        "finalization, and the finalization statuses.\n"
+        "finalization, and the finalization statuses. A successful finalize returns "
+        "anchors (file_sha256, ledger_sha256); keep them outside the recording's "
+        "folder and pass them back as expected_file_sha256 and expected_ledger_sha256 "
+        "to catch an edit to both the file and its ledger.\n"
         "stop_recording and close are refused before finalization (force=True "
         "abandons the run); close after finalization releases the recorder.\n"
         "'dependencies' reports every file the notebook reads or writes, COMMENTED "
@@ -469,14 +497,23 @@ def notebooks(
     record: bool = False,
     force: bool = False,
     timeout: float | None = None,
+    accept_differences: list[dict[str, Any]] | None = None,
+    expected_file_sha256: str | None = None,
+    expected_ledger_sha256: str | None = None,
+    require_fresh_kernel: bool = False,
 ) -> dict[str, Any]:
     nb = get_headless_notebooks()
+    if require_fresh_kernel and not (action == "record"
+                                     or (action in ("create", "open") and record)):
+        return _fail("require_fresh_kernel applies when a recording starts: "
+                     "action='record', or create/open with record=True")
     if action == "open":
         if not path:
             return _fail("open requires a path")
         result = nb.open(path)
         if record and result.get("success"):
-            rec_result = nb.start_recording(result.get("id"))
+            rec_result = nb.start_recording(result.get("id"),
+                                            require_fresh_kernel=require_fresh_kernel)
             result["recording"] = rec_result.get("success", False)
             if not result["recording"]:
                 result["recording_error"] = rec_result.get("error",
@@ -500,11 +537,13 @@ def notebooks(
     if action == "verify_record":
         if not path:
             return _fail("verify_record requires the path of a finalized notebook")
-        return _reply(nb.verify_record(path))
+        return _reply(nb.verify_record(path, expected_file_sha256=expected_file_sha256,
+                                       expected_ledger_sha256=expected_ledger_sha256))
     if action == "create":
         result = nb.create(title=title, path=path)
         if record and result.get("success"):
-            rec_result = nb.start_recording(result.get("id"))
+            rec_result = nb.start_recording(result.get("id"),
+                                            require_fresh_kernel=require_fresh_kernel)
             result["recording"] = rec_result.get("success", False)
             if not result["recording"]:
                 result["recording_error"] = rec_result.get("error",
@@ -525,7 +564,7 @@ def notebooks(
     if action == "close":
         return _reply(nb.close(notebook))
     if action == "record":
-        return _reply(nb.start_recording(notebook))
+        return _reply(nb.start_recording(notebook, require_fresh_kernel=require_fresh_kernel))
     if action == "stop_recording":
         return _reply(nb.stop_recording(force=force))
     if action == "finalize":
@@ -539,7 +578,10 @@ def notebooks(
                     return _fail(
                         f"notebook {notebook} is not the recording target; "
                         f"the active recording is on {nb.recording}")
-            return _reply(nb.finalize_recording(timeout=finalize_timeout))
+            return _reply(nb.finalize_recording(timeout=finalize_timeout,
+                                                accept_differences=accept_differences))
+        if accept_differences:
+            return _fail("accept_differences applies only to a recording")
         return _reply(nb.finalize(notebook=notebook, timeout=finalize_timeout))
     return _fail(f"unknown action: {action}")
 
@@ -760,7 +802,10 @@ def evaluate_cells(
         "option, addressed by the same index 'delete' takes. Use it to edit an "
         "existing cell: 'write' can only APPEND in a notebook whose cells sit inside "
         "section groups, which is most real notebooks, because insertion rewrites "
-        "the top-level cell list only and will not splice into a group."
+        "the top-level cell list only and will not splice into a group.\n"
+        "Text cells and other prose styles take the same notation as evaluate(): "
+        "\\[Name] characters, $ Wolfram formula $, \\( TeX \\), and the "
+        "DisplayFormula and DisplayFormulaNumbered styles for one displayed formula."
     )
 )
 def edit_cells(
@@ -1356,54 +1401,182 @@ def read_notebook_file(
 
 # --- derivation checking ---------------------------------------------------
 
+# One step: parse both sides and the assumptions into a private scratch context
+# (so a session definition such as x = 2 cannot change what is checked), try
+# FullSimplify within the budget, and if that does not prove the step, look for
+# a numerical counterexample at exact rational points, evaluated at 30 and 60
+# digits. The kernel reports facts; _derivation_verdict decides. BlockRandom
+# keeps the session's random sequence as it was: FullSimplify draws on it.
+_DERIVATION_STEP = r"""
+BlockRandom[Module[{ctx = "MCPDerivation" <> IntegerString[$ModuleNumber] <> "`",
+    parse, ha, hb, hs, vars, heads, simp, facts},
+  parse[s_String] := Block[{$Context = ctx, $ContextPath = Join[{"System`"}, __CONTEXTS__]},
+    Quiet[ToExpression[s, InputForm, Hold]]];
+  facts = Catch[
+    ha = parse[__A__]; hb = parse[__B__];
+    hs = If[__ASSUME__ === "", Hold[True], parse[__ASSUME__]];
+    If[!MatchQ[ha, Hold[_]] || !MatchQ[hb, Hold[_]] || !MatchQ[hs, Hold[_]],
+      Throw[<|"parsed" -> False|>]];
+    heads = Union[Cases[{ha, hb}, (f_Symbol /; Context[f] === ctx)[___] :> f,
+      {0, Infinity}, Heads -> True]];
+    vars = Complement[Union[Cases[{ha, hb, hs}, s_Symbol /; Context[s] === ctx,
+      {0, Infinity}, Heads -> True]], heads];
+    simp = TimeConstrained[
+      Quiet[FullSimplify[ReleaseHold[ha] - ReleaseHold[hb] == 0,
+        Assumptions -> ReleaseHold[hs]]], __BUDGET__, $TimedOut];
+    Module[{tried = 0, admitted = 0, samples = {}, pt, rules, v30, v60, zero, clean},
+      If[simp =!= True && heads === {},
+        BlockRandom[
+          While[tried < 60 && Length[samples] < 5,
+            tried++;
+            pt = Table[RandomInteger[{-40, 40}]/RandomInteger[{1, 7}], Length[vars]];
+            rules = Thread[vars -> pt];
+            If[TrueQ[Quiet[ReleaseHold[hs] /. rules]],
+              admitted++;
+              {v30, v60} = Quiet[N[(ReleaseHold[ha] - ReleaseHold[hb]) /. rules, #]] & /@ {30, 60};
+              If[NumericQ[v30] && NumericQ[v60],
+                zero = TrueQ[v60 == 0];
+                (* A precision warning means the value cannot be trusted as a witness;
+                   a zero with a warning still counts as a zero. *)
+                clean = zero || Quiet[Check[N[(ReleaseHold[ha] - ReleaseHold[hb]) /. rules, 60];
+                  True, False]];
+                AppendTo[samples, <|
+                  "point" -> AssociationThread[SymbolName /@ vars, ToString[#, InputForm] & /@ pt],
+                  "v30" -> N[{Re[v30], Im[v30]}], "v60" -> N[{Re[v60], Im[v60]}],
+                  "zero" -> zero, "clean" -> clean|>];
+                If[!zero && clean, Break[]]]];
+            If[vars === {}, Break[]]],
+          RandomSeeding -> 20261006]];
+      <|"parsed" -> True,
+        "simplified" -> Which[simp === True, "True", simp === False, "False",
+          simp === $TimedOut, "timeout", True, "unevaluated"],
+        "variables" -> (SymbolName /@ vars), "functions" -> (SymbolName /@ heads),
+        "points_tried" -> tried, "points_admitted" -> admitted,
+        "samples" -> samples|>]];
+  Quiet[Remove[Evaluate[ctx <> "*"]]];
+  facts]]
+"""
+
+
+def _wl_string(text: str) -> str:
+    """A Wolfram string literal holding text exactly."""
+    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _numeric_witness(samples: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """The first sample that disproves a step, or None.
+
+    A sample counts only if the difference is non-zero, came without any
+    message, and its 30- and 60-digit values agree; one precision alone is
+    not trusted.
+    """
+    for sample in samples:
+        if sample.get("zero") or not sample.get("clean"):
+            continue
+        low, high = complex(*sample["v30"]), complex(*sample["v60"])
+        if abs(high) <= 1e-40 or abs(low - high) > 1e-12 * abs(high):
+            continue
+        value = (f"{high.real:.12g}" if high.imag == 0
+                 else f"{high.real:.12g} + {high.imag:.12g} I")
+        return {"point": sample["point"], "value": value}
+    return None
+
+
+def _derivation_verdict(facts: dict[str, Any], assumptions: str = "") -> tuple[str, str]:
+    """proved, disproved or undecided, with the reason, from one step's facts.
+
+    Only FullSimplify returning True proves a step, and only a numerical
+    counterexample that agrees at two precisions disproves it. Anything else,
+    including FullSimplify giving up, running out of time or even reporting
+    the sides unequal without a numerical witness, is undecided.
+    """
+    if not facts.get("parsed"):
+        return "undecided", "a side or the assumptions could not be parsed"
+    if facts.get("simplified") == "True":
+        return "proved", "FullSimplify shows the difference is zero"
+    if _numeric_witness(facts.get("samples", [])):
+        return "disproved", ("the difference is non-zero at the witness point, at 30 "
+                             "and 60 digits")
+    reasons = {"timeout": "FullSimplify did not finish within the budget",
+               "False": "FullSimplify reports the sides unequal",
+               "unevaluated": "FullSimplify could not show the difference is zero"}
+    why = reasons.get(facts.get("simplified"), "FullSimplify could not decide")
+    if facts.get("functions"):
+        how = ("no numerical check is possible, because the step uses functions "
+               "without definitions: " + ", ".join(facts["functions"]))
+    elif assumptions and facts.get("points_admitted", 0) == 0:
+        how = "no sample point satisfied the assumptions, so no numerical check was made"
+    elif not facts.get("samples"):
+        how = "no sample point gave a number at both precisions"
+    else:
+        how = (f"no sample point gave a non-zero difference that agrees at both "
+               f"precisions ({len(facts['samples'])} evaluated)")
+    return "undecided", f"{why}; {how}"
+
+
 @server.tool(
     description=(
         "Check a chain of expressions step by step: each step must equal the one "
-        "before it. Returns the first step that does not follow. steps are Wolfram "
-        "expressions as strings, in order."
+        "before it. steps are Wolfram expressions as strings, in order. Each step "
+        "gets a verdict: proved (FullSimplify shows the difference is zero), "
+        "disproved (a numerical counterexample at exact rational points, agreeing "
+        "at 30 and 60 digits, is reported as the witness) or undecided (neither; "
+        "not a disproof). Steps are parsed in a clean scope, so session definitions "
+        "do not apply; pass contexts (e.g. ['Global`'] or a package context) to "
+        "use them. first_failing_step is the first disproved step."
     )
 )
 def verify_derivation(steps: list[str], timeout: float = 120.0,
-                      assumptions: str = "") -> dict[str, Any]:
+                      assumptions: str = "",
+                      contexts: list[str] | None = None) -> dict[str, Any]:
     refused = _refuse_while_recording("verify_derivation")
     if refused:
         return refused
     if len(steps) < 2:
         return _fail("give at least two steps to compare")
+    scope = list(contexts or [])
+    if any(not c.endswith("`") for c in scope):
+        return _fail("contexts are names ending in a backquote, such as Global`")
+    budget = max(5.0, timeout / max(1, len(steps)))
+    wl_contexts = "{" + ", ".join(_wl_string(c) for c in scope) + "}"
     checks: list[dict[str, Any]] = []
-    first_break: int | None = None
 
     for i in range(len(steps) - 1):
         a, b = steps[i], steps[i + 1]
-        # FullSimplify of the difference, bounded: a step that cannot be decided
-        # within the budget is reported as "unproven", never as "equal".
-        assume = f", Assumptions -> ({assumptions})" if assumptions else ""
-        code = (f"TimeConstrained[TrueQ[FullSimplify[({a}) - ({b}) == 0{assume}]], "
-                f"{max(5.0, timeout / max(1, len(steps)))}, $TimedOut]")
-        out = evaluate_text(code, timeout=timeout)
-        verdict = out.text.strip() if out.success else "$Failed"
-        entry = {"step": i + 1, "from": a[:120], "to": b[:120]}
-        if verdict == "True":
-            entry["equal"] = True
-        elif verdict == "$TimedOut":
-            entry["equal"] = None
-            entry["note"] = "could not be decided within the budget -- not a disproof"
-        else:
-            entry["equal"] = False
-            if first_break is None:
-                first_break = i + 1
-        if out.messages:
-            entry["messages"] = [m.get("name") for m in out.messages]
+        code = (_DERIVATION_STEP.replace("__CONTEXTS__", wl_contexts)
+                .replace("__A__", _wl_string(a)).replace("__B__", _wl_string(b))
+                .replace("__ASSUME__", _wl_string(assumptions))
+                .replace("__BUDGET__", repr(float(budget))))
+        entry: dict[str, Any] = {"step": i + 1, "from": a[:120], "to": b[:120]}
+        try:
+            facts = evaluate_json(code, timeout=timeout)
+        except Exception as exc:
+            facts = {"parsed": False, "error": repr(exc)}
+        if facts.get("success") is False:
+            facts = {"parsed": False, "error": facts.get("error")}
+        verdict, why = _derivation_verdict(facts, assumptions)
+        entry["verdict"] = verdict
+        entry["equal"] = {"proved": True, "disproved": False}.get(verdict)
+        entry["note"] = why
+        witness = _numeric_witness(facts.get("samples", []))
+        if witness:
+            entry["witness"] = witness
+        if facts.get("error"):
+            entry["error"] = facts["error"]
         checks.append(entry)
 
+    first = lambda v: next((c["step"] for c in checks if c["verdict"] == v), None)  # noqa: E731
     return _reply({
         "success": True,
         "steps": len(steps),
-        "all_verified": first_break is None and all(c.get("equal") for c in checks),
-        "first_failing_step": first_break,
+        "scope": scope or "clean",
+        "all_verified": all(c["verdict"] == "proved" for c in checks),
+        "first_failing_step": first("disproved"),
+        "first_undecided_step": first("undecided"),
         "checks": checks,
-        "note": ("equal=None means undecided within the time budget, which is not "
-                 "the same as unequal."),
+        "note": ("verdict: proved, disproved (with a numerical witness) or undecided. "
+                 "undecided is not a disproof, and equal mirrors it as True, False "
+                 "or None."),
     })
 
 

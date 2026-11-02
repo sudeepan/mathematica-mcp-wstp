@@ -164,9 +164,9 @@ notebooks(action="finalize")       # re-run in a fresh kernel, check, seal
 notebooks(action="close")
 ```
 
-Every recorded cell is written to the notebook, read back, fingerprinted and entered in the recorder ledger before its code runs. While recording, every other way to change kernel state is refused, and any failed check stops the run rather than letting an unverifiable cell through. `finalize` copies the notebook, re-runs it in a fresh kernel, compares the copy with the ledger, and fails if a cell gives a message it did not give when recorded, which usually means it leaned on something defined outside the record. It also compares each cell's result with the one recorded and reports any difference, and a cell recorded with `evaluate(code, expect="True")` is a checkpoint: if its fresh result does not match, the run is not sealed. Recording warns when it starts on a kernel that already holds definitions or packages, and keeps the list in the ledger. A successful finalization seals the run. The finalized notebook shows typeset outputs and formatted `Print` cells, as a desktop run would.
+Every recorded cell is written to the notebook, read back, fingerprinted and entered in the recorder ledger before its code runs. While recording, every other way to change kernel state is refused, and any failed check stops the run rather than letting an unverifiable cell through. `finalize` copies the notebook, re-runs it in a fresh kernel, compares the copy with the ledger, and fails if a cell gives a message it did not give when recorded, which usually means it leaned on something defined outside the record. It also compares each cell's result with the one recorded: a result that differs, or is missing, stops the seal, unless the cell was recorded with `volatile=True` (a timing, say) or the difference is accepted afterwards, in writing. For now the model can do either by itself; both are planned to need the user's approval. A cell recorded with `evaluate(code, expect="True")` is a checkpoint, whose fresh result must also match the expectation; a checkpoint can never be accepted. Recording warns when it starts on a kernel that already holds definitions or packages, and keeps the list in the ledger; with `require_fresh_kernel=True` it refuses to start instead. A successful finalization seals the run. The finalized notebook shows typeset outputs and formatted `Print` cells, as a desktop run would.
 
-Later, `notebooks(action="verify_record", path=...)` checks a finalized file against its ledger and tells an edit to its text or outputs from a change to the recorded code.
+Later, `notebooks(action="verify_record", path=...)` checks a finalized file against its ledger and tells an edit to its text or outputs from a change to the recorded code. The ledger sits next to the file, so someone who can edit both can make them agree: a successful finalize therefore returns `anchors`, fingerprints of the file and the ledger, to keep where the recording session cannot rewrite them (a commit pushed to a remote, or a message to whoever reviews the run). Given back to `verify_record`, they catch any later edit to either; they cannot help against someone who can also edit the place they were kept.
 
 The details are in [`docs/agent-guide.md`](docs/agent-guide.md#recording-every-evaluation-into-a-notebook).
 
@@ -293,7 +293,7 @@ Sixteen consolidated tools rather than a wide flat surface:
 | `vars`               | Inspect, set or clear the kernel's `Global`` symbols         |
 | `supervisor`         | A kernel in its own process, outliving this one              |
 | `batch`              | Run several tools in one round trip                          |
-| `verify_derivation`  | Check a chain of expressions step by step                    |
+| `verify_derivation`  | Check a chain of expressions step by step: proved, disproved with a numerical witness, or undecided |
 | `read_notebook_file` | Read a `.nb` without opening a session                       |
 | `guide`              | Usage notes by topic                                         |
 

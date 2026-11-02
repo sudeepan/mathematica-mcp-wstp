@@ -297,6 +297,15 @@ says so (`kernel_not_fresh`, `kernel_at_start`, `warning`) and the ledger keeps
 the list. To start clean: `stop_recording(force=True)`,
 `kernel(action="restart")`, then record again.
 
+To make a fresh kernel a rule rather than advice, pass
+`require_fresh_kernel=True` to `record`, or to `create` or `open` together
+with `record=True`. Recording then refuses to start on a kernel that holds
+definitions or packages, or whose state could not be checked; nothing is
+written to a ledger, and the reply names what was found (`kernel_at_start`).
+After `create` or `open` the notebook stays open, so restart the kernel and
+start the recording on the same notebook id:
+`notebooks(action="record", notebook=..., require_fresh_kernel=True)`.
+
 Every `evaluate(code)` call writes `code` as a cell before evaluating it.
 While recording, `write_cell`, `edit_cells`, `execute_in_notebook` are blocked
 on that notebook, and saving it under a different path is refused.
@@ -311,9 +320,50 @@ evaluate("GraphGen[1]")
 
 Only `Input` and `Code` are accepted as scientific styles. Narrative styles
 (Title, Subtitle, Section, Subsection, Subsubsection, Text, Item,
-ItemNumbered, ItemParagraph) write notebook structure, as plain text in the
-style's own font, but **skip scientific execution entirely**. No ledger record is created, so the scientific ledger
-contains only cells that actually computed. Any other style is rejected.
+ItemNumbered, ItemParagraph, DisplayFormula, DisplayFormulaNumbered) write
+notebook structure, as text in the style's own font, but **skip scientific
+execution entirely**. No ledger record is created, so the scientific ledger
+contains only cells that actually computed. Any other style is rejected, and
+the error lists the accepted ones.
+
+### Mathematics in narrative cells
+
+Prose can carry the notation you would type in the notebook interface. The
+same rules apply to `evaluate(..., style=...)` while recording and to
+`edit_cells` otherwise. Without a recording, `evaluate` refuses any style other
+than `Input` or `Code`: there is no cell to write, and the text would otherwise
+run as code.
+
+| Write | Gives |
+|---|---|
+| `\[Delta]`, `\:03b4`, `\\|0003b4` | δ; an unknown name such as `\[NotAName]` is kept as written |
+| `\\` | a literal backslash, so `\\[Delta]` stays as written |
+| `\$` | a literal dollar sign |
+| `$ ... $` | an inline formula in **Wolfram syntax**, not TeX: `$Subscript[\[Gamma], \[Mu]] T^a$`, `$p^2/(2 m)$`; use `==` for an equation |
+| `\( ... \)` | an inline formula in TeX: `\(\gamma^\mu \partial_\mu \psi\)` |
+
+A `DisplayFormula` or `DisplayFormulaNumbered` cell holds one formula: TeX if
+it is wrapped in `\( ... \)`, Wolfram syntax otherwise.
+
+```text
+evaluate("The vertex $-I g Subscript[\[Gamma], \[Mu]] T^a$ fixes our convention.", style="Text")
+evaluate("Subscript[\[Gamma], \[Mu]] Subscript[\[Gamma], \[Nu]] + Subscript[\[Gamma], \[Nu]] Subscript[\[Gamma], \[Mu]] == 2 Subscript[g, \[Mu]\[Nu]]", style="DisplayFormulaNumbered")
+```
+
+- **Nothing is run.** A formula is parsed in a context of its own and only
+  typeset; `$x = 5$` assigns nothing and `$Print[1]$` prints nothing.
+- **The written order is kept.** Products and sums are shown as written, so
+  `$\[Gamma]^\[Nu] \[Gamma]^\[Mu]$` is not reordered; everything else is
+  typeset in TraditionalForm.
+- **TeX inside `$ ... $` is refused, not guessed.** Backslash commands are not
+  Wolfram syntax, and `_` and `^{...}` mean something else there, so they are
+  refused with a pointer to `\( ... \)`.
+- **Anything else that cannot be read is refused,** with the reason and the
+  character position, and nothing is written. During a recording a refused
+  cell does not fault the run; send the corrected text.
+- A cell whose stored content differs from what you sent keeps your text in
+  its `TaggingRules` (`"MCPSource"`), and `cells()` shows that text.
+- The front end's TeX reader drops a few commands, `\mathcal` among them.
 
 The recorder stamps the replay flag on every cell it writes:
 `Evaluatable -> True` on Input/Code cells and `Evaluatable -> False` on
@@ -438,12 +488,37 @@ The ledger also keeps a fingerprint and a short preview of each cell's result,
 taken from the `InputForm` text the reply shows. The fresh run captures each
 cell's result the same way, so typesetting differences between the two runs do
 not matter, and finalization reports the comparison under `reproduction`:
-`same`, `differs` (each changed cell with its recorded and fresh preview) or
-`incomplete` (a cell with no fresh result). A difference is reported, not
-enforced: a cell that leans on a definition made before recording, or that
-returns a timing, differs for different reasons, and only you can tell them
-apart. Mark a cell whose result legitimately changes from run to run with
-`evaluate(code, volatile=True)`; it is listed as volatile instead.
+`same`, `differs` (each changed cell with its recorded and fresh preview and
+both fingerprints) or `incomplete` (a cell with no fresh result). Either of
+the last two fails finalization: the run is not sealed and the finalized file
+is kept as a failed attempt. A cell that leans on a definition made before
+recording differs, and so does one that returns a timing or a random number.
+Mark a cell whose result legitimately changes from run to run with
+`evaluate(code, volatile=True)` when you record it; it is then listed as
+volatile and not compared.
+
+A difference noticed only at finalization can be accepted, in writing,
+instead of recording everything again. Finalize again with
+`accept_differences=[{"seq": 3, "fresh_digest": "...", "reason": "..."}]`,
+copying `seq` and `fresh_digest` from the failed reply. Name every cell that
+attempt found different, including those it lists under `accepted`: an
+acceptance covers one attempt only, and a partial list is refused. Each needs
+the fresh fingerprint that attempt reported, and the fresh run must then give
+that same result again, or the cell differs anew; a cell whose result changes
+on every run, such as an unseeded random number, can therefore never be
+accepted and has to be recorded again with `volatile=True`. A checkpoint cell
+can never be accepted, and while one differs no acceptance can seal the run.
+A run sealed this way reports `reproduction: "accepted"`, never `same`, and
+lists each accepted cell with its reason, in the reply, in the ledger and in
+`verify_record`. The second finalization re-runs the whole notebook, so it
+takes as long as the first.
+
+Both `accept_differences` and `volatile=True` are provisional in this form.
+They are planned to need the user's approval through the client, the program
+running the model, rather than only the model's own call; do not build on the
+current form. Until then the model can accept a difference or mark a cell
+volatile by itself, so check the accepted and volatile cells a sealed record
+lists before relying on it.
 
 A checkpoint is enforced. `evaluate(code, expect="True")` stores the
 expectation in the ledger before the cell runs, reports `checkpoint` in the
@@ -456,8 +531,16 @@ predicate that cannot decide should return something other than its pass value.
 
 The finalize reply reports each check separately under `status`: `structure`,
 `fresh_run`, `messages`, `reproduction` and `checkpoints`. The fresh run
-captures results through `$Post`; a notebook that sets `$Post` itself stops
-that capture for later cells, which then show as missing.
+captures results through `$Post`, including `Null` results; a notebook that
+sets `$Post` itself stops that capture for later cells, which then show as
+missing and fail finalization. A cell ending in `;` gives `Null` in both runs,
+so the comparison checks nothing there: `a = RandomInteger[10^6];` followed by
+`b = a + 1;` seals as `same`. Only a checkpoint, or a later cell that shows a
+value depending on it, catches a change in such a cell. Two cases differ by
+design between the runs and need `volatile=True`: a cell that uses `%` or
+`Out` (the recording session keeps no output history, the fresh run does), and
+a result containing symbols the kernel numbers itself, such as `x$1234` from
+`Module`.
 
 ### What the finalized notebook shows
 
@@ -543,6 +626,24 @@ match, and `changes` says what differs from the file as it was sealed:
 `none`, `narrative_or_outputs_only` (text edited after sealing, for example),
 or `recorded_cells`. It also returns the statuses the finalization reported.
 
+That check is relative to the ledger, which sits next to the file: someone who
+can edit both can change a recorded cell and update the ledger to match. A
+successful finalize returns `anchors`: the run id, the SHA-256 of the
+finalized file and of the ledger, and the reproduction status. Copy them
+somewhere the recording session cannot later rewrite, such as a commit
+pushed to a remote or a message to whoever reviews the run, and pass them
+back:
+
+```text
+notebooks(action="verify_record", path="...",
+          expected_file_sha256="...", expected_ledger_sha256="...")
+```
+
+The reply then reports `anchors_match` for each, and `verified` is false on
+any mismatch. Nothing writes the ledger after the run is sealed, so the
+anchors stay valid. They protect against edits made after they were copied,
+not against someone who can also edit the place they were copied to.
+
 Neither proves scientific correctness. For mathematical divergence, use
 `Length`/`LeafCount` on transparent expressions and `ByteCount` on opaque
 ones (pitfall 7).
@@ -579,14 +680,16 @@ Before a serious replay:
 For a from-scratch computation:
 
 ```text
-1. start from a fresh kernel if the record must stand on its own
+1. start from a fresh kernel if the record must stand on its own;
+   require_fresh_kernel=True in step 2 enforces it
 2. notebooks(action="create", ..., path=..., record=True)
 3. evaluate(code) - every call is recorded as a cell; give the checks that
    matter an expectation: evaluate(code, expect="True")
 4. notebooks(action="save")
 5. notebooks(action="finalize") - while the recorder is still active;
-   re-evaluates in a fresh kernel, verifies against the ledger, reports
-   results that differ and fails on a checkpoint that does not pass
+   re-evaluates in a fresh kernel, verifies against the ledger, and fails
+   on a result that differs from the recorded one (unless volatile or
+   accepted) and on a checkpoint that does not pass
 6. notebooks(action="close") - releases the sealed recorder
 ```
 

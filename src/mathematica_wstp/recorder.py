@@ -36,6 +36,7 @@ class Recorder:
         "Section", "Subsection", "Subsubsection",
         "Text", "Item", "ItemNumbered", "ItemParagraph",
         "Subitem", "SubitemNumbered", "SubitemParagraph",
+        "DisplayFormula", "DisplayFormulaNumbered",
         "Output", "Print", "Message",
     })
 
@@ -149,7 +150,7 @@ class Recorder:
             return {
                 "success": False,
                 "error": (f"style {style!r} is neither narrative nor scientific "
-                          f"(allowed: {sorted(self._SCIENTIFIC_STYLES)})"),
+                          f"(allowed: {sorted(self._SCIENTIFIC_STYLES | self._NARRATIVE_STYLES)})"),
             }
 
         return self._record_scientific(code, style, expect, volatile)
@@ -161,6 +162,11 @@ class Recorder:
         if self._check_session_loss(write_result, "narrative write"):
             return {"success": False,
                     "error": "kernel state lost during narrative write"}
+        if write_result.get("refused"):
+            # Text or a formula that could not be read: nothing was written, so
+            # the recording is intact and the caller can send a corrected cell.
+            return {"success": False, "refused": True, "scientific": False,
+                    "error": write_result.get("error", "narrative content refused")}
         if not write_result.get("success"):
             self._fault("PRE_DISPATCH",
                         f"narrative write failed: {write_result.get('error')}")
@@ -450,12 +456,17 @@ class Recorder:
     def has_unresolved(self) -> bool:
         return len(self.unresolved_records()) > 0
 
-    def finalize(self, timeout: int = 600) -> dict[str, Any]:
+    def finalize(self, timeout: int = 600,
+                 accept_differences: list[dict[str, Any]] | None = None
+                 ) -> dict[str, Any]:
         """Copy the recording notebook and evaluate it in a fresh kernel.
 
         Preflight refuses when the recorder is faulted or any record is
         unresolved (non-COMPLETED and not yet annotated). The prototype
         kernel is never touched.
+
+        accept_differences lets a result that differed in the last failed
+        attempt count as reproduced, see _validate_acceptances.
         """
         if self.is_sealed:
             return {
@@ -480,6 +491,12 @@ class Recorder:
                 "unresolved": [{"seq": r["seq"], "tag": r["record_tag"]}
                                for r in unresolved],
             }
+
+        accepted: dict[int, dict[str, Any]] = {}
+        if accept_differences:
+            accepted, refusal = self._validate_acceptances(accept_differences)
+            if refusal:
+                return {"success": False, "error": refusal, "run_id": self.run_id}
 
         estimate = self.estimated_seconds()
         if estimate > timeout:
@@ -555,13 +572,14 @@ class Recorder:
                 }
 
             structural = self._verify_finalized(finalized_path)
-            reproduction, checkpoints = self._compare_results(eval_result)
+            reproduction, checkpoints = self._compare_results(eval_result, accepted)
         except Exception as exc:
             self._record_finalization(finalized_path, success=False, error=repr(exc))
             raise
         structure_ok = structural.get("verified", False)
         checkpoints_ok = checkpoints["status"] in ("pass", "none")
-        overall_success = structure_ok and checkpoints_ok
+        reproduction_ok = reproduction["status"] in ("same", "accepted")
+        overall_success = structure_ok and checkpoints_ok and reproduction_ok
         status = {
             "structure": "verified" if structure_ok else "failed",
             "fresh_run": "completed",
@@ -570,14 +588,25 @@ class Recorder:
             "checkpoints": checkpoints["status"],
         }
         errors = ([] if structure_ok else ["post-finalization structural verification failed"]) \
-            + ([] if checkpoints_ok else ["a checkpoint did not pass in the fresh run"])
+            + ([] if checkpoints_ok else ["a checkpoint did not pass in the fresh run"]) \
+            + (["a result differs from the recorded one in the fresh run"]
+               if reproduction["status"] == "differs" else []) \
+            + (["a cell has no result from the fresh run"]
+               if reproduction["status"] == "incomplete" else [])
 
+        file_sha256 = _file_digest(finalized_path)
         self._record_finalization(
             finalized_path, success=overall_success,
             error="; ".join(errors) or None,
             details={"status": status, "reproduction": reproduction,
                      "checkpoints": checkpoints,
-                     "file_sha256": _file_digest(finalized_path)})
+                     "file_sha256": file_sha256})
+        # Taken after the sealing attempt is written; nothing writes the ledger
+        # once the run is sealed, so these stay valid.
+        anchors = ({"run_id": self.run_id, "file_sha256": file_sha256,
+                    "ledger_sha256": _file_digest(self.ledger.path),
+                    "reproduction": reproduction["status"]}
+                   if overall_success else None)
 
         return {
             "success": overall_success,
@@ -596,18 +625,87 @@ class Recorder:
                if self.kernel_at_start else {}),
             **({"repeated_messages": repeated} if repeated else {}),
             **({"previous_attempt_preserved_as": preserved} if preserved else {}),
+            **({"anchors": anchors,
+                "anchors_note": ("Copy these somewhere this recording session cannot "
+                                 "later rewrite, such as a commit pushed to a remote or "
+                                 "a message to whoever reviews the run. verify_record "
+                                 "can then check the file and its ledger against them.")}
+               if anchors else {}),
             **({"error": "; ".join(errors)} if errors else {}),
         }
 
-    def _compare_results(self, eval_result: dict[str, Any]
+    def _validate_acceptances(self, items: list[dict[str, Any]]
+                              ) -> tuple[dict[int, dict[str, Any]], str | None]:
+        """Check acceptances against the differences the last attempt reported.
+
+        Only a difference that was actually reported can be accepted: each
+        item names a cell (seq) that differed in the most recent finalization
+        attempt, the fresh-result fingerprint that attempt reported for it, and
+        a reason, and together the items name every such cell. A checkpoint
+        cell can never be accepted. Anything else is refused before the fresh
+        run starts. Returns (accepted, refusal).
+        """
+        latest = self.ledger.data.get("finalization")
+        if not isinstance(latest, dict) or latest.get("success") is not False:
+            return {}, ("accept_differences applies to the differences reported by the "
+                        "last failed finalization attempt, and there is none")
+        # A cell accepted in that attempt still differed from the recording; an
+        # acceptance covers one attempt, so it has to be named again.
+        repro = latest.get("reproduction") or {}
+        reported = {d["seq"]: d for d in repro.get("accepted", []) + repro.get("differs", [])}
+        if not reported:
+            return {}, (f"the last finalization attempt (attempt {latest.get('attempt')}) "
+                        "reported no differing results, so there is nothing to accept")
+        accepted: dict[int, dict[str, Any]] = {}
+        for item in items:
+            if not isinstance(item, dict):
+                return {}, f"each acceptance must be an object, got {item!r}"
+            seq, digest = item.get("seq"), item.get("fresh_digest")
+            if isinstance(seq, str) and seq.isdigit():
+                seq = int(seq)
+            reason = str(item.get("reason") or "").strip()
+            record = self.ledger.record_by_seq(seq) if isinstance(seq, int) else None
+            if record is None:
+                return {}, f"no recorded cell with seq {seq!r}"
+            if "expect" in record:
+                return {}, (f"seq {seq} is a checkpoint; a checkpoint's result can never "
+                            "be accepted")
+            if seq in accepted:
+                return {}, f"seq {seq} is accepted twice"
+            if seq not in reported:
+                return {}, (f"seq {seq} did not differ in the last finalization attempt "
+                            f"(attempt {latest.get('attempt')})")
+            if digest != reported[seq].get("fresh_digest"):
+                return {}, (f"the fingerprint given for seq {seq} is not the fresh result "
+                            f"attempt {latest.get('attempt')} reported")
+            if not reason:
+                return {}, f"the acceptance of seq {seq} needs a reason"
+            accepted[seq] = {"fresh_digest": digest, "reason": reason,
+                             "from_attempt": latest.get("attempt")}
+        unnamed = sorted(set(reported) - set(accepted))
+        checkpoints = [s for s in unnamed if "expect" in (self.ledger.record_by_seq(s) or {})]
+        if checkpoints:
+            return {}, (f"checkpoint seq {', '.join(map(str, checkpoints))} differed in attempt "
+                        f"{latest.get('attempt')}; a checkpoint can never be accepted, so "
+                        "no acceptance can seal this run")
+        if unnamed:
+            return {}, (f"attempt {latest.get('attempt')} also found seq "
+                        f"{', '.join(map(str, unnamed))} different; accept every difference "
+                        "it listed, or none")
+        return accepted, None
+
+    def _compare_results(self, eval_result: dict[str, Any],
+                         accepted: dict[int, dict[str, Any]] | None = None
                          ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Compare each cell's fresh-run result with the one recorded.
 
-        Reproduction is reported, never enforced: a result can differ for
-        reasons the recording cannot know (a timing, a process id), and a
-        volatile cell says so up front. A checkpoint is enforced: its fresh
-        result must match the expectation stored before the cell first ran.
+        A result that differs, or that the fresh run did not give, fails
+        reproduction, unless the cell was marked volatile when recorded or the
+        difference is one accepted from the last attempt (same fresh
+        fingerprint). A checkpoint's fresh result must also match the
+        expectation stored before the cell first ran.
         """
+        accepted = accepted or {}
         cell_at = _line_to_cell(eval_result.get("labels", []))
         fresh: dict[str, dict[str, Any]] = {}
         for entry in eval_result.get("outputs", []):
@@ -617,7 +715,7 @@ class Recorder:
                 # A cell's result is its last statement's.
                 fresh[tag] = {"digest": digest, "preview": preview, "length": length}
 
-        same, differs, missing, volatile, unrecorded = [], [], [], [], []
+        same, differs, missing, volatile, unrecorded, taken = [], [], [], [], [], []
         results = []
         for r in self.ledger.records:
             if (r.get("disposition") or {}).get("execution_outcome") != "COMPLETED":
@@ -638,17 +736,31 @@ class Recorder:
                 missing.append(seq)
             elif got["digest"] == r["output_digest"]:
                 same.append(seq)
+            elif seq in accepted and got["digest"] == accepted[seq]["fresh_digest"]:
+                taken.append({"seq": seq, "record_tag": tag,
+                              "recorded": r.get("output_preview"),
+                              "fresh": got["preview"],
+                              "recorded_digest": r["output_digest"],
+                              "fresh_digest": got["digest"],
+                              "reason": accepted[seq]["reason"],
+                              "accepted_from_attempt": accepted[seq]["from_attempt"]})
             else:
                 differs.append({"seq": seq, "record_tag": tag,
                                 "recorded": r.get("output_preview"),
-                                "fresh": got["preview"]})
+                                "fresh": got["preview"],
+                                "recorded_digest": r["output_digest"],
+                                "fresh_digest": got["digest"],
+                                **({"accepted_fresh_digest": accepted[seq]["fresh_digest"]}
+                                   if seq in accepted else {})})
 
         reproduction: dict[str, Any] = {
-            "status": "differs" if differs else "incomplete" if missing else "same",
+            "status": ("differs" if differs else "incomplete" if missing
+                       else "accepted" if taken else "same"),
             "same": len(same),
         }
         for key, value in (("differs", differs), ("missing", missing),
-                           ("volatile", volatile), ("not_recorded", unrecorded)):
+                           ("accepted", taken), ("volatile", volatile),
+                           ("not_recorded", unrecorded)):
             if value:
                 reproduction[key] = value
         checkpoints: dict[str, Any] = {

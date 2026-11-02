@@ -16,7 +16,8 @@ if ! command -v "$PY" > /dev/null; then
 fi
 
 unit="test_recorder_foundation test_recorder_core test_recorder_annotations
-      test_recorder_finalize test_recorder_adversarial test_recorder_hardening"
+      test_recorder_finalize test_recorder_adversarial test_recorder_hardening
+      test_derivation"
 live="test_kernel test_recorder_server test_server_mcp test_supervisor"
 suites=$unit
 [ "${1:-}" = "--no-kernel" ] || suites="$unit $live"

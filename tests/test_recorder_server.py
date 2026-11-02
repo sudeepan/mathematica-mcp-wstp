@@ -473,6 +473,54 @@ def test_fresh_kernel_records_without_a_warning():
         assert stored == {"user_symbols": [], "packages": []}, stored
 
 
+def test_require_fresh_kernel_refuses_then_records_after_a_restart():
+    """Opted in, a used kernel starts no recording; after a restart the same notebook does."""
+    name = fresh_symbol("rfkUsed")
+    assert evaluate_text(f"{name} = 1", timeout=30).success
+    tmp = tempfile.mkdtemp(prefix="rec-srv-rfk-")
+    ledgers = os.path.join(tmp, "ledgers")
+    os.environ["MATHEMATICA_WSTP_RECORDING_DIR"] = ledgers
+    notebooks.reset_headless_notebooks()
+    nbid = None
+    try:
+        made = payload(server.notebooks(action="create", title="Fresh only",
+                                        path=os.path.join(tmp, "rfk.nb"), record=True,
+                                        require_fresh_kernel=True))
+        assert made["success"] and made["recording"] is False, made
+        assert made["kernel_not_fresh"] is True, made
+        assert name in made["kernel_at_start"]["user_symbols"], made
+        assert "kernel(action='restart')" in made["recording_error"], made
+        nbid = made["id"]
+        nb = notebooks.get_headless_notebooks()
+        assert not nb.has_active_recorder
+        again = payload(server.notebooks(action="record", notebook=nbid,
+                                         require_fresh_kernel=True))
+        assert again["success"] is False and name in again["error"], again
+        assert not os.path.isdir(ledgers) or not os.listdir(ledgers), os.listdir(ledgers)
+
+        assert payload(server.kernel(action="restart"))["success"]
+        started = payload(server.notebooks(action="record", notebook=nbid,
+                                           require_fresh_kernel=True))
+        assert started["success"] and started["recording"] is True, started
+        assert "kernel_not_fresh" not in started, started
+        stored = nb._recorder.ledger.data["kernel_at_start"]
+        assert stored == {"user_symbols": [], "packages": []}, stored
+        assert payload(server.evaluate("2 + 3"))["output"].strip() == "5"
+    finally:
+        nb = notebooks.get_headless_notebooks()
+        with contextlib.suppress(Exception):
+            if nb.has_active_recorder:
+                nb.stop_recording(force=True)
+        with contextlib.suppress(Exception):
+            if nbid:
+                nb.close(nbid)
+        with contextlib.suppress(Exception):
+            evaluate_text(f"Remove[{name}]", timeout=30)
+        notebooks.reset_headless_notebooks()
+        os.environ.pop("MATHEMATICA_WSTP_RECORDING_DIR", None)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_multi_statement_cell_with_a_message_finalizes():
     """A message from the second statement of a recorded cell belongs to that cell."""
     with recording_session("multi") as ctx:
@@ -529,10 +577,159 @@ def test_reproduced_results_seal_with_passing_checkpoint():
         assert fin["checkpoints"]["status"] == "pass", fin
 
 
+def test_changed_result_blocks_sealing_until_accepted():
+    """No checkpoint needed: a result that changes in the fresh kernel stops the seal."""
+    a = fresh_symbol("chgA")
+    assert evaluate_text(f"{a} = 3", timeout=30).success
+    try:
+        with recording_session("changed") as ctx:
+            first = payload(server.evaluate(f"{a} + 1"))
+            assert first["output"].strip() == "4", first
+            assert payload(server.notebooks(action="save"))["success"]
+            fin = payload(server.notebooks(action="finalize"))
+            assert fin["success"] is False and fin["sealed"] is False, fin
+            assert fin["status"]["reproduction"] == "differs", fin
+            diff = fin["reproduction"]["differs"][0]
+            assert (diff["seq"], diff["recorded"]) == (1, "4"), fin
+
+            accepted = payload(server.notebooks(action="finalize", accept_differences=[
+                {"seq": 1, "fresh_digest": diff["fresh_digest"],
+                 "reason": "defined before recording, on purpose"}]))
+            assert accepted["success"] and accepted["sealed"], accepted
+            assert accepted["status"]["reproduction"] == "accepted", accepted
+            assert accepted["reproduction"]["accepted"][0]["reason"] == \
+                "defined before recording, on purpose", accepted
+    finally:
+        evaluate_text(f"Remove[{a}]", timeout=30)
+
+
+def test_accepted_result_must_repeat_in_the_next_fresh_run():
+    """A Module name repeats in every fresh kernel and can be accepted; a random number cannot."""
+    with recording_session("repeat") as ctx:
+        for code in ("Module[{x}, x]", "RandomInteger[10^6]"):
+            assert payload(server.evaluate(code))["success"], code
+        assert payload(server.notebooks(action="save"))["success"]
+        fin = payload(server.notebooks(action="finalize"))
+        digests = {d["seq"]: d["fresh_digest"] for d in fin["reproduction"]["differs"]}
+        assert fin["success"] is False and sorted(digests) == [1, 2], fin
+
+        partial = payload(server.notebooks(action="finalize", accept_differences=[
+            {"seq": 1, "fresh_digest": digests[1], "reason": "Module numbering"}]))
+        assert partial["success"] is False and "accept every difference" in partial["error"]
+
+        both = payload(server.notebooks(action="finalize", accept_differences=[
+            {"seq": s, "fresh_digest": digests[s], "reason": "accepted"} for s in (1, 2)]))
+        assert both["success"] is False and both["sealed"] is False, both
+        assert [x["seq"] for x in both["reproduction"]["accepted"]] == [1], both
+        changed = both["reproduction"]["differs"]
+        assert [x["seq"] for x in changed] == [2], both
+        assert changed[0]["accepted_fresh_digest"] == digests[2], both
+
+
 def test_expect_needs_a_recording():
     notebooks.reset_headless_notebooks()
     reply = payload(server.evaluate("1 + 1", expect="2"))
     assert reply["success"] is False and "start a recording" in reply["error"], reply
+
+
+MATH_CHECK = r"""Module[{cells = Cases[Get["PATH"], Cell[c_, st_String, o___] :> {c, st, {o}}, Infinity],
+    first, boxes, joined},
+  first = SelectFirst[cells, MatchQ[#, {_TextData, "Text", _}] && !FreeQ[#, "\[Nu]"] &];
+  boxes = Cases[first[[1]], Cell[BoxData[FormBox[b_, TraditionalForm]], "InlineFormula", ___] :> b, Infinity];
+  joined = StringJoin[Cases[first[[1]], _String, {2}]];
+  <|"delta" -> StringContainsQ[joined, FromCharacterCode[948]],
+    "literal" -> StringContainsQ[joined, "\\" <> "[Delta]"],
+    "superscripts" -> Cases[boxes, SuperscriptBox[_, e_String] :> e, Infinity],
+    "terms" -> Cases[boxes, s : "a" | "b" | "c", Infinity],
+    "inlineTeX" -> Count[cells, {t_TextData, "Text", _} /; !FreeQ[t, "InlineFormula"] &&
+       !FreeQ[t, SuperscriptBox["\[Gamma]", "\[Mu]"]] && !FreeQ[t, "\[Psi]"]],
+    "display" -> Cases[cells, {BoxData[FormBox[_, TraditionalForm]], st : "DisplayFormula" | "DisplayFormulaNumbered", o_} :>
+       {st, Lookup[o, Evaluatable, "unset"]}],
+    "sources" -> Count[cells, {_, _, o_} /; !FreeQ[o, "MCPSource"]],
+    "codeSources" -> Count[cells, {_, "Input" | "Code", o_} /; !FreeQ[o, "MCPSource"]]|>]"""
+
+
+def test_math_in_prose_is_typeset_in_order_never_run_and_seals():
+    """Formulas in prose are typeset as written, never evaluated, and the run still seals."""
+    x = fresh_symbol("mcpProseX")
+    with recording_session("prose") as ctx:
+        cells = [
+            ("The \\[Delta]-function, a literal \\\\[Delta], and "
+             "$\\[Gamma]^\\[Nu] \\[Gamma]^\\[Mu] + c - b + a$.", "Text"),
+            ("The current \\(\\bar\\psi \\gamma^\\mu \\psi\\) in TeX.", "Text"),
+            ("x^2 + y^2 == r^2", "DisplayFormula"),
+            ("\\(\\frac{e^2}{4\\pi}\\)", "DisplayFormulaNumbered"),
+            (f"Typeset only: ${x} = 5$ and $Print[\"side effect\"]$.", "Text"),
+        ]
+        for code, style in cells:
+            r = payload(server.evaluate(code, style=style))
+            assert r["success"] and r["scientific"] is False, (code, r)
+        bad = payload(server.evaluate("a typo in $x^^^2$", style="Text"))
+        assert bad["success"] is False and bad["refused"] is True, bad
+        assert "not valid Wolfram syntax" in bad["error"], bad
+        tex = payload(server.evaluate("a subscript $a_b$", style="Text"))
+        assert tex["refused"] is True and "\\( ... \\)" in tex["error"], tex
+        assert ctx.nb.recording_fault() is None
+        assert payload(server.evaluate("1 + 1"))["output"].strip() == "2"
+        assert not symbol_exists(x), "a formula in prose was evaluated"
+        printed = evaluate_text('MCPHeadlessNotebook`Private`mpProse["$Print[\\"side effect\\"]$"]; 1',
+                                timeout=60).prints
+        assert printed == [], printed
+
+        assert payload(server.notebooks(action="save"))["success"]
+        fin = payload(server.notebooks(action="finalize"))
+        assert fin["success"] and fin["sealed"], fin
+        assert fin["status"]["reproduction"] == "same", fin
+        path = fin["finalized_path"]
+        got = evaluate_json(MATH_CHECK.replace("PATH", path.replace("\\", "\\\\")), timeout=60)
+        assert got.get("success"), got
+        assert got["delta"] and got["literal"], got
+        assert got["superscripts"] == ["ν", "μ"], got
+        assert got["terms"] == ["c", "b", "a"], got
+        assert got["inlineTeX"] == 1, got
+        assert got["display"] == [["DisplayFormula", False], ["DisplayFormulaNumbered", False]], got
+        assert got["sources"] == 5 and got["codeSources"] == 0, got
+
+        assert payload(server.notebooks(action="close"))["success"]
+        ctx.nbid = None
+        assert payload(server.notebooks(action="verify_record", path=path))["verified"]
+        nb = notebooks.get_headless_notebooks()
+        sid = nb.open(path)["id"]
+        try:
+            index = next(c["index"] for c in nb.read_back(notebook=sid)["cells"]
+                         if c["style"] == "DisplayFormula")
+            edited = payload(server.edit_cells(action="replace", index=index,
+                                               content="\\(x^3\\)", notebook=sid))
+            assert edited["success"], edited
+            assert nb.save(notebook=sid)["success"]
+        finally:
+            nb.close(notebook=sid)
+        v = payload(server.notebooks(action="verify_record", path=path))
+        assert v["verified"] and v["changes"] == "narrative_or_outputs_only", v
+
+
+def test_edit_cells_writes_math_outside_a_recording():
+    """edit_cells takes the same notation; a refusal writes nothing; cells() shows the source."""
+    tmp = tempfile.mkdtemp(prefix="rec-srv-mathedit-")
+    notebooks.reset_headless_notebooks()
+    try:
+        made = payload(server.notebooks(action="create", title="Math", path=os.path.join(tmp, "m.nb")))
+        sid = made["id"]
+        source = "The energy $p^2/(2 m) + V[x]$ is conserved."
+        assert payload(server.edit_cells(action="write", style="Text", content=source, notebook=sid))["success"]
+        listed = payload(server.cells(notebook=sid))["cells"]
+        assert listed[-1]["content"] == source, listed[-1]
+        before = len(listed)
+        bad = payload(server.edit_cells(action="write", style="Text", content="bad $x +$", notebook=sid))
+        assert bad["success"] is False and bad["refused"] is True, bad
+        assert len(payload(server.cells(notebook=sid))["cells"]) == before
+        index = listed[-1]["index"]
+        assert payload(server.edit_cells(action="replace", index=index, content="Plain words.",
+                                          notebook=sid))["success"]
+        assert payload(server.cells(notebook=sid))["cells"][-1]["content"] == "Plain words."
+    finally:
+        notebooks.reset_headless_notebooks()
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def sealed_recording(ctx) -> str:
@@ -582,6 +779,22 @@ def test_verify_record_tells_narrative_edits_from_code_edits():
         assert v["verified"] is False and v["changes"] == "recorded_cells", v
         assert any(i["issue"] == "source_changed_in_finalized"
                    for i in v["structural_verification"]["issues"]), v
+
+
+def test_verify_record_with_the_anchors_finalize_returned():
+    """The anchors still match after the recorder is released: nothing rewrites the ledger."""
+    with recording_session("anchors") as ctx:
+        assert payload(server.evaluate(fresh_symbol("mcpAn") + " = 2 + 3"))["success"]
+        assert payload(server.notebooks(action="save"))["success"]
+        fin = payload(server.notebooks(action="finalize"))
+        assert fin["success"] and fin["anchors"]["reproduction"] == "same", fin
+        anchors = fin["anchors"]
+        assert payload(server.notebooks(action="close"))["success"]
+        ctx.nbid = None
+        v = payload(server.notebooks(action="verify_record", path=fin["finalized_path"],
+                                     expected_file_sha256=anchors["file_sha256"],
+                                     expected_ledger_sha256=anchors["ledger_sha256"]))
+        assert v["verified"] and v["anchors_match"] == {"file": True, "ledger": True}, v
 
 
 def test_verify_record_needs_a_finalized_file():

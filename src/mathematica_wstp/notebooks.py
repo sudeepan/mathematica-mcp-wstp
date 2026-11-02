@@ -90,6 +90,24 @@ def _with_timeout_policy(reply: dict[str, Any], timeout: int) -> dict[str, Any]:
     return reply
 
 
+def _freshness_problems(snapshot: dict[str, Any]) -> list[str]:
+    """Why a kernel snapshot does not show a fresh kernel; empty if it does."""
+    problems = []
+    if snapshot.get("error"):
+        problems.append(str(snapshot["error"]))
+    symbols = snapshot.get("user_symbols") or []
+    if symbols:
+        shown = ", ".join(symbols[:5])
+        if len(symbols) > 5:
+            shown += f" and {len(symbols) - 5} more"
+        problems.append(f"Global` definitions: {shown}")
+    if snapshot.get("packages"):
+        problems.append("packages loaded since it started: " + ", ".join(snapshot["packages"]))
+    if snapshot.get("packages_checked") is False:
+        problems.append("its packages could not be compared with those it started with")
+    return problems
+
+
 @dataclass
 class HeadlessNotebooks:
     """Front-end-free notebook sessions backed by the persistent kernel."""
@@ -877,13 +895,18 @@ class HeadlessNotebooks:
 
     _FINALIZED_NAME = re.compile(r"-(R[0-9a-f]{10})-finalized(?:-failed-\d+)?\.nb$")
 
-    def verify_record(self, path: str) -> dict[str, Any]:
+    def verify_record(self, path: str, expected_file_sha256: str | None = None,
+                      expected_ledger_sha256: str | None = None) -> dict[str, Any]:
         """Check a finalized notebook file against the ledger of its recording.
 
         The recorded code cells must still match the ledger. The file's
         fingerprint from sealing tells whether anything else changed since:
         an edit to narrative or output cells changes the file but not the
         record, an edit to a recorded cell changes both.
+
+        The ledger sits next to the file, so someone who can edit both can
+        make them agree. The anchors finalize returned, kept elsewhere, close
+        that gap: given here, the file and ledger must still hash to them.
         """
         from .recorder import _file_digest, verify_file_against_ledger
         from .recorder_ledger import RecorderLedger, ledger_dir
@@ -921,17 +944,32 @@ class HeadlessNotebooks:
         else:
             changes = "unknown"
         latest = ledger.data.get("finalization") or {}
+        current_ledger = _file_digest(ledger_path)
+        anchors_match: dict[str, bool] = {}
+        if expected_file_sha256:
+            anchors_match["file"] = current == expected_file_sha256
+        if expected_ledger_sha256:
+            anchors_match["ledger"] = current_ledger == expected_ledger_sha256
         result: dict[str, Any] = {
             "success": True,
-            "verified": bool(structural.get("verified")),
+            "verified": bool(structural.get("verified")) and all(anchors_match.values()),
             "run_id": run_id,
             "ledger": ledger_path,
             "sealed": latest.get("success") is True
                       and os.path.basename(str(latest.get("path", ""))) == os.path.basename(target),
             "file_unchanged_since_finalization": unchanged,
             "changes": changes,
+            "file_sha256": current,
+            "ledger_sha256": current_ledger,
             "structural_verification": structural,
         }
+        if anchors_match:
+            result["anchors_match"] = anchors_match
+        else:
+            result["note"] = ("Checked against the local ledger only: someone who can edit "
+                              "both the file and its ledger can make them agree. Pass the "
+                              "anchors finalize returned to check against copies kept "
+                              "elsewhere.")
         if attempt:
             for key in ("status", "reproduction", "checkpoints"):
                 if key in attempt:
@@ -1130,13 +1168,18 @@ class HeadlessNotebooks:
     # -- recording --------------------------------------------------------
 
     @_under_recording_lock
-    def start_recording(self, notebook: str | None = None) -> dict[str, Any]:
+    def start_recording(self, notebook: str | None = None,
+                        require_fresh_kernel: bool = False) -> dict[str, Any]:
         """Start a new integrity recording session on a notebook.
 
         A new recording requires a clean executable baseline: no
         pre-existing executable cells. Narrative cells (Title, Section,
         Text, etc.) are allowed. Resuming an interrupted recording is
         a separate operation.
+
+        A kernel that already holds definitions or packages is reported with a
+        warning; with require_fresh_kernel the recording is refused instead,
+        and also when the kernel's state could not be checked.
         """
         from .recorder import Recorder
 
@@ -1207,6 +1250,20 @@ class HeadlessNotebooks:
             }
 
         snapshot = self._kernel_snapshot()
+        if require_fresh_kernel:
+            problems = _freshness_problems(snapshot)
+            if problems:
+                return {
+                    "success": False,
+                    "error": ("require_fresh_kernel: the kernel is not fresh ("
+                              + "; ".join(problems) + "), so no recording was started. "
+                              "Restart it with kernel(action='restart'), then start the "
+                              f"recording again: notebooks(action='record', "
+                              f"notebook='{notebook_id}', require_fresh_kernel=True)."),
+                    "notebook": notebook_id,
+                    "kernel_not_fresh": True,
+                    "kernel_at_start": snapshot,
+                }
         self._recording_target = notebook_id
         self._recorder = Recorder(self, notebook_id, nb_path, kernel_snapshot=snapshot)
         reply = {
@@ -1227,7 +1284,8 @@ class HeadlessNotebooks:
                 "finalize will not have them either, and a cell that uses them can "
                 "give a different result there without any message. For a record that "
                 "stands on its own: stop_recording(force=True), kernel(action='restart'), "
-                "then start the recording again.")
+                "then start the recording again. require_fresh_kernel=True refuses "
+                "instead of warning.")
         return reply
 
     # Names the server itself creates in Global`: Module locals such as mcpRes
@@ -1374,7 +1432,9 @@ class HeadlessNotebooks:
                     "recording_faulted": True, "recording_fault": fault}
 
     @_under_recording_lock
-    def finalize_recording(self, timeout: int = 600) -> dict[str, Any]:
+    def finalize_recording(self, timeout: int = 600,
+                           accept_differences: list[dict[str, Any]] | None = None
+                           ) -> dict[str, Any]:
         """Run the recorder's finalization: copy, fresh kernel, evaluate.
 
         Refuses when no recorder is active or unresolved records exist.
@@ -1383,7 +1443,8 @@ class HeadlessNotebooks:
             return {"success": False,
                     "error": "no recording session is active"}
         try:
-            return self._recorder.finalize(timeout=timeout)
+            return self._recorder.finalize(timeout=timeout,
+                                           accept_differences=accept_differences)
         except Exception:
             logger.warning("finalize_recording failed", exc_info=True)
             return {"success": False, "error": "finalization failed"}

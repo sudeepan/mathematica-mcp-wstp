@@ -493,6 +493,47 @@ def test_narrative_write_failure_faults():
         assert w.rec.is_faulted
 
 
+def test_refused_narrative_content_does_not_fault():
+    """Text the helper cannot read is refused: nothing is written and the run stays intact."""
+    with workspace() as w:
+        original = w.fake._call_with_session
+
+        def refusing(fn, notebook_id, *args, timeout=60):
+            if fn == "MCPWriteCell":
+                w.fake.calls.append(fn)
+                return {"success": False, "refused": True, "reason": "not valid",
+                        "error": 'refused: the formula "x^^^2" is not valid Wolfram syntax'}
+            return original(fn, notebook_id, *args, timeout=timeout)
+
+        w.fake._call_with_session = refusing
+        r = w.rec.record_and_verify("a typo in $x^^^2$", style="Text")
+        assert r["success"] is False and r["refused"] is True, r
+        assert "not valid Wolfram syntax" in r["error"], r
+        assert not w.rec.is_faulted and w.rec.ledger.records == []
+        w.fake._call_with_session = original
+        assert w.rec.record_and_verify("the corrected $x^2$", style="Text")["success"]
+
+
+def test_prose_style_without_a_recording_is_refused():
+    """Outside a recording a prose style is refused instead of running the text as code."""
+    from mathematica_wstp import notebooks, server
+    notebooks.reset_headless_notebooks()
+    for style in ("Text", "Section", "DisplayFormula"):
+        reply = server.evaluate("x = 5", style=style).structured_content
+        assert reply["success"] is False and "no recording is active" in reply["error"], reply
+        assert "edit_cells(action='write'" in reply["error"], reply
+
+
+def test_display_formula_cells_are_narrative():
+    """A displayed formula is written like prose: no ledger record, never evaluatable."""
+    for style in ("DisplayFormula", "DisplayFormulaNumbered"):
+        with workspace() as w:
+            r = w.rec.record_and_verify("x^2 + y^2 == r^2", style=style)
+            assert r["success"] is True and r["scientific"] is False, r
+            assert w.rec.ledger.records == []
+            assert (w.fake.cells[-1]["style"], w.fake.cells[-1]["evaluatable"]) == (style, False)
+
+
 # --- style and identity ---------------------------------------------------------
 
 def test_style_change_fails_verification():
@@ -550,6 +591,7 @@ def test_unknown_style_rejected():
         r = w.rec.record_and_verify("x = 1", style="ExternalLanguage")
         assert r["success"] is False
         assert "neither narrative nor scientific" in r["error"]
+        assert all(f"'{st}'" in r["error"] for st in ("Input", "Text", "DisplayFormula")), r
         assert w.fake.calls == [], "rejected before touching the notebook"
         assert w.rec.ledger.records == []
 
@@ -845,6 +887,70 @@ def test_start_recording_refuses_supervisor_backend():
         assert nb._recorder is None
 
 
+def with_kernel_snapshot(w: Workspace, snapshot: dict):
+    nb = headless_with(w.fake, w.nb_path)
+    nb._kernel_snapshot = lambda: copy.deepcopy(snapshot)
+    return nb
+
+
+def ledger_files() -> list[str]:
+    return sorted(os.listdir(os.environ["MATHEMATICA_WSTP_RECORDING_DIR"]))
+
+
+def test_require_fresh_kernel_refuses_a_used_kernel():
+    """Opted in, a kernel holding definitions or packages starts no recording."""
+    used = {"user_symbols": ["a", "f1"], "packages": ["MyPackage`"]}
+    with workspace() as w:
+        before = ledger_files()
+        nb = with_kernel_snapshot(w, used)
+        refused = nb.start_recording(notebook="hnb1", require_fresh_kernel=True)
+        assert refused["success"] is False and refused["kernel_not_fresh"] is True, refused
+        assert refused["kernel_at_start"] == used, refused
+        for part in ("a, f1", "MyPackage`", "kernel(action='restart')",
+                     "notebooks(action='record', notebook='hnb1', require_fresh_kernel=True)"):
+            assert part in refused["error"], (part, refused["error"])
+        assert nb._recorder is None and ledger_files() == before
+
+        warned = nb.start_recording(notebook="hnb1")
+        assert warned["success"] and warned["kernel_not_fresh"] is True, warned
+        assert "require_fresh_kernel=True refuses" in warned["warning"], warned
+
+
+def test_require_fresh_kernel_refuses_a_kernel_it_could_not_check():
+    """A snapshot that failed, or packages that could not be compared, is not fresh."""
+    from mathematica_wstp.notebooks import _freshness_problems
+    unchecked = [{"error": "could not inspect the kernel: link dead"},
+                 {"user_symbols": [], "packages": [], "packages_checked": False}]
+    with workspace() as w:
+        for snapshot in unchecked:
+            nb = with_kernel_snapshot(w, snapshot)
+            refused = nb.start_recording(notebook="hnb1", require_fresh_kernel=True)
+            assert refused["success"] is False and nb._recorder is None, refused
+    many = _freshness_problems({"user_symbols": [f"s{i}" for i in range(7)], "packages": []})
+    assert many == ["Global` definitions: s0, s1, s2, s3, s4 and 2 more"], many
+
+
+def test_require_fresh_kernel_records_on_a_fresh_kernel():
+    """A fresh kernel passes the check, and the ledger keeps its empty snapshot."""
+    fresh = {"user_symbols": [], "packages": []}
+    with workspace() as w:
+        nb = with_kernel_snapshot(w, fresh)
+        started = nb.start_recording(notebook="hnb1", require_fresh_kernel=True)
+        assert started["success"] and started["recording"] is True, started
+        assert "kernel_not_fresh" not in started and "warning" not in started, started
+        assert nb._recorder.ledger.data["kernel_at_start"] == fresh
+
+
+def test_require_fresh_kernel_only_where_a_recording_starts():
+    """Passed to an action that starts no recording, the option is refused, not ignored."""
+    from mathematica_wstp import server
+    for kwargs in ({"action": "list"}, {"action": "create", "title": "t"},
+                   {"action": "open", "path": "x.nb"}, {"action": "finalize"}):
+        reply = server.notebooks(require_fresh_kernel=True, **kwargs).structured_content
+        assert reply["success"] is False, (kwargs, reply)
+        assert "applies when a recording starts" in reply["error"], (kwargs, reply)
+
+
 # --- character escapes ------------------------------------------------------------
 
 def test_named_character_survives_front_end_save():
@@ -1051,18 +1157,223 @@ def test_finalize_reports_reproduced_results_and_seals():
         assert fin["reproduction"] == {"status": "same", "same": 2}, fin
 
 
-def test_finalize_reports_a_changed_result_without_failing():
-    """A result that differs in the fresh kernel is reported, not enforced."""
+def test_changed_result_blocks_sealing():
+    """A result that differs in the fresh kernel fails finalization, and the file is kept."""
     with workspace() as w:
         a, _ = record_result(w, "result = a + 1", "4")
         run = {"success": True, "finalized": True, "messages": [],
                "labels": [[1, a["record_tag"]]], "outputs": [fresh_output(1, "1 + a")]}
         with fresh_kernel_stub(run):
             fin = w.rec.finalize(timeout=5)
-        assert fin["success"] and fin["status"]["reproduction"] == "differs", fin
+        assert fin["success"] is False and not w.rec.is_sealed, fin
+        assert "differs from the recorded one" in fin["error"], fin
         assert fin["reproduction"]["differs"] == [
             {"seq": a["seq"], "record_tag": a["record_tag"], "recorded": "4",
-             "fresh": "1 + a"}], fin
+             "fresh": "1 + a", "recorded_digest": sha("4"),
+             "fresh_digest": sha("1 + a")}], fin
+        assert os.path.exists(fin["finalized_path"])
+        attempt = w.rec.ledger.data["finalization"]
+        assert attempt["success"] is False and attempt["status"]["reproduction"] == "differs"
+
+
+def test_same_and_volatile_results_seal():
+    with workspace() as w:
+        a, _ = record_result(w, "x = 2", "2")
+        b, _ = record_result(w, "t = AbsoluteTime[]", "3.9e9", volatile=True)
+        run = {"success": True, "finalized": True, "messages": [],
+               "labels": [[1, a["record_tag"]], [2, b["record_tag"]]],
+               "outputs": [fresh_output(1, "2"), fresh_output(2, "4.0e9")]}
+        with fresh_kernel_stub(run):
+            fin = w.rec.finalize(timeout=5)
+        assert fin["success"] and w.rec.is_sealed, fin
+        assert fin["reproduction"] == {"status": "same", "same": 1,
+                                       "volatile": [b["seq"]]}, fin
+
+
+def test_missing_result_blocks_sealing():
+    """A cell the fresh run gave no result for cannot count as reproduced."""
+    with workspace() as w:
+        a, _ = record_result(w, "x = 2", "2")
+        run = {"success": True, "finalized": True, "messages": [],
+               "labels": [[1, a["record_tag"]]], "outputs": []}
+        with fresh_kernel_stub(run):
+            fin = w.rec.finalize(timeout=5)
+        assert fin["success"] is False and not w.rec.is_sealed, fin
+        assert fin["reproduction"]["status"] == "incomplete", fin
+        assert "no result from the fresh run" in fin["error"], fin
+
+
+@contextlib.contextmanager
+def counting_stub(result: dict):
+    """A fresh-kernel stub that also counts how often the fresh run was started."""
+    calls = []
+    original = recorder_mod._evaluate_in_fresh_kernel
+    def run(path, timeout=600):
+        calls.append(path)
+        return dict(result)
+    recorder_mod._evaluate_in_fresh_kernel = run
+    try:
+        yield calls
+    finally:
+        recorder_mod._evaluate_in_fresh_kernel = original
+
+
+def differing_attempt(w: Workspace) -> tuple[dict, dict, dict]:
+    """Record a cell, run a finalization in which it differs; return the pieces."""
+    a, _ = record_result(w, "result = a + 1", "4")
+    run = {"success": True, "finalized": True, "messages": [],
+           "labels": [[1, a["record_tag"]]], "outputs": [fresh_output(1, "1 + a")]}
+    with fresh_kernel_stub(run):
+        first = w.rec.finalize(timeout=5)
+    assert first["success"] is False and first["status"]["reproduction"] == "differs"
+    return a, run, first
+
+
+def test_accepted_difference_seals_and_says_so():
+    """A difference the last attempt reported can be accepted, and is shown as accepted."""
+    with workspace() as w:
+        a, run, first = differing_attempt(w)
+        digest = first["reproduction"]["differs"][0]["fresh_digest"]
+        acceptance = [{"seq": a["seq"], "fresh_digest": digest,
+                       "reason": "a was defined outside the record on purpose"}]
+        with fresh_kernel_stub(run):
+            fin = w.rec.finalize(timeout=5, accept_differences=acceptance)
+        assert fin["success"] and w.rec.is_sealed, fin
+        assert fin["status"]["reproduction"] == "accepted", fin
+        taken = fin["reproduction"]["accepted"]
+        assert taken == [{"seq": a["seq"], "record_tag": a["record_tag"],
+                          "recorded": "4", "fresh": "1 + a",
+                          "recorded_digest": sha("4"), "fresh_digest": digest,
+                          "reason": "a was defined outside the record on purpose",
+                          "accepted_from_attempt": 1}], fin
+        stored = w.rec.ledger.data["finalization"]
+        assert stored["success"] is True and stored["reproduction"]["accepted"] == taken
+        assert fin["anchors"]["reproduction"] == "accepted", fin
+        later = verifier(w).verify_record(fin["finalized_path"])
+        assert later["reproduction"]["status"] == "accepted", later
+
+
+def test_acceptances_that_are_refused():
+    """Only a reported difference, with its fingerprint and a reason, and never a checkpoint."""
+    with workspace() as w:
+        a, _ = record_result(w, "result = a + 1", "4")
+        with counting_stub({"success": True}) as calls:
+            refused = w.rec.finalize(timeout=5, accept_differences=[
+                {"seq": a["seq"], "fresh_digest": sha("1 + a"), "reason": "r"}])
+        assert refused["success"] is False and "there is none" in refused["error"], refused
+        assert calls == [] and "finalization" not in w.rec.ledger.data
+
+    with workspace() as w:
+        a, run, first = differing_attempt(w)
+        b, _ = record_result(w, "ok = True", "True", expect="True")
+        digest = first["reproduction"]["differs"][0]["fresh_digest"]
+        attempts = len(w.rec.ledger.data["finalization_attempts"])
+        cases = [
+            ({"seq": 99, "fresh_digest": digest, "reason": "r"}, "no recorded cell"),
+            ({"seq": b["seq"], "fresh_digest": digest, "reason": "r"}, "checkpoint"),
+            ({"seq": a["seq"], "fresh_digest": sha("something else"), "reason": "r"},
+             "not the fresh result"),
+            ({"seq": a["seq"], "fresh_digest": digest, "reason": "  "}, "needs a reason"),
+        ]
+        for item, words in cases:
+            with counting_stub(run) as calls:
+                refused = w.rec.finalize(timeout=5, accept_differences=[item])
+            assert refused["success"] is False and words in refused["error"], (item, refused)
+            assert calls == [], item
+        with counting_stub(run) as calls:
+            twice = w.rec.finalize(timeout=5, accept_differences=[
+                {"seq": a["seq"], "fresh_digest": digest, "reason": "r"},
+                {"seq": a["seq"], "fresh_digest": digest, "reason": "r"}])
+        assert "accepted twice" in twice["error"] and calls == []
+        assert len(w.rec.ledger.data["finalization_attempts"]) == attempts
+
+
+def test_cell_not_among_the_last_differences_is_refused():
+    with workspace() as w:
+        a, run, first = differing_attempt(w)
+        b, _ = record_result(w, "x = 2", "2")
+        with counting_stub(run) as calls:
+            refused = w.rec.finalize(timeout=5, accept_differences=[
+                {"seq": b["seq"], "fresh_digest": sha("2"), "reason": "r"}])
+        assert "did not differ in the last finalization attempt" in refused["error"], refused
+        assert calls == []
+
+
+def test_accepted_cell_that_changes_again_fails():
+    """An acceptance binds to the fresh result it named; a new value is a new difference."""
+    with workspace() as w:
+        a, run, first = differing_attempt(w)
+        digest = first["reproduction"]["differs"][0]["fresh_digest"]
+        moved = dict(run, outputs=[fresh_output(1, "2 + a")])
+        with fresh_kernel_stub(moved):
+            fin = w.rec.finalize(timeout=5, accept_differences=[
+                {"seq": a["seq"], "fresh_digest": digest, "reason": "r"}])
+        assert fin["success"] is False and not w.rec.is_sealed, fin
+        assert fin["reproduction"]["differs"][0]["accepted_fresh_digest"] == digest, fin
+
+
+def two_differing_cells(w: Workspace) -> tuple[dict, dict, dict]:
+    """Record two cells and run a finalization in which both differ."""
+    a, _ = record_result(w, "u = Module[{x}, x]", "x$17178")
+    b, _ = record_result(w, "v = RandomInteger[10^6]", "979118")
+    run = {"success": True, "finalized": True, "messages": [],
+           "labels": [[1, a["record_tag"]], [2, b["record_tag"]]],
+           "outputs": [fresh_output(1, "x$16960"), fresh_output(2, "885115")]}
+    with fresh_kernel_stub(run):
+        first = w.rec.finalize(timeout=5)
+    assert [d["seq"] for d in first["reproduction"]["differs"]] == [a["seq"], b["seq"]]
+    return a, b, run
+
+
+def test_acceptance_must_name_every_difference():
+    """Accepting part of what an attempt reported is refused before any fresh run."""
+    with workspace() as w:
+        a, b, run = two_differing_cells(w)
+        with counting_stub(run) as calls:
+            partial = w.rec.finalize(timeout=5, accept_differences=[
+                {"seq": a["seq"], "fresh_digest": sha("x$16960"), "reason": "r"}])
+        assert partial["success"] is False and calls == [], partial
+        assert f"also found seq {b['seq']} different" in partial["error"], partial
+
+        # Accepted together: cell a repeats, cell b changes again, so it fails.
+        moved = dict(run, outputs=[fresh_output(1, "x$16960"), fresh_output(2, "442872")])
+        with fresh_kernel_stub(moved):
+            second = w.rec.finalize(timeout=5, accept_differences=[
+                {"seq": a["seq"], "fresh_digest": sha("x$16960"), "reason": "r"},
+                {"seq": b["seq"], "fresh_digest": sha("885115"), "reason": "r"}])
+        assert second["success"] is False and not w.rec.is_sealed, second
+        assert [x["seq"] for x in second["reproduction"]["accepted"]] == [a["seq"]]
+        assert [x["seq"] for x in second["reproduction"]["differs"]] == [b["seq"]]
+
+        # The cell accepted in that attempt is not carried over: name it again.
+        with counting_stub(moved) as calls:
+            again = w.rec.finalize(timeout=5, accept_differences=[
+                {"seq": b["seq"], "fresh_digest": sha("442872"), "reason": "r"}])
+        assert f"also found seq {a['seq']} different" in again["error"] and calls == []
+        with fresh_kernel_stub(moved):
+            sealed = w.rec.finalize(timeout=5, accept_differences=[
+                {"seq": a["seq"], "fresh_digest": sha("x$16960"), "reason": "r"},
+                {"seq": b["seq"], "fresh_digest": sha("442872"), "reason": "r"}])
+        assert sealed["success"] and w.rec.is_sealed, sealed
+        assert sealed["status"]["reproduction"] == "accepted", sealed
+
+
+def test_differing_checkpoint_rules_out_any_acceptance():
+    """When a checkpoint's result differed, no acceptance of the other cells can seal."""
+    with workspace() as w:
+        a, _ = record_result(w, "result = a + 1", "4")
+        b, _ = record_result(w, "ok = TrueQ[result == 4]", "True", expect="True")
+        run = {"success": True, "finalized": True, "messages": [],
+               "labels": [[1, a["record_tag"]], [2, b["record_tag"]]],
+               "outputs": [fresh_output(1, "1 + a"), fresh_output(2, "False")]}
+        with fresh_kernel_stub(run):
+            first = w.rec.finalize(timeout=5)
+        assert first["success"] is False
+        with counting_stub(run) as calls:
+            refused = w.rec.finalize(timeout=5, accept_differences=[
+                {"seq": a["seq"], "fresh_digest": sha("1 + a"), "reason": "r"}])
+        assert refused["success"] is False and calls == [], refused
+        assert f"checkpoint seq {b['seq']} differed" in refused["error"], refused
 
 
 def test_failed_checkpoint_blocks_sealing():
@@ -1121,6 +1432,85 @@ def test_literal_comparison_ignores_whitespace_outside_strings():
     assert recorder_mod._same_literal('"pass"', ' "pass" ')
     assert not recorder_mod._same_literal('"a b"', '"ab"')
     assert not recorder_mod._same_literal("1 + a", "4")
+
+
+
+def verifier(w: Workspace):
+    """A real HeadlessNotebooks that reads the finalized file through FakeHelper."""
+    nb = headless_with(w.fake, w.nb_path)
+    nb.open, nb.close, nb.is_open = w.fake.open, w.fake.close, w.fake.is_open
+    return nb
+
+
+def file_sha(path: str) -> str:
+    with open(path, "rb") as fh:
+        return hashlib.sha256(fh.read()).hexdigest()
+
+
+def sealed_run(w: Workspace) -> tuple[dict, dict]:
+    a, _ = record_result(w, "x = 2", "2")
+    run = {"success": True, "finalized": True, "messages": [],
+           "labels": [[1, a["record_tag"]]], "outputs": [fresh_output(1, "2")]}
+    with fresh_kernel_stub(run):
+        fin = w.rec.finalize(timeout=5)
+    assert fin["success"] and w.rec.is_sealed, fin
+    return a, fin
+
+
+def test_finalize_returns_anchors_of_both_files():
+    with workspace() as w:
+        _, fin = sealed_run(w)
+        assert fin["anchors"] == {"run_id": w.rec.run_id,
+                                  "file_sha256": file_sha(fin["finalized_path"]),
+                                  "ledger_sha256": file_sha(w.rec.ledger.path),
+                                  "reproduction": "same"}, fin
+        assert "cannot later rewrite" in fin["anchors_note"]
+
+
+def test_failed_finalize_returns_no_anchors():
+    with workspace() as w:
+        a, run, first = differing_attempt(w)
+        assert "anchors" not in first, first
+
+
+def test_anchors_catch_an_edited_ledger():
+    with workspace() as w:
+        _, fin = sealed_run(w)
+        anchors = fin["anchors"]
+        with open(w.rec.ledger.path, "a") as fh:
+            fh.write("\n")
+        checked = verifier(w).verify_record(
+            fin["finalized_path"], expected_file_sha256=anchors["file_sha256"],
+            expected_ledger_sha256=anchors["ledger_sha256"])
+        assert checked["anchors_match"] == {"file": True, "ledger": False}, checked
+        assert checked["verified"] is False, checked
+
+
+def test_anchors_catch_a_consistent_edit_of_file_and_ledger():
+    """Changing a recorded cell and its ledger together passes locally, not against anchors."""
+    with workspace() as w:
+        a, fin = sealed_run(w)
+        anchors, path = fin["anchors"], fin["finalized_path"]
+        edited = copy.deepcopy(w.fake.cells)
+        next(c for c in edited if c["tag"] == a["record_tag"])["source"] = "x = 3"
+        w.fake.files[path] = edited
+        with open(path, "a") as fh:
+            fh.write("(* edited *)")
+        ledger = RecorderLedger.load(w.rec.ledger.path)
+        ledger.record_by_seq(a["seq"])["source_digest"] = sha(canon("x = 3"))
+        ledger.data["finalization"]["file_sha256"] = file_sha(path)
+        ledger.data["finalization_attempts"][-1]["file_sha256"] = file_sha(path)
+        recorder_mod._write_atomically(ledger.path, ledger.data)
+
+        plain = verifier(w).verify_record(path)
+        assert plain["verified"] is True and plain["changes"] == "none", plain
+        assert "local ledger only" in plain["note"], plain
+
+        anchored = verifier(w).verify_record(
+            path, expected_file_sha256=anchors["file_sha256"],
+            expected_ledger_sha256=anchors["ledger_sha256"])
+        assert anchored["anchors_match"] == {"file": False, "ledger": False}, anchored
+        assert anchored["verified"] is False, anchored
 
 
 # --- Runner ----------------------------------------------------------------
