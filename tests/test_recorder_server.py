@@ -13,6 +13,7 @@ Needs the `mcp` package and a Wolfram kernel:
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import shutil
 import sys
@@ -341,13 +342,15 @@ def test_finalize_accepts_messages_given_when_recorded():
 
 
 def test_finalize_refuses_message_not_given_when_recorded():
-    """A cell that leaned on a definition made before recording fails in the fresh kernel."""
-    warm = fresh_symbol("mcpWarm")
-    assert evaluate_text(f"{warm} = True", timeout=30).success
+    """A cell that leaned on a file that has gone since fails in the fresh kernel."""
     with recording_session("warm") as ctx:
-        reply = payload(server.evaluate(f"If[TrueQ[{warm}], 1, 1/0]"))
+        flag = os.path.join(ctx.tmp, "flag.txt")
+        open(flag, "w").close()
+        escaped = flag.replace("\\", "\\\\").replace('"', '\\"')
+        reply = payload(server.evaluate(f'If[FileExistsQ["{escaped}"], 1, 1/0]'))
         assert reply["success"] and not reply.get("messages"), reply
         assert payload(server.notebooks(action="save"))["success"]
+        os.remove(flag)
 
         fin = payload(server.notebooks(action="finalize"))
         assert fin["success"] is False, fin
@@ -445,23 +448,20 @@ def test_finalized_prints_and_outputs_are_typeset():
         evaluate_text("$PrePrint =.", timeout=30)
 
 
-def test_record_start_reports_existing_definitions():
-    """Definitions made before recording are reported and kept in the ledger."""
+def test_recording_restarts_a_used_kernel():
+    """Definitions made before recording are gone: the recording starts in a new kernel."""
     name = fresh_symbol("recWarn")
     assert evaluate_text(f"{name} = 3", timeout=30).success
-    try:
-        with recording_session("warn") as ctx:
-            made = ctx.made
-            assert made.get("run_id") == ctx.nb._recorder.run_id, made
-            assert made.get("kernel_not_fresh") is True, made
-            assert name in made["kernel_at_start"]["user_symbols"], made
-            assert "restart" in made["warning"], made
-            assert not any(n.startswith(("mcp", "$MCP"))
-                           for n in made["kernel_at_start"]["user_symbols"]), made
-            stored = ctx.nb._recorder.ledger.data["kernel_at_start"]
-            assert name in stored["user_symbols"], stored
-    finally:
-        evaluate_text(f"Remove[{name}]", timeout=30)
+    with recording_session("warn") as ctx:
+        made = ctx.made
+        assert made.get("run_id") == ctx.nb._recorder.run_id, made
+        restarted = made["kernel_restarted"]
+        assert restarted["success"] and restarted["previous_pid"] != restarted["pid"], made
+        assert "kernel_not_fresh" not in made and "warning" not in made, made
+        assert "load every package" in made["note"], made
+        stored = ctx.nb._recorder.ledger.data["kernel_at_start"]
+        assert stored == {"user_symbols": [], "packages": []}, stored
+        assert payload(server.evaluate(name))["output"].strip() == name
 
 
 def test_fresh_kernel_records_without_a_warning():
@@ -473,49 +473,72 @@ def test_fresh_kernel_records_without_a_warning():
         assert stored == {"user_symbols": [], "packages": []}, stored
 
 
-def test_require_fresh_kernel_refuses_then_records_after_a_restart():
-    """Opted in, a used kernel starts no recording; after a restart the same notebook does."""
+def test_record_keeps_unsaved_cells_across_the_restart():
+    """Cells written before record are saved first, so the restart does not lose them."""
     name = fresh_symbol("rfkUsed")
     assert evaluate_text(f"{name} = 1", timeout=30).success
     tmp = tempfile.mkdtemp(prefix="rec-srv-rfk-")
-    ledgers = os.path.join(tmp, "ledgers")
-    os.environ["MATHEMATICA_WSTP_RECORDING_DIR"] = ledgers
+    os.environ["MATHEMATICA_WSTP_RECORDING_DIR"] = os.path.join(tmp, "ledgers")
     notebooks.reset_headless_notebooks()
+    nb = notebooks.get_headless_notebooks()
     nbid = None
     try:
-        made = payload(server.notebooks(action="create", title="Fresh only",
-                                        path=os.path.join(tmp, "rfk.nb"), record=True,
-                                        require_fresh_kernel=True))
-        assert made["success"] and made["recording"] is False, made
-        assert made["kernel_not_fresh"] is True, made
-        assert name in made["kernel_at_start"]["user_symbols"], made
-        assert "kernel(action='restart')" in made["recording_error"], made
+        made = nb.create(title="Fresh only", path=os.path.join(tmp, "rfk.nb"))
+        assert made["success"], made
         nbid = made["id"]
-        nb = notebooks.get_headless_notebooks()
-        assert not nb.has_active_recorder
-        again = payload(server.notebooks(action="record", notebook=nbid,
-                                         require_fresh_kernel=True))
-        assert again["success"] is False and name in again["error"], again
-        assert not os.path.isdir(ledgers) or not os.listdir(ledgers), os.listdir(ledgers)
-
-        assert payload(server.kernel(action="restart"))["success"]
+        assert nb.write_cell("Written before recording", style="Section", notebook=nbid)["success"]
         started = payload(server.notebooks(action="record", notebook=nbid,
                                            require_fresh_kernel=True))
         assert started["success"] and started["recording"] is True, started
+        assert started["kernel_restarted"]["previous_pid"] != started["kernel_restarted"]["pid"]
         assert "kernel_not_fresh" not in started, started
         stored = nb._recorder.ledger.data["kernel_at_start"]
         assert stored == {"user_symbols": [], "packages": []}, stored
         assert payload(server.evaluate("2 + 3"))["output"].strip() == "5"
+        assert payload(server.notebooks(action="save"))["success"]
+        assert cell_forms(os.path.join(tmp, "rfk.nb")) == [
+            ["Title", "String"], ["Section", "String"], ["Input", "BoxData"]], \
+            cell_forms(os.path.join(tmp, "rfk.nb"))
     finally:
-        nb = notebooks.get_headless_notebooks()
         with contextlib.suppress(Exception):
             if nb.has_active_recorder:
                 nb.stop_recording(force=True)
         with contextlib.suppress(Exception):
             if nbid:
                 nb.close(nbid)
+        notebooks.reset_headless_notebooks()
+        os.environ.pop("MATHEMATICA_WSTP_RECORDING_DIR", None)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_recording_waits_for_another_notebook_to_be_saved():
+    """The restart would lose another notebook's unsaved cell, so recording refuses until it is saved."""
+    tmp = tempfile.mkdtemp(prefix="rec-srv-other-")
+    os.environ["MATHEMATICA_WSTP_RECORDING_DIR"] = os.path.join(tmp, "ledgers")
+    notebooks.reset_headless_notebooks()
+    nb = notebooks.get_headless_notebooks()
+    ids = []
+    try:
+        other = nb.create(title="Other", path=os.path.join(tmp, "other.nb"))
+        target = nb.create(title="Target", path=os.path.join(tmp, "target.nb"))
+        ids = [other["id"], target["id"]]
+        assert nb.save(notebook=other["id"])["success"]
+        assert nb.write_cell("not saved yet", style="Text", notebook=other["id"])["success"]
+        refused = payload(server.notebooks(action="record", notebook=target["id"]))
+        assert refused["success"] is False and other["id"] in refused["error"], refused
+        assert "unsaved changes" in refused["error"] and not nb.has_active_recorder, refused
+        assert nb.save(notebook=other["id"])["success"]
+        started = payload(server.notebooks(action="record", notebook=target["id"]))
+        assert started["success"] and started["recording"] is True, started
+        assert cell_forms(os.path.join(tmp, "other.nb")) == [
+            ["Title", "String"], ["Text", "String"]], cell_forms(os.path.join(tmp, "other.nb"))
+    finally:
         with contextlib.suppress(Exception):
-            evaluate_text(f"Remove[{name}]", timeout=30)
+            if nb.has_active_recorder:
+                nb.stop_recording(force=True)
+        for nbid in ids:
+            with contextlib.suppress(Exception):
+                nb.close(nbid)
         notebooks.reset_headless_notebooks()
         os.environ.pop("MATHEMATICA_WSTP_RECORDING_DIR", None)
         shutil.rmtree(tmp, ignore_errors=True)
@@ -534,28 +557,23 @@ def test_multi_statement_cell_with_a_message_finalizes():
         assert fin["timeout"] == 900 and fin["estimated_seconds"] < 900, fin
 
 
-def test_checkpoint_catches_a_definition_made_before_recording():
-    """The reported repro: definitions made outside the record change the fresh results."""
+def test_definitions_made_before_recording_cannot_reach_it():
+    """The reported repro: definitions made outside the record are gone once it starts."""
     a, f1, f2 = (fresh_symbol(p) for p in ("cpA", "cpTermOne", "cpTermTwo"))
     assert evaluate_text(f"{a} = 3; {f1} = 1/(u - v); {f2} = -1/(u - v);",
                          timeout=30).success
-    try:
-        with recording_session("cpfail") as ctx:
-            assert ctx.made.get("kernel_not_fresh") is True, ctx.made
-            first = payload(server.evaluate(f"{a} + 1"))
-            assert first["output"].strip() == "4", first
-            check = payload(server.evaluate(f"TrueQ[Together[{f1} + {f2}] === 0]",
-                                            expect="True"))
-            assert check["checkpoint"]["status"] == "pass", check
-            assert payload(server.notebooks(action="save"))["success"]
-            fin = payload(server.notebooks(action="finalize"))
-            assert fin["success"] is False and fin["sealed"] is False, fin
-            assert fin["status"]["checkpoints"] == "fail", fin
-            assert fin["checkpoints"]["results"][0]["got"] == "False", fin
-            assert [(d["seq"], d["recorded"]) for d in fin["reproduction"]["differs"]] == [
-                (1, "4"), (2, "True")], fin
-    finally:
-        evaluate_text(f"Remove[{a}, {f1}, {f2}]", timeout=30)
+    with recording_session("cpfail"):
+        first = payload(server.evaluate(f"{a} + 1"))
+        assert first["output"].strip() == f"1 + {a}", first
+        check = payload(server.evaluate(f"TrueQ[Together[{f1} + {f2}] === 0]",
+                                        expect="True"))
+        assert check["checkpoint"]["status"] == "fail", check
+        assert payload(server.notebooks(action="save"))["success"]
+        fin = payload(server.notebooks(action="finalize"))
+        assert fin["success"] is False and fin["sealed"] is False, fin
+        assert fin["status"]["reproduction"] == "same", fin
+        assert fin["status"]["checkpoints"] == "fail", fin
+        assert fin["checkpoints"]["results"][0]["got"] == "False", fin
 
 
 def test_reproduced_results_seal_with_passing_checkpoint():
@@ -579,42 +597,47 @@ def test_reproduced_results_seal_with_passing_checkpoint():
 
 def test_changed_result_blocks_sealing_until_accepted():
     """No checkpoint needed: a result that changes in the fresh kernel stops the seal."""
-    a = fresh_symbol("chgA")
-    assert evaluate_text(f"{a} = 3", timeout=30).success
-    try:
-        with recording_session("changed") as ctx:
-            first = payload(server.evaluate(f"{a} + 1"))
-            assert first["output"].strip() == "4", first
-            assert payload(server.notebooks(action="save"))["success"]
-            fin = payload(server.notebooks(action="finalize"))
-            assert fin["success"] is False and fin["sealed"] is False, fin
-            assert fin["status"]["reproduction"] == "differs", fin
-            diff = fin["reproduction"]["differs"][0]
-            assert (diff["seq"], diff["recorded"]) == (1, "4"), fin
+    with recording_session("changed") as ctx:
+        source = os.path.join(ctx.tmp, "value.m")
+        with open(source, "w") as fh:
+            fh.write("3")
+        first = payload(server.evaluate(f"Get[{json.dumps(source)}]"))
+        assert first["output"].strip() == "3", first
+        assert payload(server.notebooks(action="save"))["success"]
+        with open(source, "w") as fh:
+            fh.write("4")
+        fin = payload(server.notebooks(action="finalize"))
+        assert fin["success"] is False and fin["sealed"] is False, fin
+        assert fin["status"]["reproduction"] == "differs", fin
+        diff = fin["reproduction"]["differs"][0]
+        assert (diff["seq"], diff["recorded"], diff["fresh"]) == (1, "3", "4"), fin
 
-            accepted = payload(server.notebooks(action="finalize", accept_differences=[
-                {"seq": 1, "fresh_digest": diff["fresh_digest"],
-                 "reason": "defined before recording, on purpose"}]))
-            assert accepted["success"] and accepted["sealed"], accepted
-            assert accepted["status"]["reproduction"] == "accepted", accepted
-            assert accepted["reproduction"]["accepted"][0]["reason"] == \
-                "defined before recording, on purpose", accepted
-    finally:
-        evaluate_text(f"Remove[{a}]", timeout=30)
+        accepted = payload(server.notebooks(action="finalize", accept_differences=[
+            {"seq": 1, "fresh_digest": diff["fresh_digest"],
+             "reason": "the input file was updated on purpose"}]))
+        assert accepted["success"] and accepted["sealed"], accepted
+        assert accepted["status"]["reproduction"] == "accepted", accepted
+        assert accepted["reproduction"]["accepted"][0]["reason"] == \
+            "the input file was updated on purpose", accepted
 
 
 def test_accepted_result_must_repeat_in_the_next_fresh_run():
-    """A Module name repeats in every fresh kernel and can be accepted; a random number cannot."""
+    """A changed input repeats in every fresh kernel and can be accepted; a random number cannot."""
     with recording_session("repeat") as ctx:
-        for code in ("Module[{x}, x]", "RandomInteger[10^6]"):
+        source = os.path.join(ctx.tmp, "value.m")
+        with open(source, "w") as fh:
+            fh.write("3")
+        for code in (f"Get[{json.dumps(source)}]", "RandomInteger[10^6]"):
             assert payload(server.evaluate(code))["success"], code
         assert payload(server.notebooks(action="save"))["success"]
+        with open(source, "w") as fh:
+            fh.write("4")
         fin = payload(server.notebooks(action="finalize"))
         digests = {d["seq"]: d["fresh_digest"] for d in fin["reproduction"]["differs"]}
         assert fin["success"] is False and sorted(digests) == [1, 2], fin
 
         partial = payload(server.notebooks(action="finalize", accept_differences=[
-            {"seq": 1, "fresh_digest": digests[1], "reason": "Module numbering"}]))
+            {"seq": 1, "fresh_digest": digests[1], "reason": "input file updated"}]))
         assert partial["success"] is False and "accept every difference" in partial["error"]
 
         both = payload(server.notebooks(action="finalize", accept_differences=[

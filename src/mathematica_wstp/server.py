@@ -444,7 +444,7 @@ def status() -> dict[str, Any]:
 
 # What start_recording reports that create/open with record=True pass on.
 _RECORDING_START_FIELDS = ("run_id", "ledger", "kernel_not_fresh", "kernel_at_start",
-                           "warning")
+                           "kernel_restarted", "note", "warning")
 
 
 @server.tool(
@@ -454,9 +454,11 @@ _RECORDING_START_FIELDS = ("run_id", "ledger", "kernel_not_fresh", "kernel_at_st
         "| stop_recording | finalize(timeout) | verify_record(path).\n"
         "record: start integrity recording of every evaluate() call into this "
         "notebook (needs a disk path, no existing Input/Code cells, and the direct "
-        "kernel). Pass record=True with create or open to start immediately. A kernel "
-        "that already holds definitions or packages gets a warning; "
-        "require_fresh_kernel=True refuses to start instead. While "
+        "kernel). Pass record=True with create or open to start immediately. Every "
+        "recording starts in a fresh kernel: the notebook is saved, the kernel "
+        "restarted and the notebook reopened, so load packages inside the recording; "
+        "require_fresh_kernel=True also refuses when even the fresh kernel holds "
+        "definitions from its startup files. While "
         "recording, tools that would run code outside evaluate() are refused. "
         "finalize: while recording, re-run the notebook in a fresh kernel, check it "
         "against the recorder ledger and seal the run; otherwise save and run "
@@ -1653,10 +1655,11 @@ _GUIDE: dict[str, str] = {
         "check owner_alive before calling anything abandoned.\n"
         "read_notebook_file() reads a .nb without opening a session.\n"
         "To build a notebook from evaluate() calls with an audit trail: "
-        "notebooks(action='create', path=..., record=True), evaluate as usual, then "
-        "save and finalize, which re-runs the notebook in a fresh kernel, checks it "
-        "against the recorder ledger and seals it. While recording, other ways to run "
-        "code are refused; docs/agent-guide.md has the details."
+        "notebooks(action='create', path=..., record=True), which restarts the kernel "
+        "first, evaluate as usual (loading packages too), then save and finalize, "
+        "which re-runs the notebook in a fresh kernel, checks it against the recorder "
+        "ledger and seals it. While recording, other ways to run code are refused; "
+        "docs/agent-guide.md has the details."
     ),
     "state": (
         "The kernel is persistent and shared: everything you define stays until the "

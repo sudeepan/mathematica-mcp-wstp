@@ -97,6 +97,8 @@ class FakeHelper:
                 reply["raw_digest"] = sha(received)
                 reply["canonical_digest"] = sha(canon(received))
             return reply
+        if fn == "MCPSave":
+            return {"success": True, "id": notebook_id, "saved": True}
         if fn == "MCPReadBack":
             return {"success": True, "id": notebook_id, "total": len(cells),
                     "cells": [self._readback(i, c) for i, c in enumerate(cells)]}
@@ -203,6 +205,8 @@ def headless_with(fake: FakeHelper, path: str):
         "notebook_id": fake.notebook_id, "path": path,
         "title": "", "created": True})()
     nb._call_with_session = fake._call_with_session
+    # No kernel to restart here; the restart itself is tested against a live kernel.
+    nb._fresh_kernel_for_recording = lambda notebook_id: {"success": True, "previous_pid": 1, "pid": 2}
     return nb
 
 
@@ -906,13 +910,13 @@ def test_require_fresh_kernel_refuses_a_used_kernel():
         refused = nb.start_recording(notebook="hnb1", require_fresh_kernel=True)
         assert refused["success"] is False and refused["kernel_not_fresh"] is True, refused
         assert refused["kernel_at_start"] == used, refused
-        for part in ("a, f1", "MyPackage`", "kernel(action='restart')",
-                     "notebooks(action='record', notebook='hnb1', require_fresh_kernel=True)"):
+        for part in ("a, f1", "MyPackage`", "startup files", "without require_fresh_kernel"):
             assert part in refused["error"], (part, refused["error"])
         assert nb._recorder is None and ledger_files() == before
 
         warned = nb.start_recording(notebook="hnb1")
         assert warned["success"] and warned["kernel_not_fresh"] is True, warned
+        assert "startup files" in warned["warning"], warned
         assert "require_fresh_kernel=True refuses" in warned["warning"], warned
 
 
@@ -938,7 +942,60 @@ def test_require_fresh_kernel_records_on_a_fresh_kernel():
         started = nb.start_recording(notebook="hnb1", require_fresh_kernel=True)
         assert started["success"] and started["recording"] is True, started
         assert "kernel_not_fresh" not in started and "warning" not in started, started
+        assert started["kernel_restarted"]["pid"] == 2, started
         assert nb._recorder.ledger.data["kernel_at_start"] == fresh
+
+
+def test_recording_starts_in_a_fresh_kernel():
+    """The kernel is restarted after the checks and before the snapshot and the recorder."""
+    with workspace() as w:
+        nb = headless_with(w.fake, w.nb_path)
+        order = []
+        nb._fresh_kernel_for_recording = lambda notebook_id: (
+            order.append(("restart", notebook_id)) or {"success": True, "previous_pid": 7, "pid": 8})
+        nb._kernel_snapshot = lambda: (order.append(("snapshot",)) or {"user_symbols": [], "packages": []})
+        started = nb.start_recording(notebook="hnb1")
+        assert started["success"] and order == [("restart", "hnb1"), ("snapshot",)], (order, started)
+        assert started["kernel_restarted"] == {"success": True, "previous_pid": 7, "pid": 8}, started
+
+
+def test_restart_refused_while_another_notebook_is_unsaved():
+    """Another open notebook with unsaved changes stops the restart, and is named."""
+    from mathematica_wstp import session
+    with workspace() as w:
+        nb = headless_with(w.fake, w.nb_path)
+        del nb._fresh_kernel_for_recording  # the real restart step, with the kernel stubbed
+        listing = {"success": True, "notebooks": [
+            {"id": "hnb1", "path": w.nb_path, "dirty": True},
+            {"id": "hnb2", "path": "/elsewhere/other.nb", "dirty": True}]}
+        nb._call = lambda fn, *a, **k: (listing if fn == "MCPList"
+                                        else w.fake._call_with_session(fn, *a, **k))
+        restarts = []
+        real_restart = session.restart_kernel
+        session.restart_kernel = lambda: restarts.append(1) or {"previous_pid": 1, "pid": 2}
+        try:
+            refused = nb.start_recording(notebook="hnb1")
+            assert refused["success"] is False, refused
+            assert "hnb2 (/elsewhere/other.nb)" in refused["error"], refused
+            assert restarts == [] and nb._recorder is None
+            assert "MCPSave" not in w.fake.calls, w.fake.calls
+            listing["notebooks"][1]["dirty"] = False
+            started = nb.start_recording(notebook="hnb1")
+            assert started["success"] and restarts == [1], started
+            assert started["kernel_restarted"]["pid"] == 2, started
+        finally:
+            session.restart_kernel = real_restart
+
+
+def test_failed_fresh_kernel_starts_no_recording():
+    """If the kernel cannot be restarted, nothing is recorded and no ledger is written."""
+    with workspace() as w:
+        before = ledger_files()
+        nb = headless_with(w.fake, w.nb_path)
+        nb._fresh_kernel_for_recording = lambda notebook_id: {"success": False, "error": "no kernel"}
+        refused = nb.start_recording(notebook="hnb1")
+        assert refused["success"] is False and "fresh kernel" in refused["error"], refused
+        assert nb._recorder is None and ledger_files() == before
 
 
 def test_require_fresh_kernel_only_where_a_recording_starts():

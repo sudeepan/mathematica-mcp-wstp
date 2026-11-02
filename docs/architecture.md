@@ -166,6 +166,11 @@ Recording is the third kind of record: a notebook built from `evaluate` calls,
 where each call is checked into the notebook before it runs.
 
 ```text
+notebooks(action="record")
+    save the notebook; restart the kernel; reopen the notebook
+    note any definitions or packages the fresh kernel still holds
+    start the ledger
+
 evaluate(code)
     write the cell (tagged, Evaluatable -> True)
     read it back; compare its fingerprint with the source sent
