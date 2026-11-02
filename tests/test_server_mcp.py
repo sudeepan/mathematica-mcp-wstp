@@ -5,9 +5,10 @@ The unit tests in test_kernel.py prove the transport; these prove the wiring --
 that tools are registered, that responses are JSON a model can use, and above
 all that abort() reaches a kernel while evaluate() is still blocked on it.
 
-That last one only works if the framework dispatches sync tools on worker
-threads, which is why the tools are plain ``def``. If someone converts them to
-``async def``, this file is what will catch it.
+That last one only works if the tools run on worker threads: each is a plain
+``def``, registered through an async twin that runs it on one and sends
+progress messages meanwhile. If someone runs a tool on the event loop instead,
+this file is what will catch it.
 
 Run: .venv/bin/python tests/test_server_mcp.py
 """
@@ -607,6 +608,49 @@ def check_an_aborting_cell_does_not_take_the_session_down() -> list[tuple[str, b
             srv.wait()
         os.unlink(nb.name)
     return out
+
+
+def check_a_long_call_sends_progress_messages() -> list[tuple[str, bool, str]]:
+    """A call that runs longer than the interval tells the client it is still going.
+
+    A client may end a call that has been silent for a while although the
+    kernel is still working. The interval is shortened here so the check is fast.
+    """
+    params = StdioServerParameters(command=PARAMS.command, args=PARAMS.args,
+                                   env={**PARAMS.env, "MATHEMATICA_WSTP_PROGRESS_SECONDS": "0.5"})
+
+    async def run() -> tuple[dict, list, dict, list]:
+        long_reports: list = []
+        short_reports: list = []
+
+        async def on_long(progress, total, message):
+            long_reports.append((progress, total, message))
+
+        async def on_short(progress, total, message):
+            short_reports.append((progress, total, message))
+
+        async with stdio_client(params) as (read, write):
+            async with ClientSession(read, write) as sess:
+                await sess.initialize()
+                await sess.call_tool("evaluate", {"code": "1"})   # start the kernel first
+                long = _payload(await sess.call_tool(
+                    "evaluate", {"code": "Pause[3]; 7"}, progress_callback=on_long))
+                short = _payload(await sess.call_tool(
+                    "evaluate", {"code": "1 + 1"}, progress_callback=on_short))
+        return long, long_reports, short, short_reports
+
+    long, long_reports, short, short_reports = asyncio.run(run())
+    progress = [p for p, _, _ in long_reports]
+    return [
+        ("a long call still returns its result", long.get("output", "").strip() == "7", str(long)[:200]),
+        ("a long call sends progress messages", len(long_reports) >= 3, str(long_reports)),
+        ("progress only grows", progress == sorted(set(progress)), str(progress)),
+        ("each message names the tool",
+         all(str(m).startswith("evaluate still running after ") for _, _, m in long_reports),
+         str(long_reports)[:200]),
+        ("a quick call sends none", short_reports == [] and short.get("output", "").strip() == "2",
+         str(short_reports)),
+    ]
 
 
 def check_summary_mode_keeps_the_index_bookkeeping() -> list[tuple[str, bool, str]]:
@@ -1803,6 +1847,7 @@ def main() -> int:
     results += check_the_subkernel_pool_can_be_released_without_losing_state()
     results += check_a_span_that_skips_an_unrun_cell_says_so()
     results += check_summary_mode_keeps_the_index_bookkeeping()
+    results += check_a_long_call_sends_progress_messages()
     results += check_per_cell_replay_is_reachable_from_the_protocol()
     results += check_an_oversized_replay_keeps_what_identifies_the_run()
     results += check_an_oversized_cell_listing_degrades_instead_of_breaking()

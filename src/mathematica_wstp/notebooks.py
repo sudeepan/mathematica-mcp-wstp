@@ -1177,9 +1177,13 @@ class HeadlessNotebooks:
         Text, etc.) are allowed. Resuming an interrupted recording is
         a separate operation.
 
-        A kernel that already holds definitions or packages is reported with a
-        warning; with require_fresh_kernel the recording is refused instead,
-        and also when the kernel's state could not be checked.
+        Every recording starts in a fresh kernel: the notebook is saved, the
+        kernel restarted and the notebook reopened before the recorder exists, so
+        nothing defined before the recording (a definition, a changed option,
+        $Assumptions, a loaded package) can reach it without being part of it.
+        What the fresh kernel still holds came from its own startup files; that is
+        reported with a warning, and with require_fresh_kernel the recording is
+        refused instead, as it is when the kernel's state could not be checked.
         """
         from .recorder import Recorder
 
@@ -1249,20 +1253,30 @@ class HeadlessNotebooks:
                 "error": "integrity recording requires a notebook with a disk path",
             }
 
+        fresh = self._fresh_kernel_for_recording(notebook_id)
+        if not fresh.get("success"):
+            return {
+                "success": False,
+                "error": ("could not start the recording in a fresh kernel: "
+                          + str(fresh.get("error", ""))),
+                "notebook": notebook_id,
+            }
+
         snapshot = self._kernel_snapshot()
         if require_fresh_kernel:
             problems = _freshness_problems(snapshot)
             if problems:
                 return {
                     "success": False,
-                    "error": ("require_fresh_kernel: the kernel is not fresh ("
-                              + "; ".join(problems) + "), so no recording was started. "
-                              "Restart it with kernel(action='restart'), then start the "
-                              f"recording again: notebooks(action='record', "
-                              f"notebook='{notebook_id}', require_fresh_kernel=True)."),
+                    "error": ("require_fresh_kernel: even the freshly restarted kernel is not "
+                              "fresh (" + "; ".join(problems) + "), so no recording was "
+                              "started. This state comes from the kernel's own startup files "
+                              "(init.m or autoloaded packages); remove it there, or start the "
+                              "recording without require_fresh_kernel."),
                     "notebook": notebook_id,
                     "kernel_not_fresh": True,
                     "kernel_at_start": snapshot,
+                    "kernel_restarted": fresh,
                 }
         self._recording_target = notebook_id
         self._recorder = Recorder(self, notebook_id, nb_path, kernel_snapshot=snapshot)
@@ -1274,19 +1288,61 @@ class HeadlessNotebooks:
             "run_id": self._recorder.run_id,
             "ledger": self._recorder.ledger.path,
             "headless": True,
+            "kernel_restarted": fresh,
+            "note": ("The kernel was restarted, so the recording starts clean: load every "
+                     "package and define everything the notebook needs inside the recording."),
         }
         if snapshot.get("user_symbols") or snapshot.get("packages") or snapshot.get("error"):
             reply["kernel_not_fresh"] = True
             reply["kernel_at_start"] = snapshot
             reply["warning"] = (
-                "The kernel already holds definitions or packages from before this "
-                "recording. The record does not contain them, so the fresh kernel at "
-                "finalize will not have them either, and a cell that uses them can "
-                "give a different result there without any message. For a record that "
-                "stands on its own: stop_recording(force=True), kernel(action='restart'), "
-                "then start the recording again. require_fresh_kernel=True refuses "
-                "instead of warning.")
+                "Even the freshly restarted kernel holds definitions or packages, so they "
+                "come from its own startup files (init.m or autoloaded packages). The "
+                "fresh kernel at finalize loads them too, but the record does not contain "
+                "them, so another machine can give different results. "
+                "require_fresh_kernel=True refuses in this case.")
         return reply
+
+    def _fresh_kernel_for_recording(self, notebook_id: str) -> dict[str, Any]:
+        """Save the notebook, restart the kernel, and reopen the notebook.
+
+        Saving first keeps prose written since the notebook was created or opened.
+        Every other open notebook lives in the same kernel, so one with unsaved
+        changes stops the restart instead of losing them. The notebook is
+        reopened here, before the recorder exists, so the recorder's first write
+        is not taken for a kernel lost mid-recording.
+        """
+        from . import session
+        listed = self._call("MCPList", timeout=60)
+        if not listed.get("success"):
+            return {"success": False,
+                    "error": ("the other open notebooks could not be checked: "
+                              f"{listed.get('error')}")}
+        unsaved = [f"{n.get('id')} ({n.get('path') or 'no file yet'})"
+                   for n in listed.get("notebooks", [])
+                   if n.get("id") != notebook_id and n.get("dirty")]
+        if unsaved:
+            return {"success": False,
+                    "error": ("the kernel restart would lose the unsaved changes in "
+                              + ", ".join(unsaved) + "; save or close it first")}
+        saved = self._call_with_session("MCPSave", notebook_id, "", timeout=120)
+        if not saved.get("success"):
+            return {"success": False,
+                    "error": f"saving the notebook before the restart failed: {saved.get('error')}"}
+        try:
+            restarted = session.restart_kernel()
+        except Exception as exc:
+            return {"success": False, "error": f"the kernel restart failed: {exc!r}"}
+        reopened = self._call_with_session("MCPReadBack", notebook_id, timeout=60)
+        if not reopened.get("success"):
+            return {"success": False,
+                    "error": ("the notebook could not be reopened after the restart: "
+                              f"{reopened.get('error')}")}
+        fresh = {"success": True, "previous_pid": restarted.get("previous_pid"),
+                 "pid": restarted.get("pid")}
+        if restarted.get("subkernels_leaked"):
+            fresh["subkernels_leaked"] = restarted["subkernels_leaked"]
+        return fresh
 
     # Names the server itself creates in Global`: Module locals such as mcpRes
     # and the helper's load flag $MCPHeadlessNotebookLoaded.
@@ -1395,15 +1451,21 @@ class HeadlessNotebooks:
             return None
         try:
             if self._recorder:
-                return self._recorder.record_and_verify(code, style, expect=expect,
-                                                        volatile=volatile)
-            return self._call_with_session(
-                "MCPWriteCell", target, code, style, "End", 0)
+                result = self._recorder.record_and_verify(code, style, expect=expect,
+                                                          volatile=volatile)
+            else:
+                result = self._call_with_session(
+                    "MCPWriteCell", target, code, style, "End", 0)
         except Exception as exc:
             logger.warning("recording cell write failed", exc_info=True)
             fault = self.fault_recording("PRE_DISPATCH", f"unhandled exception: {exc!r}")
             return {"success": False, "error": "recording write failed",
                     **({"recording_faulted": True, "recording_fault": fault} if fault else {})}
+        if isinstance(result, dict) and result.get("success"):
+            error = self._save_recording_notebook()
+            if error:
+                result["save_failed"] = error
+        return result
 
     def record_outcome(self, seq: int, result: Any,
                        kernel_notice: str | None,
@@ -1422,14 +1484,39 @@ class HeadlessNotebooks:
             names = [m["name"] for m in getattr(result, "messages", None) or []
                      if m.get("name")]
             text = result.text if getattr(result, "success", False) else None
-            return self._recorder.apply_outcome(seq, disposition,
-                                                message_names=names,
-                                                output_text=text)
+            outcome = self._recorder.apply_outcome(seq, disposition,
+                                                   message_names=names,
+                                                   output_text=text)
         except Exception as exc:
             logger.warning("recording outcome failed", exc_info=True)
             fault = self.fault_recording("POST_EVAL", f"unhandled exception: {exc!r}")
             return {"success": False, "error": "recording outcome failed",
                     "recording_faulted": True, "recording_fault": fault}
+        # The outcome can change the notebook: a timed-out cell is marked not evaluatable.
+        error = self._save_recording_notebook()
+        if error and isinstance(outcome, dict):
+            outcome["save_failed"] = error
+        return outcome
+
+    def _save_recording_notebook(self) -> str | None:
+        """Save the recording notebook, so the file holds every cell recorded so far.
+
+        Returns None once saved, the error otherwise. A failed save changes
+        nothing in the recording: the next one, or finalize, writes the file
+        again. It never reopens a lost session, which would hide the lost
+        kernel from the recorder's own checks.
+        """
+        target = self._recording_target
+        if target is None:
+            return None
+        try:
+            saved = self._call("MCPSave", target, "", timeout=60)
+        except Exception as exc:
+            saved = {"success": False, "error": repr(exc)}
+        if saved.get("success"):
+            return None
+        logger.warning("saving the recording notebook failed: %s", saved.get("error"))
+        return str(saved.get("error") or "unknown error")
 
     @_under_recording_lock
     def finalize_recording(self, timeout: int = 600,

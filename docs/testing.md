@@ -8,7 +8,7 @@ Mathematica; the rest run anywhere.
 
 | Suites | Needs Mathematica | On GitHub | Locally |
 |---|---|---|---|
-| `test_recorder_hardening`, and the pure-Python tests of the five other `test_recorder_*` suites and of `test_derivation` | no | yes | yes |
+| `test_recorder_hardening`, `test_progress`, `test_supervisor_socket`, and the pure-Python tests of the five other `test_recorder_*` suites and of `test_derivation` | no | yes | yes |
 | the tests of those six suites that start a kernel | yes | skipped, with the reason | yes |
 | `test_kernel`, `test_recorder_server`, `test_server_mcp`, `test_supervisor` | yes | no | yes |
 

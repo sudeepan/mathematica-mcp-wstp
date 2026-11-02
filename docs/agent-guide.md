@@ -195,6 +195,10 @@ This is why `pitfalls.md` exists.
 Calls longer than the client's foreground window may be moved to a background
 task. That does not make the original RPC durable across a client/session exit.
 
+While a call runs, the server sends a progress message every 15 seconds, naming
+the tool and the time so far, so a client that ends silent calls keeps waiting.
+`MATHEMATICA_WSTP_PROGRESS_SECONDS` changes the interval.
+
 For a replay, set the per-cell timeout deliberately. The agent-facing replay
 surface defaults to 300 s per cell. If one cell is expected to take hours or
 days, choose the larger value explicitly and report it.
@@ -289,24 +293,31 @@ Integrity recording needs three things at the start:
 - the direct kernel. Recording is refused while a supervisor backend is
   selected; switch back with `supervisor(action="use_direct")` first.
 
-Only one recording can be active at a time. The recorder cannot see
-definitions made before it started, so start from a fresh kernel when the
-record must stand on its own. If the kernel already holds `Global`` symbols
-with definitions, or packages loaded since it started, the reply to `record`
-says so (`kernel_not_fresh`, `kernel_at_start`, `warning`) and the ledger keeps
-the list. To start clean: `stop_recording(force=True)`,
-`kernel(action="restart")`, then record again.
+Only one recording can be active at a time. Every recording starts in a
+fresh kernel: the server saves the notebook, restarts the kernel and reopens
+the notebook before the first recorded cell, and the reply says so
+(`kernel_restarted`, with the old and new process ids). Definitions made
+before the recording are gone, so load every package and define everything
+the notebook needs inside the recording. If the save, the restart or the
+reopening fails, no recording starts and no ledger is written. Every open
+notebook lives in that kernel, so another one with unsaved changes stops the
+restart and is named in the reply: save or close it, then record again.
 
-To make a fresh kernel a rule rather than advice, pass
+The fresh kernel can still hold definitions or packages from its own startup
+files (`init.m`, autoloaded packages). The reply to `record` then says so
+(`kernel_not_fresh`, `kernel_at_start`, `warning`) and the ledger keeps the
+list: the fresh kernel at finalize loads them too, but the record does not
+contain them, so another machine can give different results. Pass
 `require_fresh_kernel=True` to `record`, or to `create` or `open` together
-with `record=True`. Recording then refuses to start on a kernel that holds
-definitions or packages, or whose state could not be checked; nothing is
-written to a ledger, and the reply names what was found (`kernel_at_start`).
-After `create` or `open` the notebook stays open, so restart the kernel and
-start the recording on the same notebook id:
-`notebooks(action="record", notebook=..., require_fresh_kernel=True)`.
+with `record=True`, to refuse to start in that case, or when the kernel's
+state could not be checked; nothing is written to a ledger, and the reply
+names what was found (`kernel_at_start`).
 
 Every `evaluate(code)` call writes `code` as a cell before evaluating it.
+The notebook file is saved after each cell is written and again after it runs,
+so a session that ends before `save` leaves every recorded cell on disk. A save
+that fails is reported as `notebook_save_failed` and does not stop the
+recording: the ledger is the record, and the next save writes the file again.
 While recording, `write_cell`, `edit_cells`, `execute_in_notebook` are blocked
 on that notebook, and saving it under a different path is refused.
 
@@ -453,8 +464,8 @@ recorded. In the fresh run a cell may give those messages again: they are
 listed under `repeated_messages` and do not fail finalization. Any other
 message fails it, and `unexpected_messages` names the cell (`seq`,
 `record_tag`) and the message. A new message usually means the cell relied on
-something the fresh kernel does not have, such as a definition made before
-recording started. A message that belongs to no recorded cell, for instance
+something the fresh kernel does not have, such as a file it reads that has
+changed since. A message that belongs to no recorded cell, for instance
 while the notebook is opened or saved, also fails finalization. A cell holding
 several statements takes one line number per statement in the fresh run; its
 messages are matched to it all the same.
@@ -680,17 +691,17 @@ Before a serious replay:
 For a from-scratch computation:
 
 ```text
-1. start from a fresh kernel if the record must stand on its own;
-   require_fresh_kernel=True in step 2 enforces it
-2. notebooks(action="create", ..., path=..., record=True)
-3. evaluate(code) - every call is recorded as a cell; give the checks that
-   matter an expectation: evaluate(code, expect="True")
-4. notebooks(action="save")
-5. notebooks(action="finalize") - while the recorder is still active;
+1. notebooks(action="create", ..., path=..., record=True) - restarts the
+   kernel first; require_fresh_kernel=True also refuses a kernel whose
+   startup files define things
+2. evaluate(code) - every call is recorded as a cell; load packages here,
+   and give the checks that matter an expectation: evaluate(code, expect="True")
+3. notebooks(action="save")
+4. notebooks(action="finalize") - while the recorder is still active;
    re-evaluates in a fresh kernel, verifies against the ledger, and fails
    on a result that differs from the recorded one (unless volatile or
    accepted) and on a checkpoint that does not pass
-6. notebooks(action="close") - releases the sealed recorder
+5. notebooks(action="close") - releases the sealed recorder
 ```
 
 For the observed failure modes behind these rules, read

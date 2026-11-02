@@ -42,6 +42,9 @@ supervisor(action="use_direct")
                                return to this process's own kernel
 ```
 
+Every action uses the socket given as `socket_path`, else the one named by
+`SUP_SOCK`, else a per-user default under `XDG_RUNTIME_DIR` or `/tmp`.
+
 A notebook session belongs to the kernel that opened it. Switching execution
 backends after opening the notebook strands that live document in the old
 kernel. Reopen it after choosing the backend you intend to use.

@@ -28,7 +28,7 @@ import time
 import uuid
 
 from ..evaluator import BytesResult
-from .core import default_socket_path
+from .core import configured_socket_path
 
 __all__ = ["SupervisorEvaluator", "SupervisorUnavailable", "connect"]
 
@@ -180,7 +180,7 @@ class SupervisorEvaluator:
     name = "supervisor"
 
     def __init__(self, socket_path: str | None = None):
-        self.socket_path = socket_path or default_socket_path()
+        self.socket_path = socket_path or configured_socket_path()
 
     def talk(self, message: str, timeout: float = 30.0) -> str:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)

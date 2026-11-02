@@ -19,13 +19,19 @@ client should branch on the outcome and never on how it was serialised.
 from __future__ import annotations
 
 import base64
+import functools
+import inspect
 import json
 import logging
+import math
 import os
 import sys
+import time
+import typing
 from typing import Any, Literal
 
-from mcp.server.mcpserver import MCPServer
+import anyio
+from mcp.server.mcpserver import Context, MCPServer
 from mcp.types import CallToolResult, ImageContent, TextContent
 
 from . import discovery, registry
@@ -64,6 +70,82 @@ server = MCPServer(
         "thing."
     ),
 )
+
+# --- progress messages -----------------------------------------------------
+
+# A client may end a call that has been silent for a while although the kernel
+# is still working, so a running tool reports progress this often.
+_PROGRESS_SECONDS = 15.0
+
+
+def _progress_interval() -> float:
+    """Seconds between progress messages; MATHEMATICA_WSTP_PROGRESS_SECONDS overrides."""
+    try:
+        seconds = float(os.environ.get("MATHEMATICA_WSTP_PROGRESS_SECONDS", ""))
+    except ValueError:
+        return _PROGRESS_SECONDS
+    return seconds if math.isfinite(seconds) and seconds > 0 else _PROGRESS_SECONDS
+
+
+def _with_progress(fn):
+    """An async twin of the sync tool ``fn`` that reports progress while ``fn`` runs.
+
+    ``fn`` still runs on a worker thread, as the SDK runs a sync tool, so abort()
+    reaches a kernel that evaluate() is blocked on. The twin takes fn's parameters
+    plus ``ctx``, which the SDK fills in and leaves out of the input schema.
+    """
+    async def twin(ctx: Context, **kwargs: Any) -> Any:
+        outcome: dict[str, Any] = {}
+        done = anyio.Event()
+
+        async def work() -> None:
+            try:
+                outcome["value"] = await anyio.to_thread.run_sync(functools.partial(fn, **kwargs))
+            except Exception as exc:
+                outcome["error"] = exc
+            finally:
+                done.set()
+
+        interval = _progress_interval()
+        start = time.monotonic()
+        reporting = True
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(work)
+            while not done.is_set():
+                with anyio.move_on_after(interval):
+                    await done.wait()
+                if done.is_set() or not reporting:
+                    continue
+                elapsed = time.monotonic() - start
+                try:
+                    await ctx.report_progress(
+                        elapsed, message=f"{fn.__name__} still running after {elapsed:.0f} s")
+                except Exception:
+                    # The client cannot be told; the tool itself carries on.
+                    reporting = False
+        if "error" in outcome:
+            raise outcome["error"]
+        return outcome["value"]
+
+    signature = inspect.signature(fn, eval_str=True)
+    twin.__name__, twin.__qualname__, twin.__doc__ = fn.__name__, fn.__qualname__, fn.__doc__
+    twin.__signature__ = signature.replace(parameters=[
+        *signature.parameters.values(),
+        inspect.Parameter("ctx", inspect.Parameter.KEYWORD_ONLY, annotation=Context)])
+    twin.__annotations__ = {**typing.get_type_hints(fn), "ctx": Context}
+    return twin
+
+
+def _tool(**options: Any):
+    """``server.tool`` for a sync tool: registers its progress-reporting twin.
+
+    The module keeps the sync function itself, so code and tests that call a
+    tool directly are unaffected.
+    """
+    def register(fn):
+        server.tool(**options)(_with_progress(fn))
+        return fn
+    return register
 
 
 def _truncate(text: str, limit: int = MAX_OUTPUT_CHARS) -> tuple[str, bool]:
@@ -143,7 +225,7 @@ def _refuse_while_recording(what: str) -> CallToolResult | None:
 
 # --- evaluation ------------------------------------------------------------
 
-@server.tool(
+@_tool(
     description=(
         "Evaluate Wolfram Language code in the persistent kernel. State carries "
         "between calls. On timeout the evaluation is ABORTED but the kernel and "
@@ -221,6 +303,7 @@ def _evaluate_inner(nb, code: str, timeout: float, style: str,
                 "scientific": False,
                 "style": style,
                 "recorded": True,
+                **({"notebook_save_failed": rec["save_failed"]} if rec.get("save_failed") else {}),
             })
 
         verified = (isinstance(rec, dict)
@@ -271,6 +354,8 @@ def _evaluate_inner(nb, code: str, timeout: float, style: str,
             if outcome.get("recording_faulted"):
                 rec["recording_faulted"] = True
                 rec["recording_fault"] = outcome.get("recording_fault")
+            if outcome.get("save_failed"):
+                rec["save_failed"] = outcome["save_failed"]
 
     if not result.success:
         payload: dict[str, Any] = {
@@ -308,6 +393,8 @@ def _evaluate_inner(nb, code: str, timeout: float, style: str,
             if rec.get("recording_faulted"):
                 payload["recording_faulted"] = True
                 payload["recording_fault"] = rec.get("recording_fault")
+            if rec.get("save_failed"):
+                payload["notebook_save_failed"] = rec["save_failed"]
         payload.update(result.extra)
         return _reply(payload)
 
@@ -344,6 +431,8 @@ def _evaluate_inner(nb, code: str, timeout: float, style: str,
         if rec.get("recording_faulted"):
             payload["recording_faulted"] = True
             payload["recording_fault"] = rec.get("recording_fault")
+        if rec.get("save_failed"):
+            payload["notebook_save_failed"] = rec["save_failed"]
     flags = [k for k in ("fresh_kernel", "truncated", "kernel_replaced",
                          "result_may_be_partial")
              if payload.get(k)]
@@ -352,7 +441,7 @@ def _evaluate_inner(nb, code: str, timeout: float, style: str,
     return _reply(payload, text + (f"\n[{', '.join(flags)}]" if flags else ""))
 
 
-@server.tool(
+@_tool(
     description=(
         "Interrupt the evaluation the kernel is running right now, and verify "
         "afterwards what survived. Normally the kernel lives and every definition "
@@ -372,7 +461,7 @@ def abort(rebuild_parallel_kernels: bool = False) -> dict[str, Any]:
 
 # --- kernel administration -------------------------------------------------
 
-@server.tool(
+@_tool(
     description=(
         "Kernel administration. actions: state | restart | stop | abort | subkernels | "
         "close_subkernels | reap. "
@@ -419,7 +508,7 @@ def kernel(
     return _fail(f"unknown action: {action}")
 
 
-@server.tool(description="Server, kernel and installation status, plus any orphaned kernels.")
+@_tool(description="Server, kernel and installation status, plus any orphaned kernels.")
 def status() -> dict[str, Any]:
     k = session.kernel_status()
     payload = {
@@ -444,19 +533,21 @@ def status() -> dict[str, Any]:
 
 # What start_recording reports that create/open with record=True pass on.
 _RECORDING_START_FIELDS = ("run_id", "ledger", "kernel_not_fresh", "kernel_at_start",
-                           "warning")
+                           "kernel_restarted", "note", "warning")
 
 
-@server.tool(
+@_tool(
     description=(
         "Notebook sessions over .nb files on disk. actions: open(path) | create(title,path) "
         "| list | info | save(path) | close | verify | dependencies | record "
         "| stop_recording | finalize(timeout) | verify_record(path).\n"
         "record: start integrity recording of every evaluate() call into this "
         "notebook (needs a disk path, no existing Input/Code cells, and the direct "
-        "kernel). Pass record=True with create or open to start immediately. A kernel "
-        "that already holds definitions or packages gets a warning; "
-        "require_fresh_kernel=True refuses to start instead. While "
+        "kernel). Pass record=True with create or open to start immediately. Every "
+        "recording starts in a fresh kernel: the notebook is saved, the kernel "
+        "restarted and the notebook reopened, so load packages inside the recording; "
+        "require_fresh_kernel=True also refuses when even the fresh kernel holds "
+        "definitions from its startup files. While "
         "recording, tools that would run code outside evaluate() are refused. "
         "finalize: while recording, re-run the notebook in a fresh kernel, check it "
         "against the recorder ledger and seal the run; otherwise save and run "
@@ -586,7 +677,7 @@ def notebooks(
     return _fail(f"unknown action: {action}")
 
 
-@server.tool(
+@_tool(
     description=(
         "List or read cells of an open notebook. Use style to filter (e.g. 'Input'). "
         "Cell indices are positions in the document and are what evaluate_cells takes. "
@@ -735,7 +826,7 @@ def _condense_range(payload: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-@server.tool(
+@_tool(
     description=(
         "Evaluate notebook cells in document order, in the persistent kernel, with "
         "state carrying between them. Give either index, or from_+to for a range. "
@@ -794,7 +885,7 @@ def evaluate_cells(
     return _reply(_condense_range(payload))
 
 
-@server.tool(
+@_tool(
     description=(
         "Change the cells of an open notebook. actions: write(content,style,position) "
         "| replace(index,content) | delete(index).\n"
@@ -836,7 +927,7 @@ def edit_cells(
 
 # --- front-end rendering ---------------------------------------------------
 
-@server.tool(
+@_tool(
     description=(
         "Render with the Wolfram front end, headlessly: typeset an expression, "
         "rasterise a notebook cell, or export a notebook. "
@@ -905,7 +996,7 @@ def render(
 
 # --- kernel variables ------------------------------------------------------
 
-@server.tool(
+@_tool(
     description=(
         "Inspect or change the kernel's Global` symbols. actions: list | get(name) | "
         "set(name,value) | clear(name) | clear_all. Use this to see what a notebook "
@@ -1006,7 +1097,7 @@ def vars(
 
 # --- batching --------------------------------------------------------------
 
-@server.tool(
+@_tool(
     description=(
         "Run several of this server's tools in one round trip. "
         "ops: [{\"tool\": \"evaluate\", \"args\": {\"code\": \"1+1\"}}, ...]. "
@@ -1079,7 +1170,7 @@ def _condense_replay(payload: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-@server.tool(
+@_tool(
     description=(
         "Per-cell replay of a notebook, and reconciliation of one that was "
         "interrupted. actions: run | reconcile | list.\n"
@@ -1173,7 +1264,7 @@ def replay(
     return _reply(_condense_replay(payload))
 
 
-@server.tool(
+@_tool(
     description=(
         "A kernel owned by a separate process, so it outlives this one. "
         "actions: status | start | stop | use | use_direct | lookup.\n"
@@ -1183,10 +1274,10 @@ def replay(
         "kernel instead, keeps a ledger of every request, and can be asked "
         "afterwards what became of one.\n"
         "'start' launches one deliberately; nothing starts it implicitly, and "
-        "'use' refuses rather than starting one. 'use' points NOTEBOOK "
-        "execution at it -- evaluate() and vars() keep talking to this "
-        "process's own kernel, so while a supervisor is selected those and "
-        "notebook replay are two different kernels with different definitions. "
+        "'use' refuses rather than starting one. 'use' points evaluate(), vars() "
+        "and notebook execution at it, so they share the supervisor's kernel and "
+        "its definitions. Every action uses socket_path if given, else SUP_SOCK, "
+        "else a per-user default. "
         "'lookup' asks what became of an idempotency key without submitting "
         "anything, which is how a client that lost its answer recovers. "
         "'running' names the evaluation in the supervisor's kernel and 'abort' "
@@ -1252,9 +1343,9 @@ def supervisor(
                 payload = {
                     "success": True, "backend_in_use": evaluator.name,
                     "socket": evaluator.socket_path,
-                    "note": ("Notebook execution now runs in the supervisor's kernel. "
-                             "evaluate() and vars() still use this process's own kernel, "
-                             "so the two hold different definitions."),
+                    "note": ("evaluate(), vars() and notebook execution now run in the "
+                             "supervisor's kernel. abort() still reaches this process's "
+                             "kernel; use supervisor(action='abort') for the supervised run."),
                 }
                 if stranded:
                     # A notebook lives in the kernel that opened it. Saying so here is
@@ -1268,7 +1359,8 @@ def supervisor(
 
             if action == "use_direct":
                 return _reply({"success": True, "backend_in_use": use_own().name,
-                               "note": "Notebook execution is back in this process's kernel."})
+                               "note": ("evaluate(), vars() and notebook execution are back "
+                                        "in this process's kernel.")})
 
     if action in ("running", "abort"):
         # abort() and kernel(action="abort") reach THIS process's kernel. When
@@ -1328,7 +1420,7 @@ def _config_for(socket_path: str):
 
 # --- reading a notebook without opening a session --------------------------
 
-@server.tool(
+@_tool(
     description=(
         "Read a .nb file from disk without opening a kernel session for it. "
         "modes: outline (headings only) | markdown | wolfram (code cells only) | "
@@ -1514,7 +1606,7 @@ def _derivation_verdict(facts: dict[str, Any], assumptions: str = "") -> tuple[s
     return "undecided", f"{why}; {how}"
 
 
-@server.tool(
+@_tool(
     description=(
         "Check a chain of expressions step by step: each step must equal the one "
         "before it. steps are Wolfram expressions as strings, in order. Each step "
@@ -1653,10 +1745,11 @@ _GUIDE: dict[str, str] = {
         "check owner_alive before calling anything abandoned.\n"
         "read_notebook_file() reads a .nb without opening a session.\n"
         "To build a notebook from evaluate() calls with an audit trail: "
-        "notebooks(action='create', path=..., record=True), evaluate as usual, then "
-        "save and finalize, which re-runs the notebook in a fresh kernel, checks it "
-        "against the recorder ledger and seals it. While recording, other ways to run "
-        "code are refused; docs/agent-guide.md has the details."
+        "notebooks(action='create', path=..., record=True), which restarts the kernel "
+        "first, evaluate as usual (loading packages too), then save and finalize, "
+        "which re-runs the notebook in a fresh kernel, checks it against the recorder "
+        "ledger and seals it. While recording, other ways to run code are refused; "
+        "docs/agent-guide.md has the details."
     ),
     "state": (
         "The kernel is persistent and shared: everything you define stays until the "
@@ -1717,7 +1810,7 @@ _GUIDE: dict[str, str] = {
 }
 
 
-@server.tool(
+@_tool(
     description=("Usage notes for this server. topics: workflow | abort | errors | "
                  "notebooks | performance.")
 )
