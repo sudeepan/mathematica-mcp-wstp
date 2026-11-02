@@ -297,6 +297,15 @@ says so (`kernel_not_fresh`, `kernel_at_start`, `warning`) and the ledger keeps
 the list. To start clean: `stop_recording(force=True)`,
 `kernel(action="restart")`, then record again.
 
+To make a fresh kernel a rule rather than advice, pass
+`require_fresh_kernel=True` to `record`, or to `create` or `open` together
+with `record=True`. Recording then refuses to start on a kernel that holds
+definitions or packages, or whose state could not be checked; nothing is
+written to a ledger, and the reply names what was found (`kernel_at_start`).
+After `create` or `open` the notebook stays open, so restart the kernel and
+start the recording on the same notebook id:
+`notebooks(action="record", notebook=..., require_fresh_kernel=True)`.
+
 Every `evaluate(code)` call writes `code` as a cell before evaluating it.
 While recording, `write_cell`, `edit_cells`, `execute_in_notebook` are blocked
 on that notebook, and saving it under a different path is refused.
@@ -630,7 +639,8 @@ Before a serious replay:
 For a from-scratch computation:
 
 ```text
-1. start from a fresh kernel if the record must stand on its own
+1. start from a fresh kernel if the record must stand on its own;
+   require_fresh_kernel=True in step 2 enforces it
 2. notebooks(action="create", ..., path=..., record=True)
 3. evaluate(code) - every call is recorded as a cell; give the checks that
    matter an expectation: evaluate(code, expect="True")

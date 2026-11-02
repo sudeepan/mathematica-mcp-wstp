@@ -473,6 +473,54 @@ def test_fresh_kernel_records_without_a_warning():
         assert stored == {"user_symbols": [], "packages": []}, stored
 
 
+def test_require_fresh_kernel_refuses_then_records_after_a_restart():
+    """Opted in, a used kernel starts no recording; after a restart the same notebook does."""
+    name = fresh_symbol("rfkUsed")
+    assert evaluate_text(f"{name} = 1", timeout=30).success
+    tmp = tempfile.mkdtemp(prefix="rec-srv-rfk-")
+    ledgers = os.path.join(tmp, "ledgers")
+    os.environ["MATHEMATICA_WSTP_RECORDING_DIR"] = ledgers
+    notebooks.reset_headless_notebooks()
+    nbid = None
+    try:
+        made = payload(server.notebooks(action="create", title="Fresh only",
+                                        path=os.path.join(tmp, "rfk.nb"), record=True,
+                                        require_fresh_kernel=True))
+        assert made["success"] and made["recording"] is False, made
+        assert made["kernel_not_fresh"] is True, made
+        assert name in made["kernel_at_start"]["user_symbols"], made
+        assert "kernel(action='restart')" in made["recording_error"], made
+        nbid = made["id"]
+        nb = notebooks.get_headless_notebooks()
+        assert not nb.has_active_recorder
+        again = payload(server.notebooks(action="record", notebook=nbid,
+                                         require_fresh_kernel=True))
+        assert again["success"] is False and name in again["error"], again
+        assert not os.path.isdir(ledgers) or not os.listdir(ledgers), os.listdir(ledgers)
+
+        assert payload(server.kernel(action="restart"))["success"]
+        started = payload(server.notebooks(action="record", notebook=nbid,
+                                           require_fresh_kernel=True))
+        assert started["success"] and started["recording"] is True, started
+        assert "kernel_not_fresh" not in started, started
+        stored = nb._recorder.ledger.data["kernel_at_start"]
+        assert stored == {"user_symbols": [], "packages": []}, stored
+        assert payload(server.evaluate("2 + 3"))["output"].strip() == "5"
+    finally:
+        nb = notebooks.get_headless_notebooks()
+        with contextlib.suppress(Exception):
+            if nb.has_active_recorder:
+                nb.stop_recording(force=True)
+        with contextlib.suppress(Exception):
+            if nbid:
+                nb.close(nbid)
+        with contextlib.suppress(Exception):
+            evaluate_text(f"Remove[{name}]", timeout=30)
+        notebooks.reset_headless_notebooks()
+        os.environ.pop("MATHEMATICA_WSTP_RECORDING_DIR", None)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_multi_statement_cell_with_a_message_finalizes():
     """A message from the second statement of a recorded cell belongs to that cell."""
     with recording_session("multi") as ctx:

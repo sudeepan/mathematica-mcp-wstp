@@ -437,7 +437,9 @@ _RECORDING_START_FIELDS = ("run_id", "ledger", "kernel_not_fresh", "kernel_at_st
         "| stop_recording | finalize(timeout) | verify_record(path).\n"
         "record: start integrity recording of every evaluate() call into this "
         "notebook (needs a disk path, no existing Input/Code cells, and the direct "
-        "kernel). Pass record=True with create or open to start immediately. While "
+        "kernel). Pass record=True with create or open to start immediately. A kernel "
+        "that already holds definitions or packages gets a warning; "
+        "require_fresh_kernel=True refuses to start instead. While "
         "recording, tools that would run code outside evaluate() are refused. "
         "finalize: while recording, re-run the notebook in a fresh kernel, check it "
         "against the recorder ledger and seal the run; otherwise save and run "
@@ -481,14 +483,20 @@ def notebooks(
     accept_differences: list[dict[str, Any]] | None = None,
     expected_file_sha256: str | None = None,
     expected_ledger_sha256: str | None = None,
+    require_fresh_kernel: bool = False,
 ) -> dict[str, Any]:
     nb = get_headless_notebooks()
+    if require_fresh_kernel and not (action == "record"
+                                     or (action in ("create", "open") and record)):
+        return _fail("require_fresh_kernel applies when a recording starts: "
+                     "action='record', or create/open with record=True")
     if action == "open":
         if not path:
             return _fail("open requires a path")
         result = nb.open(path)
         if record and result.get("success"):
-            rec_result = nb.start_recording(result.get("id"))
+            rec_result = nb.start_recording(result.get("id"),
+                                            require_fresh_kernel=require_fresh_kernel)
             result["recording"] = rec_result.get("success", False)
             if not result["recording"]:
                 result["recording_error"] = rec_result.get("error",
@@ -517,7 +525,8 @@ def notebooks(
     if action == "create":
         result = nb.create(title=title, path=path)
         if record and result.get("success"):
-            rec_result = nb.start_recording(result.get("id"))
+            rec_result = nb.start_recording(result.get("id"),
+                                            require_fresh_kernel=require_fresh_kernel)
             result["recording"] = rec_result.get("success", False)
             if not result["recording"]:
                 result["recording_error"] = rec_result.get("error",
@@ -538,7 +547,7 @@ def notebooks(
     if action == "close":
         return _reply(nb.close(notebook))
     if action == "record":
-        return _reply(nb.start_recording(notebook))
+        return _reply(nb.start_recording(notebook, require_fresh_kernel=require_fresh_kernel))
     if action == "stop_recording":
         return _reply(nb.stop_recording(force=force))
     if action == "finalize":

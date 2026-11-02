@@ -845,6 +845,70 @@ def test_start_recording_refuses_supervisor_backend():
         assert nb._recorder is None
 
 
+def with_kernel_snapshot(w: Workspace, snapshot: dict):
+    nb = headless_with(w.fake, w.nb_path)
+    nb._kernel_snapshot = lambda: copy.deepcopy(snapshot)
+    return nb
+
+
+def ledger_files() -> list[str]:
+    return sorted(os.listdir(os.environ["MATHEMATICA_WSTP_RECORDING_DIR"]))
+
+
+def test_require_fresh_kernel_refuses_a_used_kernel():
+    """Opted in, a kernel holding definitions or packages starts no recording."""
+    used = {"user_symbols": ["a", "f1"], "packages": ["MyPackage`"]}
+    with workspace() as w:
+        before = ledger_files()
+        nb = with_kernel_snapshot(w, used)
+        refused = nb.start_recording(notebook="hnb1", require_fresh_kernel=True)
+        assert refused["success"] is False and refused["kernel_not_fresh"] is True, refused
+        assert refused["kernel_at_start"] == used, refused
+        for part in ("a, f1", "MyPackage`", "kernel(action='restart')",
+                     "notebooks(action='record', notebook='hnb1', require_fresh_kernel=True)"):
+            assert part in refused["error"], (part, refused["error"])
+        assert nb._recorder is None and ledger_files() == before
+
+        warned = nb.start_recording(notebook="hnb1")
+        assert warned["success"] and warned["kernel_not_fresh"] is True, warned
+        assert "require_fresh_kernel=True refuses" in warned["warning"], warned
+
+
+def test_require_fresh_kernel_refuses_a_kernel_it_could_not_check():
+    """A snapshot that failed, or packages that could not be compared, is not fresh."""
+    from mathematica_wstp.notebooks import _freshness_problems
+    unchecked = [{"error": "could not inspect the kernel: link dead"},
+                 {"user_symbols": [], "packages": [], "packages_checked": False}]
+    with workspace() as w:
+        for snapshot in unchecked:
+            nb = with_kernel_snapshot(w, snapshot)
+            refused = nb.start_recording(notebook="hnb1", require_fresh_kernel=True)
+            assert refused["success"] is False and nb._recorder is None, refused
+    many = _freshness_problems({"user_symbols": [f"s{i}" for i in range(7)], "packages": []})
+    assert many == ["Global` definitions: s0, s1, s2, s3, s4 and 2 more"], many
+
+
+def test_require_fresh_kernel_records_on_a_fresh_kernel():
+    """A fresh kernel passes the check, and the ledger keeps its empty snapshot."""
+    fresh = {"user_symbols": [], "packages": []}
+    with workspace() as w:
+        nb = with_kernel_snapshot(w, fresh)
+        started = nb.start_recording(notebook="hnb1", require_fresh_kernel=True)
+        assert started["success"] and started["recording"] is True, started
+        assert "kernel_not_fresh" not in started and "warning" not in started, started
+        assert nb._recorder.ledger.data["kernel_at_start"] == fresh
+
+
+def test_require_fresh_kernel_only_where_a_recording_starts():
+    """Passed to an action that starts no recording, the option is refused, not ignored."""
+    from mathematica_wstp import server
+    for kwargs in ({"action": "list"}, {"action": "create", "title": "t"},
+                   {"action": "open", "path": "x.nb"}, {"action": "finalize"}):
+        reply = server.notebooks(require_fresh_kernel=True, **kwargs).structured_content
+        assert reply["success"] is False, (kwargs, reply)
+        assert "applies when a recording starts" in reply["error"], (kwargs, reply)
+
+
 # --- character escapes ------------------------------------------------------------
 
 def test_named_character_survives_front_end_save():

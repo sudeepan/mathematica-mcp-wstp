@@ -90,6 +90,24 @@ def _with_timeout_policy(reply: dict[str, Any], timeout: int) -> dict[str, Any]:
     return reply
 
 
+def _freshness_problems(snapshot: dict[str, Any]) -> list[str]:
+    """Why a kernel snapshot does not show a fresh kernel; empty if it does."""
+    problems = []
+    if snapshot.get("error"):
+        problems.append(str(snapshot["error"]))
+    symbols = snapshot.get("user_symbols") or []
+    if symbols:
+        shown = ", ".join(symbols[:5])
+        if len(symbols) > 5:
+            shown += f" and {len(symbols) - 5} more"
+        problems.append(f"Global` definitions: {shown}")
+    if snapshot.get("packages"):
+        problems.append("packages loaded since it started: " + ", ".join(snapshot["packages"]))
+    if snapshot.get("packages_checked") is False:
+        problems.append("its packages could not be compared with those it started with")
+    return problems
+
+
 @dataclass
 class HeadlessNotebooks:
     """Front-end-free notebook sessions backed by the persistent kernel."""
@@ -1150,13 +1168,18 @@ class HeadlessNotebooks:
     # -- recording --------------------------------------------------------
 
     @_under_recording_lock
-    def start_recording(self, notebook: str | None = None) -> dict[str, Any]:
+    def start_recording(self, notebook: str | None = None,
+                        require_fresh_kernel: bool = False) -> dict[str, Any]:
         """Start a new integrity recording session on a notebook.
 
         A new recording requires a clean executable baseline: no
         pre-existing executable cells. Narrative cells (Title, Section,
         Text, etc.) are allowed. Resuming an interrupted recording is
         a separate operation.
+
+        A kernel that already holds definitions or packages is reported with a
+        warning; with require_fresh_kernel the recording is refused instead,
+        and also when the kernel's state could not be checked.
         """
         from .recorder import Recorder
 
@@ -1227,6 +1250,20 @@ class HeadlessNotebooks:
             }
 
         snapshot = self._kernel_snapshot()
+        if require_fresh_kernel:
+            problems = _freshness_problems(snapshot)
+            if problems:
+                return {
+                    "success": False,
+                    "error": ("require_fresh_kernel: the kernel is not fresh ("
+                              + "; ".join(problems) + "), so no recording was started. "
+                              "Restart it with kernel(action='restart'), then start the "
+                              f"recording again: notebooks(action='record', "
+                              f"notebook='{notebook_id}', require_fresh_kernel=True)."),
+                    "notebook": notebook_id,
+                    "kernel_not_fresh": True,
+                    "kernel_at_start": snapshot,
+                }
         self._recording_target = notebook_id
         self._recorder = Recorder(self, notebook_id, nb_path, kernel_snapshot=snapshot)
         reply = {
@@ -1247,7 +1284,8 @@ class HeadlessNotebooks:
                 "finalize will not have them either, and a cell that uses them can "
                 "give a different result there without any message. For a record that "
                 "stands on its own: stop_recording(force=True), kernel(action='restart'), "
-                "then start the recording again.")
+                "then start the recording again. require_fresh_kernel=True refuses "
+                "instead of warning.")
         return reply
 
     # Names the server itself creates in Global`: Module locals such as mcpRes
