@@ -293,7 +293,7 @@ Sixteen consolidated tools rather than a wide flat surface:
 | `vars`               | Inspect, set or clear the kernel's `Global`` symbols         |
 | `supervisor`         | A kernel in its own process, outliving this one              |
 | `batch`              | Run several tools in one round trip                          |
-| `verify_derivation`  | Check a chain of expressions step by step                    |
+| `verify_derivation`  | Check a chain of expressions step by step: proved, disproved with a numerical witness, or undecided |
 | `read_notebook_file` | Read a `.nb` without opening a session                       |
 | `guide`              | Usage notes by topic                                         |
 
