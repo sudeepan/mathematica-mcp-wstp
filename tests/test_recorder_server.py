@@ -632,6 +632,106 @@ def test_expect_needs_a_recording():
     assert reply["success"] is False and "start a recording" in reply["error"], reply
 
 
+MATH_CHECK = r"""Module[{cells = Cases[Get["PATH"], Cell[c_, st_String, o___] :> {c, st, {o}}, Infinity],
+    first, boxes, joined},
+  first = SelectFirst[cells, MatchQ[#, {_TextData, "Text", _}] && !FreeQ[#, "\[Nu]"] &];
+  boxes = Cases[first[[1]], Cell[BoxData[FormBox[b_, TraditionalForm]], "InlineFormula", ___] :> b, Infinity];
+  joined = StringJoin[Cases[first[[1]], _String, {2}]];
+  <|"delta" -> StringContainsQ[joined, FromCharacterCode[948]],
+    "literal" -> StringContainsQ[joined, "\\" <> "[Delta]"],
+    "superscripts" -> Cases[boxes, SuperscriptBox[_, e_String] :> e, Infinity],
+    "terms" -> Cases[boxes, s : "a" | "b" | "c", Infinity],
+    "inlineTeX" -> Count[cells, {t_TextData, "Text", _} /; !FreeQ[t, "InlineFormula"] &&
+       !FreeQ[t, SuperscriptBox["\[Gamma]", "\[Mu]"]] && !FreeQ[t, "\[Psi]"]],
+    "display" -> Cases[cells, {BoxData[FormBox[_, TraditionalForm]], st : "DisplayFormula" | "DisplayFormulaNumbered", o_} :>
+       {st, Lookup[o, Evaluatable, "unset"]}],
+    "sources" -> Count[cells, {_, _, o_} /; !FreeQ[o, "MCPSource"]],
+    "codeSources" -> Count[cells, {_, "Input" | "Code", o_} /; !FreeQ[o, "MCPSource"]]|>]"""
+
+
+def test_math_in_prose_is_typeset_in_order_never_run_and_seals():
+    """Formulas in prose are typeset as written, never evaluated, and the run still seals."""
+    x = fresh_symbol("mcpProseX")
+    with recording_session("prose") as ctx:
+        cells = [
+            ("The \\[Delta]-function, a literal \\\\[Delta], and "
+             "$\\[Gamma]^\\[Nu] \\[Gamma]^\\[Mu] + c - b + a$.", "Text"),
+            ("The current \\(\\bar\\psi \\gamma^\\mu \\psi\\) in TeX.", "Text"),
+            ("x^2 + y^2 == r^2", "DisplayFormula"),
+            ("\\(\\frac{e^2}{4\\pi}\\)", "DisplayFormulaNumbered"),
+            (f"Typeset only: ${x} = 5$ and $Print[\"side effect\"]$.", "Text"),
+        ]
+        for code, style in cells:
+            r = payload(server.evaluate(code, style=style))
+            assert r["success"] and r["scientific"] is False, (code, r)
+        bad = payload(server.evaluate("a typo in $x^^^2$", style="Text"))
+        assert bad["success"] is False and bad["refused"] is True, bad
+        assert "not valid Wolfram syntax" in bad["error"], bad
+        tex = payload(server.evaluate("a subscript $a_b$", style="Text"))
+        assert tex["refused"] is True and "\\( ... \\)" in tex["error"], tex
+        assert ctx.nb.recording_fault() is None
+        assert payload(server.evaluate("1 + 1"))["output"].strip() == "2"
+        assert not symbol_exists(x), "a formula in prose was evaluated"
+        printed = evaluate_text('MCPHeadlessNotebook`Private`mpProse["$Print[\\"side effect\\"]$"]; 1',
+                                timeout=60).prints
+        assert printed == [], printed
+
+        assert payload(server.notebooks(action="save"))["success"]
+        fin = payload(server.notebooks(action="finalize"))
+        assert fin["success"] and fin["sealed"], fin
+        assert fin["status"]["reproduction"] == "same", fin
+        path = fin["finalized_path"]
+        got = evaluate_json(MATH_CHECK.replace("PATH", path.replace("\\", "\\\\")), timeout=60)
+        assert got.get("success"), got
+        assert got["delta"] and got["literal"], got
+        assert got["superscripts"] == ["ν", "μ"], got
+        assert got["terms"] == ["c", "b", "a"], got
+        assert got["inlineTeX"] == 1, got
+        assert got["display"] == [["DisplayFormula", False], ["DisplayFormulaNumbered", False]], got
+        assert got["sources"] == 5 and got["codeSources"] == 0, got
+
+        assert payload(server.notebooks(action="close"))["success"]
+        ctx.nbid = None
+        assert payload(server.notebooks(action="verify_record", path=path))["verified"]
+        nb = notebooks.get_headless_notebooks()
+        sid = nb.open(path)["id"]
+        try:
+            index = next(c["index"] for c in nb.read_back(notebook=sid)["cells"]
+                         if c["style"] == "DisplayFormula")
+            edited = payload(server.edit_cells(action="replace", index=index,
+                                               content="\\(x^3\\)", notebook=sid))
+            assert edited["success"], edited
+            assert nb.save(notebook=sid)["success"]
+        finally:
+            nb.close(notebook=sid)
+        v = payload(server.notebooks(action="verify_record", path=path))
+        assert v["verified"] and v["changes"] == "narrative_or_outputs_only", v
+
+
+def test_edit_cells_writes_math_outside_a_recording():
+    """edit_cells takes the same notation; a refusal writes nothing; cells() shows the source."""
+    tmp = tempfile.mkdtemp(prefix="rec-srv-mathedit-")
+    notebooks.reset_headless_notebooks()
+    try:
+        made = payload(server.notebooks(action="create", title="Math", path=os.path.join(tmp, "m.nb")))
+        sid = made["id"]
+        source = "The energy $p^2/(2 m) + V[x]$ is conserved."
+        assert payload(server.edit_cells(action="write", style="Text", content=source, notebook=sid))["success"]
+        listed = payload(server.cells(notebook=sid))["cells"]
+        assert listed[-1]["content"] == source, listed[-1]
+        before = len(listed)
+        bad = payload(server.edit_cells(action="write", style="Text", content="bad $x +$", notebook=sid))
+        assert bad["success"] is False and bad["refused"] is True, bad
+        assert len(payload(server.cells(notebook=sid))["cells"]) == before
+        index = listed[-1]["index"]
+        assert payload(server.edit_cells(action="replace", index=index, content="Plain words.",
+                                          notebook=sid))["success"]
+        assert payload(server.cells(notebook=sid))["cells"][-1]["content"] == "Plain words."
+    finally:
+        notebooks.reset_headless_notebooks()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def sealed_recording(ctx) -> str:
     """Record a text cell and one computation, finalize, release; return the file."""
     for code, style in (("Setup", "Text"), (fresh_symbol("mcpVr") + " = 2 + 3", "Input")):

@@ -36,6 +36,7 @@ class Recorder:
         "Section", "Subsection", "Subsubsection",
         "Text", "Item", "ItemNumbered", "ItemParagraph",
         "Subitem", "SubitemNumbered", "SubitemParagraph",
+        "DisplayFormula", "DisplayFormulaNumbered",
         "Output", "Print", "Message",
     })
 
@@ -149,7 +150,7 @@ class Recorder:
             return {
                 "success": False,
                 "error": (f"style {style!r} is neither narrative nor scientific "
-                          f"(allowed: {sorted(self._SCIENTIFIC_STYLES)})"),
+                          f"(allowed: {sorted(self._SCIENTIFIC_STYLES | self._NARRATIVE_STYLES)})"),
             }
 
         return self._record_scientific(code, style, expect, volatile)
@@ -161,6 +162,11 @@ class Recorder:
         if self._check_session_loss(write_result, "narrative write"):
             return {"success": False,
                     "error": "kernel state lost during narrative write"}
+        if write_result.get("refused"):
+            # Text or a formula that could not be read: nothing was written, so
+            # the recording is intact and the caller can send a corrected cell.
+            return {"success": False, "refused": True, "scientific": False,
+                    "error": write_result.get("error", "narrative content refused")}
         if not write_result.get("success"):
             self._fault("PRE_DISPATCH",
                         f"narrative write failed: {write_result.get('error')}")

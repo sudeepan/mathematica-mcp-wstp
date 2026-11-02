@@ -100,9 +100,14 @@ cellStyle[c_] := If[Length[c] >= 2 && StringQ[c[[2]]], c[[2]], "Unknown"];
 (* Plain text of a cell, for previews and prose cells. Strings buried in boxes
    are joined; this is deliberately approximate and never used as the source
    for evaluation. *)
-cellText[c_] := Module[{content},
+cellText[c_] := Module[{content, src},
   content = If[Length[c] >= 1, First[c], ""];
+  (* Prose with formulas keeps the text the caller sent; show that, not box fragments. *)
+  src = FirstCase[If[Length[c] >= 3, Drop[List @@ c, 2], {}],
+    (TaggingRules -> tr_) :> FirstCase[Flatten[{tr /. a_Association :> Normal[a]}], ("MCPSource" -> s_String) :> s, None],
+    None];
   Which[
+    StringQ[src], src,
     StringQ[content], content,
     True, StringJoin[Cases[content, _String, Infinity]]
   ]
@@ -954,22 +959,233 @@ $textCellStyles = {"Title", "Subtitle", "Subsubtitle", "Chapter", "Subchapter",
   "Item", "ItemNumbered", "ItemParagraph", "Subitem", "SubitemNumbered",
   "SubitemParagraph", "Subsubitem", "SubsubitemNumbered", "SubsubitemParagraph"};
 
-cellContent[content_String, style_String] :=
-  If[MemberQ[$textCellStyles, style], content, BoxData[content]];
+$formulaCellStyles = {"DisplayFormula", "DisplayFormulaNumbered"};
+
+(* Mathematics in narrative cells. Everything here is deterministic: the text is
+   scanned by fixed rules, formulas are parsed but never evaluated, and anything
+   that cannot be read is refused with the reason instead of guessed.
+
+     \[Name] \:xxxx \|xxxxxx   the character; an unknown name is kept as written
+     \\                       a literal backslash, so \\[Delta] stays as written
+     \$                       a literal dollar sign
+     $ ... $                  an inline formula in Wolfram syntax (\$ inside it is a $)
+     \( ... \)                an inline formula in TeX
+
+   A DisplayFormula or DisplayFormulaNumbered cell holds one formula: TeX if
+   wrapped in \( ... \), Wolfram syntax otherwise.
+
+   TraditionalForm sorts the factors of a product and the terms of a sum even in
+   an unevaluated expression (b a -> a b, g^nu g^mu -> g^mu g^nu), which is wrong
+   for non-commuting objects. Products and sums are therefore laid out here in the
+   order written; every other construct is boxed by TraditionalForm as usual. *)
+
+mpRefuse[template_String, args___] := mpRefused[StringTemplate[template][args]];
+mpRefusedQ[x_] := MatchQ[x, _mpRefused];
+
+mpFmt[h : HoldComplete[_Times]] := mpTimes[h];
+mpFmt[h : HoldComplete[_Plus]] := mpPlus[h];
+mpFmt[h_HoldComplete] := mpDelegate[h];
+
+mpParts[h_HoldComplete] := List @@ (HoldComplete /@ Replace[h, HoldComplete[_[args___]] :> HoldComplete[args]]);
+
+mpNegQ[HoldComplete[n_Integer | n_Real]] := n < 0;
+mpNegQ[HoldComplete[Times[n_Integer | n_Real, ___]]] := n < 0;
+mpNegQ[_] := False;
+
+mpAbs[HoldComplete[n_Integer | n_Real]] := With[{m = -n}, HoldComplete[m]];
+mpAbs[HoldComplete[Times[-1, x_]]] := HoldComplete[x];
+mpAbs[HoldComplete[Times[-1, x__]]] := HoldComplete[Times[x]];
+mpAbs[HoldComplete[Times[n_Integer | n_Real, x__]]] := With[{m = -n}, HoldComplete[Times[m, x]]];
+
+mpParen[b_] := RowBox[{"(", b, ")"}];
+mpRow[{b_}] := b;
+mpRow[bs_List] := RowBox[Riffle[bs, " "]];
+
+mpFactor[h_HoldComplete, n_Integer] := With[{b = mpFmt[h]},
+  If[n > 1 && (MatchQ[h, HoldComplete[_Plus]] || mpNegQ[h]), mpParen[b], b]];
+
+mpTimes[h_HoldComplete] := Module[{fs = mpParts[h], sign = False, num = {}, den = {}, numB, denB, body},
+  If[fs =!= {} && mpNegQ[First[fs]],
+    sign = True;
+    If[MatchQ[First[fs], HoldComplete[-1]], fs = Rest[fs], fs[[1]] = mpAbs[First[fs]]]];
+  Scan[Replace[#, {
+      HoldComplete[Power[b_, -1]] :> AppendTo[den, HoldComplete[b]],
+      HoldComplete[Power[b_, n_Integer?Negative]] :> With[{m = -n}, AppendTo[den, HoldComplete[Power[b, m]]]],
+      other_ :> AppendTo[num, other]}] &, fs];
+  numB = If[num === {}, "1", mpRow[mpFactor[#, Length[num]] & /@ num]];
+  denB = If[den === {}, None, mpRow[mpFactor[#, Length[den]] & /@ den]];
+  body = If[denB === None, numB, FractionBox[numB, denB]];
+  If[sign, RowBox[{"-", body}], body]];
+
+mpPlus[h_HoldComplete] := Module[{ts = mpParts[h], out = {}},
+  MapIndexed[Function[{t, i}, Module[{neg = mpNegQ[t], a, b},
+      a = If[neg, mpAbs[t], t];
+      b = mpFmt[a];
+      If[MatchQ[a, HoldComplete[_Plus]], b = mpParen[b]];
+      out = Join[out, Which[
+        i === {1} && neg, {RowBox[{"-", b}]},
+        i === {1}, {b},
+        neg, {"-", b},
+        True, {"+", b}]]]], ts];
+  RowBox[out]];
+
+$mpSeparators = {",", "=", "\[LongEqual]", "==", "\[Equal]", "<", ">", "\[LessEqual]",
+  "\[GreaterEqual]", "\[NotEqual]", "\[Rule]", "\[RuleDelayed]", "\[LongRightArrow]",
+  "\[RightArrow]", "\[TildeTilde]", "\[Element]", ":", ";", "(", ")", "{", "}", "[", "]"};
+
+(* A sum, or a term with a leading minus, needs parentheses unless both of its
+   neighbours are separators; a sum or product used as a base always does. *)
+mpNeedsParen[raw_, p_List, h_HoldComplete] := Module[{container, idx, prev, next, sumLike},
+  sumLike = MatchQ[h, HoldComplete[_Plus]] || mpNegQ[h];
+  If[p === {} || !(sumLike || MatchQ[h, HoldComplete[Times[_, __]]]), Return[False]];
+  container = If[Length[p] > 1, Extract[raw, Most[p]], raw];
+  idx = Last[p];
+  Which[
+    MatchQ[container, (SuperscriptBox | SubscriptBox | SubsuperscriptBox | OverscriptBox |
+        UnderscriptBox | UnderoverscriptBox)[__]], idx === 1,
+    ListQ[container] && sumLike,
+      prev = If[idx > 1, container[[idx - 1]], None];
+      next = If[idx < Length[container], container[[idx + 1]], None];
+      !((prev === None || MemberQ[$mpSeparators, prev]) && (next === None || MemberQ[$mpSeparators, next])),
+    True, False]];
+
+(* Everything but Times and Plus: TraditionalForm boxes, with each outermost
+   Times or Plus replaced by a placeholder that is boxed separately. *)
+mpDelegate[h_HoldComplete] := Module[{pos, subs, names, phs, h2, raw},
+  pos = Position[h, _Times | _Plus, {2, Infinity}, Heads -> False];
+  pos = Select[pos, Function[p, NoneTrue[pos, # =!= p && Take[p, UpTo[Length[#]]] === # &]]];
+  subs = Extract[h, pos, HoldComplete];
+  names = Table["mcpPh" <> IntegerString[i, 10, 4], {i, Length[pos]}];
+  phs = Symbol[$Context <> #] & /@ names;
+  h2 = ReplacePart[h, Thread[pos -> phs]];
+  raw = Replace[h2, HoldComplete[x_] :> MakeBoxes[x, TraditionalForm]];
+  Fold[Function[{r, i}, Module[{where = Position[r, names[[i]]], b = mpFmt[subs[[i]]]},
+      Fold[Function[{rr, p}, ReplacePart[rr, p -> If[mpNeedsParen[rr, p, subs[[i]]], mpParen[b], b]]], r, where]]],
+    raw, Range[Length[names]]]];
+
+(* A formula in Wolfram syntax: parsed, held, boxed in a context of its own that
+   is removed afterwards, so it neither runs nor leaves symbols behind. *)
+mpWolfram[s_String] := Module[{ctx = "MCPProseFormula" <> IntegerString[$ModuleNumber] <> "`", r},
+  r = Block[{$Context = ctx, $ContextPath = {"System`"}},
+    Which[
+      StringTrim[s] === "", mpRefuse["the formula is empty"],
+      StringContainsQ[s, "_"] || StringContainsQ[s, RegularExpression["\\^\\s*\\{"]],
+        mpRefuse["the formula \"`1`\" uses _ or ^{...}, which mean something else in Wolfram syntax; write TeX as \\( ... \\), or use Subscript[x, i] and x^(n) in $ ... $", s],
+      !SyntaxQ[s],
+        mpRefuse["the formula \"`1`\" is not valid Wolfram syntax (the problem is at character `2`)`3`",
+          s, SyntaxLength[s] + 1,
+          If[StringContainsQ[s, RegularExpression["\\\\[A-Za-z]"]], "; if it is TeX, write it as \\( ... \\)", ""]],
+      True, Quiet[Check[mpFmt[ToExpression[s, InputForm, HoldComplete]],
+        mpRefuse["the formula \"`1`\" could not be typeset", s]]]]];
+  Quiet[Remove[Evaluate[ctx <> "*"]]];
+  r];
+
+(* A formula in TeX: the front end's own TeX reader, boxes only, so the notation
+   is kept as written (d_mu psi stays d_mu psi, not a derivative). *)
+mpTeX[s_String] := Module[{nb, fb},
+  If[StringTrim[s] === "", Return[mpRefuse["the TeX formula is empty"]]];
+  nb = Quiet[UsingFrontEnd[ImportString["$" <> s <> "$", "TeX"]]];
+  fb = If[Head[nb] === Notebook, FirstCase[nb, FormBox[b_, TraditionalForm] :> b, None, Infinity], None];
+  If[fb === None || !FreeQ[fb, "\\" | "$"],
+    mpRefuse["the TeX formula \"`1`\" could not be read", s], fb]];
+
+mpHexQ[s_String, n_] := StringLength[s] === n && StringMatchQ[s, RegularExpression["[0-9a-fA-F]+"]];
+
+(* One pass over the text, by fixed rules. Returns segments or a refusal. *)
+mpScan[s_String] := Module[{cs = Characters[s], n, i = 1, buf = "", segs = {}, bad = None, c, d, j, k, flush},
+  n = Length[cs];
+  flush[] := (If[buf =!= "", AppendTo[segs, {"text", buf}]]; buf = "");
+  While[i <= n && bad === None,
+    c = cs[[i]];
+    Which[
+      c === "\\" && i < n,
+        d = cs[[i + 1]];
+        Which[
+          d === "\\", buf = buf <> "\\"; i += 2,
+          d === "$", buf = buf <> "$"; i += 2,
+          d === "(",
+            j = i + 2;
+            While[j < n && !(cs[[j]] === "\\" && cs[[j + 1]] === ")"), j++];
+            If[j >= n, bad = mpRefuse["the TeX formula opened with \\( at character `1` is never closed with \\)", i],
+              flush[]; AppendTo[segs, {"tex", StringJoin[cs[[i + 2 ;; j - 1]]]}]; i = j + 2],
+          d === ")", bad = mpRefuse["\\) at character `1` closes no \\(", i],
+          d === "[",
+            k = i + 2;
+            While[k <= n && StringMatchQ[cs[[k]], RegularExpression["[A-Za-z0-9]"]], k++];
+            If[k <= n && cs[[k]] === "]" && k > i + 2,
+              buf = buf <> decodeNamedChar[StringJoin[cs[[i + 2 ;; k - 1]]]]; i = k + 1,
+              buf = buf <> "\\"; i += 1],
+          d === ":" && i + 5 <= n && mpHexQ[StringJoin[cs[[i + 2 ;; i + 5]]], 4],
+            buf = buf <> FromCharacterCode[FromDigits[StringJoin[cs[[i + 2 ;; i + 5]]], 16]]; i += 6,
+          d === "|" && i + 7 <= n && mpHexQ[StringJoin[cs[[i + 2 ;; i + 7]]], 6],
+            buf = buf <> FromCharacterCode[FromDigits[StringJoin[cs[[i + 2 ;; i + 7]]], 16]]; i += 8,
+          True, buf = buf <> "\\"; i += 1],
+      c === "$",
+        j = i + 1;
+        While[j <= n && !(cs[[j]] === "$" && cs[[j - 1]] =!= "\\"), j++];
+        If[j > n, bad = mpRefuse["the formula opened with $ at character `1` is never closed with $", i],
+          flush[]; AppendTo[segs, {"wolfram", StringReplace[StringJoin[cs[[i + 1 ;; j - 1]]], "\\$" -> "$"]}]; i = j + 1],
+      True, buf = buf <> c; i += 1]];
+  If[bad =!= None, bad, flush[]; segs]];
+
+mpInline[b_] := Cell[BoxData[FormBox[b, TraditionalForm]], "InlineFormula"];
+
+(* Narrative content: a plain string when there is no formula, the way the front
+   end stores typed prose; TextData with InlineFormula cells otherwise. *)
+mpProse[s_String] := Module[{segs, items},
+  segs = mpScan[s];
+  If[mpRefusedQ[segs], Return[segs]];
+  items = Replace[segs, {
+      {"text", t_} :> t,
+      {"wolfram", f_} :> With[{b = mpWolfram[f]}, If[mpRefusedQ[b], b, mpInline[b]]],
+      {"tex", f_} :> With[{b = mpTeX[f]}, If[mpRefusedQ[b], b, mpInline[b]]]}, {1}];
+  Which[
+    AnyTrue[items, mpRefusedQ], FirstCase[items, _mpRefused],
+    MatchQ[items, {___String}], StringJoin[items],
+    True, TextData[items]]];
+
+mpFormula[s_String] := Module[{t = StringTrim[s], b},
+  b = If[StringStartsQ[t, "\\("] && StringEndsQ[t, "\\)"],
+    mpTeX[StringTake[t, {3, -3}]], mpWolfram[t]];
+  If[mpRefusedQ[b], b, BoxData[FormBox[b, TraditionalForm]]]];
+
+(* The source text the caller sent, kept on cells whose stored content differs
+   from it, so a reader of the cell list sees what was written. *)
+mpWithSource[opts_List, src_] := Module[{tr, rest},
+  tr = Flatten[{Lookup[opts, TaggingRules, {}] /. a_Association :> Normal[a]}];
+  tr = DeleteCases[tr, "MCPSource" -> _];
+  If[StringQ[src], AppendTo[tr, "MCPSource" -> src]];
+  rest = DeleteCases[opts, TaggingRules -> _];
+  If[tr === {}, rest, Append[rest, TaggingRules -> tr]]];
+
+cellContent[content_String, style_String] := Which[
+  MemberQ[$textCellStyles, style], mpProse[content],
+  MemberQ[$formulaCellStyles, style], mpFormula[content],
+  True, BoxData[content]];
 cellContent[content_String, _] := BoxData[content];
+
+(* Only prose and formula cells keep the text they were sent; code cells hold their source already. *)
+mpProseStyleQ[style_] := MemberQ[Join[$textCellStyles, $formulaCellStyles], style];
+
+mpRefusal[r_mpRefused] := err["refused: " <> First[r], <|"refused" -> True, "reason" -> First[r]|>];
 
 (* The recorder stamps Evaluatable on every cell it writes (True for Input/Code,
    False for narrative) so replay never depends on stylesheet defaults, and so
    read-back can check the flag exactly instead of inferring it from style. *)
 MCPWriteCell[id_String, content_String, style_String, position_String, anchor_Integer, recordTag_String, evaluatable_String] :=
-  sessionOr[id, Module[{nb, pos, newCell, cells, at, updated, opts},
+  sessionOr[id, Module[{nb, pos, newCell, cells, at, updated, opts, body},
+    (* Built first: content that cannot be read is refused before anything is written. *)
+    body = cellContent[content, style];
+    If[mpRefusedQ[body], Return[mpRefusal[body]]];
     nb = $Sessions[id, "nb"];
     pos = leafPositions[nb];
     opts = Join[
       If[recordTag === "", {}, {TaggingRules -> {"MCPRecordTag" -> recordTag}}],
-      Switch[evaluatable, "True", {Evaluatable -> True}, "False", {Evaluatable -> False}, _, {}]
+      Switch[evaluatable, "True", {Evaluatable -> True}, "False", {Evaluatable -> False},
+        _, If[MemberQ[$formulaCellStyles, style], {Evaluatable -> False}, {}]]
     ];
-    newCell = Cell[cellContent[content, style], style, Sequence @@ opts];
+    If[mpProseStyleQ[style] && body =!= content, opts = mpWithSource[opts, content]];
+    newCell = Cell[body, style, Sequence @@ opts];
     (* Insertion only rewrites the TOP-LEVEL cell list. Splicing into a nested
        CellGroupData would need the group's own position and is deliberately
        not attempted: silently putting a cell in the wrong group is worse than
@@ -1007,7 +1223,7 @@ MCPWriteCell[id_String, content_String, style_String, position_String, anchor_In
    the cell being replaced rather than re-specified, so an edit cannot silently
    restyle a cell or drop its CellLabel. *)
 MCPReplaceCell[id_String, index_Integer, content_String] :=
-  sessionOr[id, Module[{nb, pos, target, style, options, replacement},
+  sessionOr[id, Module[{nb, pos, target, style, options, replacement, body},
     nb = $Sessions[id, "nb"];
     pos = leafPositions[nb];
     If[index < 0 || index >= Length[pos],
@@ -1019,7 +1235,12 @@ MCPReplaceCell[id_String, index_Integer, content_String] :=
     ];
     style = If[Length[target] >= 2, target[[2]], "Input"];
     options = If[Length[target] >= 3, Drop[List @@ target, 2], {}];
-    replacement = Cell[cellContent[content, style], style, Sequence @@ options];
+    body = cellContent[content, style];
+    If[mpRefusedQ[body], Return[mpRefusal[body]]];
+    If[mpProseStyleQ[style], options = mpWithSource[options, If[body =!= content, content, None]]];
+    If[MemberQ[$formulaCellStyles, style] && FreeQ[options, Evaluatable -> _],
+      AppendTo[options, Evaluatable -> False]];
+    replacement = Cell[body, style, Sequence @@ options];
     setNotebook[id, ReplacePart[nb, pos[[index + 1]] -> replacement]];
     $Sessions[id, "dirty"] = True;
     ok[<|"id" -> id, "replaced" -> index, "style" -> ToString[style],

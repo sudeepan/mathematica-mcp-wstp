@@ -320,9 +320,50 @@ evaluate("GraphGen[1]")
 
 Only `Input` and `Code` are accepted as scientific styles. Narrative styles
 (Title, Subtitle, Section, Subsection, Subsubsection, Text, Item,
-ItemNumbered, ItemParagraph) write notebook structure, as plain text in the
-style's own font, but **skip scientific execution entirely**. No ledger record is created, so the scientific ledger
-contains only cells that actually computed. Any other style is rejected.
+ItemNumbered, ItemParagraph, DisplayFormula, DisplayFormulaNumbered) write
+notebook structure, as text in the style's own font, but **skip scientific
+execution entirely**. No ledger record is created, so the scientific ledger
+contains only cells that actually computed. Any other style is rejected, and
+the error lists the accepted ones.
+
+### Mathematics in narrative cells
+
+Prose can carry the notation you would type in the notebook interface. The
+same rules apply to `evaluate(..., style=...)` while recording and to
+`edit_cells` otherwise. Without a recording, `evaluate` refuses any style other
+than `Input` or `Code`: there is no cell to write, and the text would otherwise
+run as code.
+
+| Write | Gives |
+|---|---|
+| `\[Delta]`, `\:03b4`, `\\|0003b4` | δ; an unknown name such as `\[NotAName]` is kept as written |
+| `\\` | a literal backslash, so `\\[Delta]` stays as written |
+| `\$` | a literal dollar sign |
+| `$ ... $` | an inline formula in **Wolfram syntax**, not TeX: `$Subscript[\[Gamma], \[Mu]] T^a$`, `$p^2/(2 m)$`; use `==` for an equation |
+| `\( ... \)` | an inline formula in TeX: `\(\gamma^\mu \partial_\mu \psi\)` |
+
+A `DisplayFormula` or `DisplayFormulaNumbered` cell holds one formula: TeX if
+it is wrapped in `\( ... \)`, Wolfram syntax otherwise.
+
+```text
+evaluate("The vertex $-I g Subscript[\[Gamma], \[Mu]] T^a$ fixes our convention.", style="Text")
+evaluate("Subscript[\[Gamma], \[Mu]] Subscript[\[Gamma], \[Nu]] + Subscript[\[Gamma], \[Nu]] Subscript[\[Gamma], \[Mu]] == 2 Subscript[g, \[Mu]\[Nu]]", style="DisplayFormulaNumbered")
+```
+
+- **Nothing is run.** A formula is parsed in a context of its own and only
+  typeset; `$x = 5$` assigns nothing and `$Print[1]$` prints nothing.
+- **The written order is kept.** Products and sums are shown as written, so
+  `$\[Gamma]^\[Nu] \[Gamma]^\[Mu]$` is not reordered; everything else is
+  typeset in TraditionalForm.
+- **TeX inside `$ ... $` is refused, not guessed.** Backslash commands are not
+  Wolfram syntax, and `_` and `^{...}` mean something else there, so they are
+  refused with a pointer to `\( ... \)`.
+- **Anything else that cannot be read is refused,** with the reason and the
+  character position, and nothing is written. During a recording a refused
+  cell does not fault the run; send the corrected text.
+- A cell whose stored content differs from what you sent keeps your text in
+  its `TaggingRules` (`"MCPSource"`), and `cells()` shows that text.
+- The front end's TeX reader drops a few commands, `\mathcal` among them.
 
 The recorder stamps the replay flag on every cell it writes:
 `Evaluatable -> True` on Input/Code cells and `Evaluatable -> False` on

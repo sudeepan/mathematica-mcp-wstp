@@ -493,6 +493,47 @@ def test_narrative_write_failure_faults():
         assert w.rec.is_faulted
 
 
+def test_refused_narrative_content_does_not_fault():
+    """Text the helper cannot read is refused: nothing is written and the run stays intact."""
+    with workspace() as w:
+        original = w.fake._call_with_session
+
+        def refusing(fn, notebook_id, *args, timeout=60):
+            if fn == "MCPWriteCell":
+                w.fake.calls.append(fn)
+                return {"success": False, "refused": True, "reason": "not valid",
+                        "error": 'refused: the formula "x^^^2" is not valid Wolfram syntax'}
+            return original(fn, notebook_id, *args, timeout=timeout)
+
+        w.fake._call_with_session = refusing
+        r = w.rec.record_and_verify("a typo in $x^^^2$", style="Text")
+        assert r["success"] is False and r["refused"] is True, r
+        assert "not valid Wolfram syntax" in r["error"], r
+        assert not w.rec.is_faulted and w.rec.ledger.records == []
+        w.fake._call_with_session = original
+        assert w.rec.record_and_verify("the corrected $x^2$", style="Text")["success"]
+
+
+def test_prose_style_without_a_recording_is_refused():
+    """Outside a recording a prose style is refused instead of running the text as code."""
+    from mathematica_wstp import notebooks, server
+    notebooks.reset_headless_notebooks()
+    for style in ("Text", "Section", "DisplayFormula"):
+        reply = server.evaluate("x = 5", style=style).structured_content
+        assert reply["success"] is False and "no recording is active" in reply["error"], reply
+        assert "edit_cells(action='write'" in reply["error"], reply
+
+
+def test_display_formula_cells_are_narrative():
+    """A displayed formula is written like prose: no ledger record, never evaluatable."""
+    for style in ("DisplayFormula", "DisplayFormulaNumbered"):
+        with workspace() as w:
+            r = w.rec.record_and_verify("x^2 + y^2 == r^2", style=style)
+            assert r["success"] is True and r["scientific"] is False, r
+            assert w.rec.ledger.records == []
+            assert (w.fake.cells[-1]["style"], w.fake.cells[-1]["evaluatable"]) == (style, False)
+
+
 # --- style and identity ---------------------------------------------------------
 
 def test_style_change_fails_verification():
@@ -550,6 +591,7 @@ def test_unknown_style_rejected():
         r = w.rec.record_and_verify("x = 1", style="ExternalLanguage")
         assert r["success"] is False
         assert "neither narrative nor scientific" in r["error"]
+        assert all(f"'{st}'" in r["error"] for st in ("Input", "Text", "DisplayFormula")), r
         assert w.fake.calls == [], "rejected before touching the notebook"
         assert w.rec.ledger.records == []
 

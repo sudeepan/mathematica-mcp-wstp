@@ -149,10 +149,17 @@ def _refuse_while_recording(what: str) -> CallToolResult | None:
         "between calls. On timeout the evaluation is ABORTED but the kernel and "
         "all its definitions survive, so you can retry a smaller piece.\n"
         "When recording is active, every call is written into the recording "
-        "notebook. Pass style to control the cell style: 'Input' (default), "
+        "notebook; without a recording, a style other than Input or Code is refused "
+        "(write prose into an open notebook with edit_cells). "
+        "Pass style to control the cell style: 'Input' (default), "
         "'Chapter', 'Section', 'Subsection', 'Item', etc. Narrative styles "
         "(Title, Section, Text, Item, etc.) write notebook structure but skip "
-        "scientific execution - no ledger record is created.\n"
+        "scientific execution - no ledger record is created. Their text may hold "
+        "\\[Name] characters, inline formulas in Wolfram syntax between $ ... $ "
+        "(== for an equation) and in TeX between \\( ... \\); \\$ is a literal "
+        "dollar sign. Style DisplayFormula or DisplayFormulaNumbered holds one "
+        "formula, Wolfram syntax or \\( TeX \\). Formulas are typeset, never "
+        "evaluated, in the order written; one that cannot be read is refused.\n"
         "While recording, expect makes the cell a checkpoint: its result (InputForm, "
         "whitespace ignored) must equal expect, e.g. expect='True' or expect='{0, 0}', "
         "here and again in the fresh kernel at finalize, or finalization fails. "
@@ -194,9 +201,19 @@ def _evaluate_inner(nb, code: str, timeout: float, style: str,
     if (expect is not None or volatile) and not nb.has_active_recorder:
         return _fail("expect and volatile apply to recorded cells; start a recording "
                      "first: notebooks(action='create', path=..., record=True)")
+    if style not in ("Input", "Code") and nb.recording is None:
+        # Without a recording the style has no cell to apply to, and the text
+        # would otherwise run as Wolfram code: "x = 5" sent as prose assigned x.
+        return _fail(f"no recording is active, so style {style!r} has no cell to write and "
+                     "the text would run as code. To write it into an open notebook use "
+                     f"edit_cells(action='write', style={style!r}, content=...); to record, "
+                     "start a recording with notebooks(action='create', path=..., record=True).",
+                     style=style)
     rec = nb.record_input(code, style=style, expect=expect, volatile=volatile)
 
     if nb.has_active_recorder:
+        if isinstance(rec, dict) and rec.get("refused"):
+            return _fail(rec["error"], refused=True, style=style)
         if isinstance(rec, dict) and rec.get("scientific") is False:
             return _reply({
                 "success": True,
@@ -785,7 +802,10 @@ def evaluate_cells(
         "option, addressed by the same index 'delete' takes. Use it to edit an "
         "existing cell: 'write' can only APPEND in a notebook whose cells sit inside "
         "section groups, which is most real notebooks, because insertion rewrites "
-        "the top-level cell list only and will not splice into a group."
+        "the top-level cell list only and will not splice into a group.\n"
+        "Text cells and other prose styles take the same notation as evaluate(): "
+        "\\[Name] characters, $ Wolfram formula $, \\( TeX \\), and the "
+        "DisplayFormula and DisplayFormulaNumbered styles for one displayed formula."
     )
 )
 def edit_cells(
