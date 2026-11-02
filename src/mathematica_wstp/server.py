@@ -452,7 +452,10 @@ _RECORDING_START_FIELDS = ("run_id", "ledger", "kernel_not_fresh", "kernel_at_st
         "(never for a checkpoint cell). "
         "verify_record(path): check a finalized notebook file against the ledger of "
         "its recording - recorded cells unchanged, whether the file changed since "
-        "finalization, and the finalization statuses.\n"
+        "finalization, and the finalization statuses. A successful finalize returns "
+        "anchors (file_sha256, ledger_sha256); keep them outside the recording's "
+        "folder and pass them back as expected_file_sha256 and expected_ledger_sha256 "
+        "to catch an edit to both the file and its ledger.\n"
         "stop_recording and close are refused before finalization (force=True "
         "abandons the run); close after finalization releases the recorder.\n"
         "'dependencies' reports every file the notebook reads or writes, COMMENTED "
@@ -476,6 +479,8 @@ def notebooks(
     force: bool = False,
     timeout: float | None = None,
     accept_differences: list[dict[str, Any]] | None = None,
+    expected_file_sha256: str | None = None,
+    expected_ledger_sha256: str | None = None,
 ) -> dict[str, Any]:
     nb = get_headless_notebooks()
     if action == "open":
@@ -507,7 +512,8 @@ def notebooks(
     if action == "verify_record":
         if not path:
             return _fail("verify_record requires the path of a finalized notebook")
-        return _reply(nb.verify_record(path))
+        return _reply(nb.verify_record(path, expected_file_sha256=expected_file_sha256,
+                                       expected_ledger_sha256=expected_ledger_sha256))
     if action == "create":
         result = nb.create(title=title, path=path)
         if record and result.get("success"):

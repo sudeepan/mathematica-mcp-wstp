@@ -1142,6 +1142,9 @@ def test_accepted_difference_seals_and_says_so():
                           "accepted_from_attempt": 1}], fin
         stored = w.rec.ledger.data["finalization"]
         assert stored["success"] is True and stored["reproduction"]["accepted"] == taken
+        assert fin["anchors"]["reproduction"] == "accepted", fin
+        later = verifier(w).verify_record(fin["finalized_path"])
+        assert later["reproduction"]["status"] == "accepted", later
 
 
 def test_acceptances_that_are_refused():
@@ -1323,6 +1326,85 @@ def test_literal_comparison_ignores_whitespace_outside_strings():
     assert recorder_mod._same_literal('"pass"', ' "pass" ')
     assert not recorder_mod._same_literal('"a b"', '"ab"')
     assert not recorder_mod._same_literal("1 + a", "4")
+
+
+
+def verifier(w: Workspace):
+    """A real HeadlessNotebooks that reads the finalized file through FakeHelper."""
+    nb = headless_with(w.fake, w.nb_path)
+    nb.open, nb.close, nb.is_open = w.fake.open, w.fake.close, w.fake.is_open
+    return nb
+
+
+def file_sha(path: str) -> str:
+    with open(path, "rb") as fh:
+        return hashlib.sha256(fh.read()).hexdigest()
+
+
+def sealed_run(w: Workspace) -> tuple[dict, dict]:
+    a, _ = record_result(w, "x = 2", "2")
+    run = {"success": True, "finalized": True, "messages": [],
+           "labels": [[1, a["record_tag"]]], "outputs": [fresh_output(1, "2")]}
+    with fresh_kernel_stub(run):
+        fin = w.rec.finalize(timeout=5)
+    assert fin["success"] and w.rec.is_sealed, fin
+    return a, fin
+
+
+def test_finalize_returns_anchors_of_both_files():
+    with workspace() as w:
+        _, fin = sealed_run(w)
+        assert fin["anchors"] == {"run_id": w.rec.run_id,
+                                  "file_sha256": file_sha(fin["finalized_path"]),
+                                  "ledger_sha256": file_sha(w.rec.ledger.path),
+                                  "reproduction": "same"}, fin
+        assert "cannot later rewrite" in fin["anchors_note"]
+
+
+def test_failed_finalize_returns_no_anchors():
+    with workspace() as w:
+        a, run, first = differing_attempt(w)
+        assert "anchors" not in first, first
+
+
+def test_anchors_catch_an_edited_ledger():
+    with workspace() as w:
+        _, fin = sealed_run(w)
+        anchors = fin["anchors"]
+        with open(w.rec.ledger.path, "a") as fh:
+            fh.write("\n")
+        checked = verifier(w).verify_record(
+            fin["finalized_path"], expected_file_sha256=anchors["file_sha256"],
+            expected_ledger_sha256=anchors["ledger_sha256"])
+        assert checked["anchors_match"] == {"file": True, "ledger": False}, checked
+        assert checked["verified"] is False, checked
+
+
+def test_anchors_catch_a_consistent_edit_of_file_and_ledger():
+    """Changing a recorded cell and its ledger together passes locally, not against anchors."""
+    with workspace() as w:
+        a, fin = sealed_run(w)
+        anchors, path = fin["anchors"], fin["finalized_path"]
+        edited = copy.deepcopy(w.fake.cells)
+        next(c for c in edited if c["tag"] == a["record_tag"])["source"] = "x = 3"
+        w.fake.files[path] = edited
+        with open(path, "a") as fh:
+            fh.write("(* edited *)")
+        ledger = RecorderLedger.load(w.rec.ledger.path)
+        ledger.record_by_seq(a["seq"])["source_digest"] = sha(canon("x = 3"))
+        ledger.data["finalization"]["file_sha256"] = file_sha(path)
+        ledger.data["finalization_attempts"][-1]["file_sha256"] = file_sha(path)
+        recorder_mod._write_atomically(ledger.path, ledger.data)
+
+        plain = verifier(w).verify_record(path)
+        assert plain["verified"] is True and plain["changes"] == "none", plain
+        assert "local ledger only" in plain["note"], plain
+
+        anchored = verifier(w).verify_record(
+            path, expected_file_sha256=anchors["file_sha256"],
+            expected_ledger_sha256=anchors["ledger_sha256"])
+        assert anchored["anchors_match"] == {"file": False, "ledger": False}, anchored
+        assert anchored["verified"] is False, anchored
 
 
 # --- Runner ----------------------------------------------------------------

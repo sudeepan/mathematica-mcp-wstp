@@ -633,6 +633,22 @@ def test_verify_record_tells_narrative_edits_from_code_edits():
                    for i in v["structural_verification"]["issues"]), v
 
 
+def test_verify_record_with_the_anchors_finalize_returned():
+    """The anchors still match after the recorder is released: nothing rewrites the ledger."""
+    with recording_session("anchors") as ctx:
+        assert payload(server.evaluate(fresh_symbol("mcpAn") + " = 2 + 3"))["success"]
+        assert payload(server.notebooks(action="save"))["success"]
+        fin = payload(server.notebooks(action="finalize"))
+        assert fin["success"] and fin["anchors"]["reproduction"] == "same", fin
+        anchors = fin["anchors"]
+        assert payload(server.notebooks(action="close"))["success"]
+        ctx.nbid = None
+        v = payload(server.notebooks(action="verify_record", path=fin["finalized_path"],
+                                     expected_file_sha256=anchors["file_sha256"],
+                                     expected_ledger_sha256=anchors["ledger_sha256"]))
+        assert v["verified"] and v["anchors_match"] == {"file": True, "ledger": True}, v
+
+
 def test_verify_record_needs_a_finalized_file():
     v = payload(server.notebooks(action="verify_record", path="/tmp/plain.nb"))
     assert v["success"] is False and "not a finalized recording" in v["error"], v

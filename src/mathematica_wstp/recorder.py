@@ -588,12 +588,19 @@ class Recorder:
             + (["a cell has no result from the fresh run"]
                if reproduction["status"] == "incomplete" else [])
 
+        file_sha256 = _file_digest(finalized_path)
         self._record_finalization(
             finalized_path, success=overall_success,
             error="; ".join(errors) or None,
             details={"status": status, "reproduction": reproduction,
                      "checkpoints": checkpoints,
-                     "file_sha256": _file_digest(finalized_path)})
+                     "file_sha256": file_sha256})
+        # Taken after the sealing attempt is written; nothing writes the ledger
+        # once the run is sealed, so these stay valid.
+        anchors = ({"run_id": self.run_id, "file_sha256": file_sha256,
+                    "ledger_sha256": _file_digest(self.ledger.path),
+                    "reproduction": reproduction["status"]}
+                   if overall_success else None)
 
         return {
             "success": overall_success,
@@ -612,6 +619,12 @@ class Recorder:
                if self.kernel_at_start else {}),
             **({"repeated_messages": repeated} if repeated else {}),
             **({"previous_attempt_preserved_as": preserved} if preserved else {}),
+            **({"anchors": anchors,
+                "anchors_note": ("Copy these somewhere this recording session cannot "
+                                 "later rewrite, such as a commit pushed to a remote or "
+                                 "a message to whoever reviews the run. verify_record "
+                                 "can then check the file and its ledger against them.")}
+               if anchors else {}),
             **({"error": "; ".join(errors)} if errors else {}),
         }
 

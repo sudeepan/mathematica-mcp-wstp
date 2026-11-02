@@ -576,6 +576,24 @@ match, and `changes` says what differs from the file as it was sealed:
 `none`, `narrative_or_outputs_only` (text edited after sealing, for example),
 or `recorded_cells`. It also returns the statuses the finalization reported.
 
+That check is relative to the ledger, which sits next to the file: someone who
+can edit both can change a recorded cell and update the ledger to match. A
+successful finalize returns `anchors`: the run id, the SHA-256 of the
+finalized file and of the ledger, and the reproduction status. Copy them
+somewhere the recording session cannot later rewrite, such as a commit
+pushed to a remote or a message to whoever reviews the run, and pass them
+back:
+
+```text
+notebooks(action="verify_record", path="...",
+          expected_file_sha256="...", expected_ledger_sha256="...")
+```
+
+The reply then reports `anchors_match` for each, and `verified` is false on
+any mismatch. Nothing writes the ledger after the run is sealed, so the
+anchors stay valid. They protect against edits made after they were copied,
+not against someone who can also edit the place they were copied to.
+
 Neither proves scientific correctness. For mathematical divergence, use
 `Length`/`LeafCount` on transparent expressions and `ByteCount` on opaque
 ones (pitfall 7).

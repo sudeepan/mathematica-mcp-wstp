@@ -877,13 +877,18 @@ class HeadlessNotebooks:
 
     _FINALIZED_NAME = re.compile(r"-(R[0-9a-f]{10})-finalized(?:-failed-\d+)?\.nb$")
 
-    def verify_record(self, path: str) -> dict[str, Any]:
+    def verify_record(self, path: str, expected_file_sha256: str | None = None,
+                      expected_ledger_sha256: str | None = None) -> dict[str, Any]:
         """Check a finalized notebook file against the ledger of its recording.
 
         The recorded code cells must still match the ledger. The file's
         fingerprint from sealing tells whether anything else changed since:
         an edit to narrative or output cells changes the file but not the
         record, an edit to a recorded cell changes both.
+
+        The ledger sits next to the file, so someone who can edit both can
+        make them agree. The anchors finalize returned, kept elsewhere, close
+        that gap: given here, the file and ledger must still hash to them.
         """
         from .recorder import _file_digest, verify_file_against_ledger
         from .recorder_ledger import RecorderLedger, ledger_dir
@@ -921,17 +926,32 @@ class HeadlessNotebooks:
         else:
             changes = "unknown"
         latest = ledger.data.get("finalization") or {}
+        current_ledger = _file_digest(ledger_path)
+        anchors_match: dict[str, bool] = {}
+        if expected_file_sha256:
+            anchors_match["file"] = current == expected_file_sha256
+        if expected_ledger_sha256:
+            anchors_match["ledger"] = current_ledger == expected_ledger_sha256
         result: dict[str, Any] = {
             "success": True,
-            "verified": bool(structural.get("verified")),
+            "verified": bool(structural.get("verified")) and all(anchors_match.values()),
             "run_id": run_id,
             "ledger": ledger_path,
             "sealed": latest.get("success") is True
                       and os.path.basename(str(latest.get("path", ""))) == os.path.basename(target),
             "file_unchanged_since_finalization": unchanged,
             "changes": changes,
+            "file_sha256": current,
+            "ledger_sha256": current_ledger,
             "structural_verification": structural,
         }
+        if anchors_match:
+            result["anchors_match"] = anchors_match
+        else:
+            result["note"] = ("Checked against the local ledger only: someone who can edit "
+                              "both the file and its ledger can make them agree. Pass the "
+                              "anchors finalize returned to check against copies kept "
+                              "elsewhere.")
         if attempt:
             for key in ("status", "reproduction", "checkpoints"):
                 if key in attempt:
