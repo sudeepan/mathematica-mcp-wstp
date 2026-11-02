@@ -1451,15 +1451,21 @@ class HeadlessNotebooks:
             return None
         try:
             if self._recorder:
-                return self._recorder.record_and_verify(code, style, expect=expect,
-                                                        volatile=volatile)
-            return self._call_with_session(
-                "MCPWriteCell", target, code, style, "End", 0)
+                result = self._recorder.record_and_verify(code, style, expect=expect,
+                                                          volatile=volatile)
+            else:
+                result = self._call_with_session(
+                    "MCPWriteCell", target, code, style, "End", 0)
         except Exception as exc:
             logger.warning("recording cell write failed", exc_info=True)
             fault = self.fault_recording("PRE_DISPATCH", f"unhandled exception: {exc!r}")
             return {"success": False, "error": "recording write failed",
                     **({"recording_faulted": True, "recording_fault": fault} if fault else {})}
+        if isinstance(result, dict) and result.get("success"):
+            error = self._save_recording_notebook()
+            if error:
+                result["save_failed"] = error
+        return result
 
     def record_outcome(self, seq: int, result: Any,
                        kernel_notice: str | None,
@@ -1478,14 +1484,39 @@ class HeadlessNotebooks:
             names = [m["name"] for m in getattr(result, "messages", None) or []
                      if m.get("name")]
             text = result.text if getattr(result, "success", False) else None
-            return self._recorder.apply_outcome(seq, disposition,
-                                                message_names=names,
-                                                output_text=text)
+            outcome = self._recorder.apply_outcome(seq, disposition,
+                                                   message_names=names,
+                                                   output_text=text)
         except Exception as exc:
             logger.warning("recording outcome failed", exc_info=True)
             fault = self.fault_recording("POST_EVAL", f"unhandled exception: {exc!r}")
             return {"success": False, "error": "recording outcome failed",
                     "recording_faulted": True, "recording_fault": fault}
+        # The outcome can change the notebook: a timed-out cell is marked not evaluatable.
+        error = self._save_recording_notebook()
+        if error and isinstance(outcome, dict):
+            outcome["save_failed"] = error
+        return outcome
+
+    def _save_recording_notebook(self) -> str | None:
+        """Save the recording notebook, so the file holds every cell recorded so far.
+
+        Returns None once saved, the error otherwise. A failed save changes
+        nothing in the recording: the next one, or finalize, writes the file
+        again. It never reopens a lost session, which would hide the lost
+        kernel from the recorder's own checks.
+        """
+        target = self._recording_target
+        if target is None:
+            return None
+        try:
+            saved = self._call("MCPSave", target, "", timeout=60)
+        except Exception as exc:
+            saved = {"success": False, "error": repr(exc)}
+        if saved.get("success"):
+            return None
+        logger.warning("saving the recording notebook failed: %s", saved.get("error"))
+        return str(saved.get("error") or "unknown error")
 
     @_under_recording_lock
     def finalize_recording(self, timeout: int = 600,

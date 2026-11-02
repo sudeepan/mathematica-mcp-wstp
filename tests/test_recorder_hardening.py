@@ -205,6 +205,7 @@ def headless_with(fake: FakeHelper, path: str):
         "notebook_id": fake.notebook_id, "path": path,
         "title": "", "created": True})()
     nb._call_with_session = fake._call_with_session
+    nb._call = fake._call_with_session
     # No kernel to restart here; the restart itself is tested against a live kernel.
     nb._fresh_kernel_for_recording = lambda notebook_id: {"success": True, "previous_pid": 1, "pid": 2}
     return nb
@@ -806,6 +807,59 @@ def test_outcome_for_unknown_seq_is_reported():
         assert out["recording_faulted"] is True
         assert out["recording_fault"]["phase"] == "POST_EVAL"
         assert "999" in out["recording_fault"]["reason"]
+
+
+def test_each_recorded_cell_is_saved_at_once():
+    """Prose, a cell before it runs, and its outcome are each saved, never through a reopen."""
+    from mathematica_wstp.session import WLResult
+    with workspace() as w:
+        nb = headless_with(w.fake, w.nb_path)
+        direct = []
+
+        def call(fn, *args, **kwargs):
+            direct.append(fn)
+            return w.fake._call_with_session(fn, *args, **kwargs)
+
+        nb._call = call
+        assert nb.start_recording(notebook="hnb1")["success"]
+        assert nb.record_input("Notes", style="Text")["success"]
+        assert direct == ["MCPSave"], direct
+        rec = nb.record_input("x = 1")
+        assert rec["success"] and "save_failed" not in rec, rec
+        assert direct == ["MCPSave"] * 2, direct
+        out = nb.record_outcome(rec["seq"], WLResult(success=True, text="1"), None, None)
+        assert "save_failed" not in out, out
+        assert direct == ["MCPSave"] * 3, direct
+        # Every save went through _call, none through the reopening _call_with_session.
+        assert w.fake.calls.count("MCPSave") == 3, w.fake.calls
+
+
+def test_a_failed_save_is_reported_and_the_recording_goes_on():
+    """The ledger is the record: a save that fails is reported, not a fault."""
+    from mathematica_wstp.session import WLResult
+    with workspace() as w:
+        nb = headless_with(w.fake, w.nb_path)
+        assert nb.start_recording(notebook="hnb1")["success"]
+        w.fake.fail["MCPSave"] = "disk full"
+        assert nb.record_input("Notes", style="Text")["save_failed"] == "disk full"
+        rec = nb.record_input("x = 1")
+        assert rec["success"] and rec["save_failed"] == "disk full", rec
+        out = nb.record_outcome(rec["seq"], WLResult(success=True, text="1"), None, None)
+        assert out["save_failed"] == "disk full", out
+        assert not nb._recorder.is_faulted
+        del w.fake.fail["MCPSave"]
+        again = nb.record_input("y = 2")
+        assert again["success"] and "save_failed" not in again, again
+
+
+def test_no_save_when_nothing_was_recorded():
+    """A refused or failed write saves nothing."""
+    with workspace() as w:
+        nb = headless_with(w.fake, w.nb_path)
+        assert nb.start_recording(notebook="hnb1")["success"]
+        w.fake.fail["MCPReadBack"] = "read-back broke"
+        assert nb.record_input("x = 1")["success"] is False
+        assert "MCPSave" not in w.fake.calls, w.fake.calls
 
 
 def test_record_input_exception_is_reported():

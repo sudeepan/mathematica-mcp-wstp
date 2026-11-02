@@ -19,6 +19,7 @@ import shutil
 import sys
 import tempfile
 import threading
+import time
 import types
 import uuid
 
@@ -385,6 +386,39 @@ def test_narrative_cells_are_stored_as_text():
         fin = payload(server.notebooks(action="finalize"))
         assert fin["success"], fin
         assert fin["structural_verification"]["verified"] is True, fin
+
+
+def test_each_recorded_cell_reaches_the_file_without_a_save():
+    """A session that ends before save still leaves every recorded cell in the file."""
+    with recording_session("autosave") as ctx:
+        assert payload(server.evaluate("Notes", style="Text"))["success"]
+        assert cell_forms(ctx.path) == [["Title", "String"], ["Text", "String"]], \
+            cell_forms(ctx.path)
+        done = payload(server.evaluate("1 + 1"))
+        assert done["success"] and "notebook_save_failed" not in done, done
+        # The cell is on disk while it runs: its outcome is stored only after 8 s.
+        replies = []
+        runner = threading.Thread(
+            target=lambda: replies.append(payload(server.evaluate("Pause[30]", timeout=8))))
+        started = time.monotonic()
+        runner.start()
+        on_disk = False
+        while not on_disk and time.monotonic() - started < 5:
+            time.sleep(0.2)
+            with open(ctx.path, encoding="utf-8", errors="replace") as fh:
+                on_disk = '"Pause"' in fh.read()
+        runner.join()
+        assert on_disk, "the running cell was not in the file"
+        timed = replies[0]
+        assert timed.get("timed_out") and "notebook_save_failed" not in timed, timed
+        assert cell_forms(ctx.path) == [
+            ["Title", "String"], ["Text", "String"], ["Input", "BoxData"],
+            ["Input", "BoxData"]], cell_forms(ctx.path)
+        escaped = ctx.path.replace("\\", "\\\\").replace('"', '\\"')
+        got = evaluate_json(f'<|"evaluatable" -> Cases[Get["{escaped}"], Cell[_, "Input", o___] '
+                            ':> (Evaluatable /. {o} /. Evaluatable -> True), Infinity]|>',
+                            timeout=60)
+        assert got.get("evaluatable") == [True, False], got
 
 
 def test_replacing_a_heading_keeps_it_text():

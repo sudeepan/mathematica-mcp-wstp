@@ -314,6 +314,10 @@ state could not be checked; nothing is written to a ledger, and the reply
 names what was found (`kernel_at_start`).
 
 Every `evaluate(code)` call writes `code` as a cell before evaluating it.
+The notebook file is saved after each cell is written and again after it runs,
+so a session that ends before `save` leaves every recorded cell on disk. A save
+that fails is reported as `notebook_save_failed` and does not stop the
+recording: the ledger is the record, and the next save writes the file again.
 While recording, `write_cell`, `edit_cells`, `execute_in_notebook` are blocked
 on that notebook, and saving it under a different path is refused.
 

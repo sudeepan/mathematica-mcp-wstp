@@ -303,6 +303,7 @@ def _evaluate_inner(nb, code: str, timeout: float, style: str,
                 "scientific": False,
                 "style": style,
                 "recorded": True,
+                **({"notebook_save_failed": rec["save_failed"]} if rec.get("save_failed") else {}),
             })
 
         verified = (isinstance(rec, dict)
@@ -353,6 +354,8 @@ def _evaluate_inner(nb, code: str, timeout: float, style: str,
             if outcome.get("recording_faulted"):
                 rec["recording_faulted"] = True
                 rec["recording_fault"] = outcome.get("recording_fault")
+            if outcome.get("save_failed"):
+                rec["save_failed"] = outcome["save_failed"]
 
     if not result.success:
         payload: dict[str, Any] = {
@@ -390,6 +393,8 @@ def _evaluate_inner(nb, code: str, timeout: float, style: str,
             if rec.get("recording_faulted"):
                 payload["recording_faulted"] = True
                 payload["recording_fault"] = rec.get("recording_fault")
+            if rec.get("save_failed"):
+                payload["notebook_save_failed"] = rec["save_failed"]
         payload.update(result.extra)
         return _reply(payload)
 
@@ -426,6 +431,8 @@ def _evaluate_inner(nb, code: str, timeout: float, style: str,
         if rec.get("recording_faulted"):
             payload["recording_faulted"] = True
             payload["recording_fault"] = rec.get("recording_fault")
+        if rec.get("save_failed"):
+            payload["notebook_save_failed"] = rec["save_failed"]
     flags = [k for k in ("fresh_kernel", "truncated", "kernel_replaced",
                          "result_may_be_partial")
              if payload.get(k)]
