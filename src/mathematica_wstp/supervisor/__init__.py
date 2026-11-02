@@ -16,11 +16,11 @@ def use(socket_path: str | None = None) -> SupervisorEvaluator:
     quietly leaves a long-lived process on the machine is not something to do
     as a side effect of choosing a backend.
 
-    This moves the NOTEBOOK LAYER only. ``evaluate`` and ``vars`` talk to this
-    process's own kernel directly, without passing through the evaluator seam,
-    so while a supervisor is selected those two and notebook replay are looking
-    at different kernels with different definitions. Worth knowing before
-    defining something in one and expecting to find it in the other.
+    Everything that evaluates goes through the evaluator seam: ``evaluate``,
+    ``vars`` and notebook replay all reach the supervisor's kernel once it is
+    selected, so a symbol defined through one is there for the others.
+    ``abort()`` does not: it reaches this process's kernel, and the supervisor
+    tool's own running and abort actions are the ones to use.
 
     A notebook already open lives in the kernel that opened it -- the document
     is held in that kernel, not in this process -- so switching strands it, and

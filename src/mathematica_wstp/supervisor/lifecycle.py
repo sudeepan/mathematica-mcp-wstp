@@ -26,7 +26,7 @@ import sys
 import time
 from dataclasses import dataclass
 
-from .core import SupervisorConfig, default_socket_path
+from .core import SupervisorConfig, configured_socket_path
 
 __all__ = ["SupervisorInfo", "probe", "start", "stop", "talk"]
 
@@ -66,7 +66,7 @@ def probe(socket_path: str | None = None) -> SupervisorInfo:
     running, because the difference decides whether starting a new one is
     correct or would steal a live supervisor's clients.
     """
-    path = socket_path or default_socket_path()
+    path = socket_path or configured_socket_path()
     if not os.path.exists(path):
         return SupervisorInfo(path, running=False, detail="no socket")
     try:
@@ -147,7 +147,7 @@ def stop(socket_path: str | None = None, wait: float = 30.0) -> SupervisorInfo:
     Stopping is a deliberate act, and taking work down with it silently would
     make it a destructive one.
     """
-    path = socket_path or default_socket_path()
+    path = socket_path or configured_socket_path()
     info = probe(path)
     if not info.running:
         return info

@@ -1274,10 +1274,10 @@ def replay(
         "kernel instead, keeps a ledger of every request, and can be asked "
         "afterwards what became of one.\n"
         "'start' launches one deliberately; nothing starts it implicitly, and "
-        "'use' refuses rather than starting one. 'use' points NOTEBOOK "
-        "execution at it -- evaluate() and vars() keep talking to this "
-        "process's own kernel, so while a supervisor is selected those and "
-        "notebook replay are two different kernels with different definitions. "
+        "'use' refuses rather than starting one. 'use' points evaluate(), vars() "
+        "and notebook execution at it, so they share the supervisor's kernel and "
+        "its definitions. Every action uses socket_path if given, else SUP_SOCK, "
+        "else a per-user default. "
         "'lookup' asks what became of an idempotency key without submitting "
         "anything, which is how a client that lost its answer recovers. "
         "'running' names the evaluation in the supervisor's kernel and 'abort' "
@@ -1343,9 +1343,9 @@ def supervisor(
                 payload = {
                     "success": True, "backend_in_use": evaluator.name,
                     "socket": evaluator.socket_path,
-                    "note": ("Notebook execution now runs in the supervisor's kernel. "
-                             "evaluate() and vars() still use this process's own kernel, "
-                             "so the two hold different definitions."),
+                    "note": ("evaluate(), vars() and notebook execution now run in the "
+                             "supervisor's kernel. abort() still reaches this process's "
+                             "kernel; use supervisor(action='abort') for the supervised run."),
                 }
                 if stranded:
                     # A notebook lives in the kernel that opened it. Saying so here is
@@ -1359,7 +1359,8 @@ def supervisor(
 
             if action == "use_direct":
                 return _reply({"success": True, "backend_in_use": use_own().name,
-                               "note": "Notebook execution is back in this process's kernel."})
+                               "note": ("evaluate(), vars() and notebook execution are back "
+                                        "in this process's kernel.")})
 
     if action in ("running", "abort"):
         # abort() and kernel(action="abort") reach THIS process's kernel. When

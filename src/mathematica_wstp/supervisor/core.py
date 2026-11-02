@@ -108,7 +108,7 @@ class SupervisorConfig:
     @classmethod
     def from_env(cls) -> SupervisorConfig:
         return cls(
-            sock=_env("SUP_SOCK", default_socket_path()),
+            sock=configured_socket_path(),
             audit=_env("SUP_AUDIT", default_socket_path() + "-audit.log"),
             spool=_env("SUP_SPOOL", default_socket_path() + "-artifacts"),
             max_inline=int(_env("SUP_MAX_INLINE", "4096")),
@@ -125,6 +125,15 @@ def default_socket_path() -> str:
     """Per-user, so two people on one machine do not share a laboratory."""
     base = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
     return os.path.join(base, f"mathematica-wstp-supervisor-{os.getuid()}")
+
+
+def configured_socket_path() -> str:
+    """The socket every action uses when given none: SUP_SOCK, else the per-user default.
+
+    One function for all of them, so a supervisor started on SUP_SOCK is the
+    one that status, stop, use and lookup then find.
+    """
+    return _env("SUP_SOCK", default_socket_path())
 
 
 # Set by configure(). Declared here so the request logic below, which is
