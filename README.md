@@ -259,7 +259,7 @@ and classify them automatically. The fresh-agent procedure in [`docs/replaying-a
 
 ## Work that lasts hours or days
 
-By default, this server owns its kernel. If the owning client/server process is killed, the kernel goes with it.
+By default, this server owns its kernel. If the owning client/server process is killed, the kernel goes with it. While a call runs, the server sends a progress message every 15 seconds (`MATHEMATICA_WSTP_PROGRESS_SECONDS` changes this), so a client that ends silent calls keeps waiting for a long one.
 
 For work that must outlive the client, deliberately opt into the supervisor:
 

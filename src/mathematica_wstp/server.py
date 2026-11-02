@@ -19,13 +19,19 @@ client should branch on the outcome and never on how it was serialised.
 from __future__ import annotations
 
 import base64
+import functools
+import inspect
 import json
 import logging
+import math
 import os
 import sys
+import time
+import typing
 from typing import Any, Literal
 
-from mcp.server.mcpserver import MCPServer
+import anyio
+from mcp.server.mcpserver import Context, MCPServer
 from mcp.types import CallToolResult, ImageContent, TextContent
 
 from . import discovery, registry
@@ -64,6 +70,82 @@ server = MCPServer(
         "thing."
     ),
 )
+
+# --- progress messages -----------------------------------------------------
+
+# A client may end a call that has been silent for a while although the kernel
+# is still working, so a running tool reports progress this often.
+_PROGRESS_SECONDS = 15.0
+
+
+def _progress_interval() -> float:
+    """Seconds between progress messages; MATHEMATICA_WSTP_PROGRESS_SECONDS overrides."""
+    try:
+        seconds = float(os.environ.get("MATHEMATICA_WSTP_PROGRESS_SECONDS", ""))
+    except ValueError:
+        return _PROGRESS_SECONDS
+    return seconds if math.isfinite(seconds) and seconds > 0 else _PROGRESS_SECONDS
+
+
+def _with_progress(fn):
+    """An async twin of the sync tool ``fn`` that reports progress while ``fn`` runs.
+
+    ``fn`` still runs on a worker thread, as the SDK runs a sync tool, so abort()
+    reaches a kernel that evaluate() is blocked on. The twin takes fn's parameters
+    plus ``ctx``, which the SDK fills in and leaves out of the input schema.
+    """
+    async def twin(ctx: Context, **kwargs: Any) -> Any:
+        outcome: dict[str, Any] = {}
+        done = anyio.Event()
+
+        async def work() -> None:
+            try:
+                outcome["value"] = await anyio.to_thread.run_sync(functools.partial(fn, **kwargs))
+            except Exception as exc:
+                outcome["error"] = exc
+            finally:
+                done.set()
+
+        interval = _progress_interval()
+        start = time.monotonic()
+        reporting = True
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(work)
+            while not done.is_set():
+                with anyio.move_on_after(interval):
+                    await done.wait()
+                if done.is_set() or not reporting:
+                    continue
+                elapsed = time.monotonic() - start
+                try:
+                    await ctx.report_progress(
+                        elapsed, message=f"{fn.__name__} still running after {elapsed:.0f} s")
+                except Exception:
+                    # The client cannot be told; the tool itself carries on.
+                    reporting = False
+        if "error" in outcome:
+            raise outcome["error"]
+        return outcome["value"]
+
+    signature = inspect.signature(fn, eval_str=True)
+    twin.__name__, twin.__qualname__, twin.__doc__ = fn.__name__, fn.__qualname__, fn.__doc__
+    twin.__signature__ = signature.replace(parameters=[
+        *signature.parameters.values(),
+        inspect.Parameter("ctx", inspect.Parameter.KEYWORD_ONLY, annotation=Context)])
+    twin.__annotations__ = {**typing.get_type_hints(fn), "ctx": Context}
+    return twin
+
+
+def _tool(**options: Any):
+    """``server.tool`` for a sync tool: registers its progress-reporting twin.
+
+    The module keeps the sync function itself, so code and tests that call a
+    tool directly are unaffected.
+    """
+    def register(fn):
+        server.tool(**options)(_with_progress(fn))
+        return fn
+    return register
 
 
 def _truncate(text: str, limit: int = MAX_OUTPUT_CHARS) -> tuple[str, bool]:
@@ -143,7 +225,7 @@ def _refuse_while_recording(what: str) -> CallToolResult | None:
 
 # --- evaluation ------------------------------------------------------------
 
-@server.tool(
+@_tool(
     description=(
         "Evaluate Wolfram Language code in the persistent kernel. State carries "
         "between calls. On timeout the evaluation is ABORTED but the kernel and "
@@ -352,7 +434,7 @@ def _evaluate_inner(nb, code: str, timeout: float, style: str,
     return _reply(payload, text + (f"\n[{', '.join(flags)}]" if flags else ""))
 
 
-@server.tool(
+@_tool(
     description=(
         "Interrupt the evaluation the kernel is running right now, and verify "
         "afterwards what survived. Normally the kernel lives and every definition "
@@ -372,7 +454,7 @@ def abort(rebuild_parallel_kernels: bool = False) -> dict[str, Any]:
 
 # --- kernel administration -------------------------------------------------
 
-@server.tool(
+@_tool(
     description=(
         "Kernel administration. actions: state | restart | stop | abort | subkernels | "
         "close_subkernels | reap. "
@@ -419,7 +501,7 @@ def kernel(
     return _fail(f"unknown action: {action}")
 
 
-@server.tool(description="Server, kernel and installation status, plus any orphaned kernels.")
+@_tool(description="Server, kernel and installation status, plus any orphaned kernels.")
 def status() -> dict[str, Any]:
     k = session.kernel_status()
     payload = {
@@ -447,7 +529,7 @@ _RECORDING_START_FIELDS = ("run_id", "ledger", "kernel_not_fresh", "kernel_at_st
                            "kernel_restarted", "note", "warning")
 
 
-@server.tool(
+@_tool(
     description=(
         "Notebook sessions over .nb files on disk. actions: open(path) | create(title,path) "
         "| list | info | save(path) | close | verify | dependencies | record "
@@ -588,7 +670,7 @@ def notebooks(
     return _fail(f"unknown action: {action}")
 
 
-@server.tool(
+@_tool(
     description=(
         "List or read cells of an open notebook. Use style to filter (e.g. 'Input'). "
         "Cell indices are positions in the document and are what evaluate_cells takes. "
@@ -737,7 +819,7 @@ def _condense_range(payload: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-@server.tool(
+@_tool(
     description=(
         "Evaluate notebook cells in document order, in the persistent kernel, with "
         "state carrying between them. Give either index, or from_+to for a range. "
@@ -796,7 +878,7 @@ def evaluate_cells(
     return _reply(_condense_range(payload))
 
 
-@server.tool(
+@_tool(
     description=(
         "Change the cells of an open notebook. actions: write(content,style,position) "
         "| replace(index,content) | delete(index).\n"
@@ -838,7 +920,7 @@ def edit_cells(
 
 # --- front-end rendering ---------------------------------------------------
 
-@server.tool(
+@_tool(
     description=(
         "Render with the Wolfram front end, headlessly: typeset an expression, "
         "rasterise a notebook cell, or export a notebook. "
@@ -907,7 +989,7 @@ def render(
 
 # --- kernel variables ------------------------------------------------------
 
-@server.tool(
+@_tool(
     description=(
         "Inspect or change the kernel's Global` symbols. actions: list | get(name) | "
         "set(name,value) | clear(name) | clear_all. Use this to see what a notebook "
@@ -1008,7 +1090,7 @@ def vars(
 
 # --- batching --------------------------------------------------------------
 
-@server.tool(
+@_tool(
     description=(
         "Run several of this server's tools in one round trip. "
         "ops: [{\"tool\": \"evaluate\", \"args\": {\"code\": \"1+1\"}}, ...]. "
@@ -1081,7 +1163,7 @@ def _condense_replay(payload: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-@server.tool(
+@_tool(
     description=(
         "Per-cell replay of a notebook, and reconciliation of one that was "
         "interrupted. actions: run | reconcile | list.\n"
@@ -1175,7 +1257,7 @@ def replay(
     return _reply(_condense_replay(payload))
 
 
-@server.tool(
+@_tool(
     description=(
         "A kernel owned by a separate process, so it outlives this one. "
         "actions: status | start | stop | use | use_direct | lookup.\n"
@@ -1330,7 +1412,7 @@ def _config_for(socket_path: str):
 
 # --- reading a notebook without opening a session --------------------------
 
-@server.tool(
+@_tool(
     description=(
         "Read a .nb file from disk without opening a kernel session for it. "
         "modes: outline (headings only) | markdown | wolfram (code cells only) | "
@@ -1516,7 +1598,7 @@ def _derivation_verdict(facts: dict[str, Any], assumptions: str = "") -> tuple[s
     return "undecided", f"{why}; {how}"
 
 
-@server.tool(
+@_tool(
     description=(
         "Check a chain of expressions step by step: each step must equal the one "
         "before it. steps are Wolfram expressions as strings, in order. Each step "
@@ -1720,7 +1802,7 @@ _GUIDE: dict[str, str] = {
 }
 
 
-@server.tool(
+@_tool(
     description=("Usage notes for this server. topics: workflow | abort | errors | "
                  "notebooks | performance.")
 )

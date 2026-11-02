@@ -195,6 +195,10 @@ This is why `pitfalls.md` exists.
 Calls longer than the client's foreground window may be moved to a background
 task. That does not make the original RPC durable across a client/session exit.
 
+While a call runs, the server sends a progress message every 15 seconds, naming
+the tool and the time so far, so a client that ends silent calls keeps waiting.
+`MATHEMATICA_WSTP_PROGRESS_SECONDS` changes the interval.
+
 For a replay, set the per-cell timeout deliberately. The agent-facing replay
 surface defaults to 300 s per cell. If one cell is expected to take hours or
 days, choose the larger value explicitly and report it.
