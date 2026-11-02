@@ -529,6 +529,55 @@ def test_reproduced_results_seal_with_passing_checkpoint():
         assert fin["checkpoints"]["status"] == "pass", fin
 
 
+def test_changed_result_blocks_sealing_until_accepted():
+    """No checkpoint needed: a result that changes in the fresh kernel stops the seal."""
+    a = fresh_symbol("chgA")
+    assert evaluate_text(f"{a} = 3", timeout=30).success
+    try:
+        with recording_session("changed") as ctx:
+            first = payload(server.evaluate(f"{a} + 1"))
+            assert first["output"].strip() == "4", first
+            assert payload(server.notebooks(action="save"))["success"]
+            fin = payload(server.notebooks(action="finalize"))
+            assert fin["success"] is False and fin["sealed"] is False, fin
+            assert fin["status"]["reproduction"] == "differs", fin
+            diff = fin["reproduction"]["differs"][0]
+            assert (diff["seq"], diff["recorded"]) == (1, "4"), fin
+
+            accepted = payload(server.notebooks(action="finalize", accept_differences=[
+                {"seq": 1, "fresh_digest": diff["fresh_digest"],
+                 "reason": "defined before recording, on purpose"}]))
+            assert accepted["success"] and accepted["sealed"], accepted
+            assert accepted["status"]["reproduction"] == "accepted", accepted
+            assert accepted["reproduction"]["accepted"][0]["reason"] == \
+                "defined before recording, on purpose", accepted
+    finally:
+        evaluate_text(f"Remove[{a}]", timeout=30)
+
+
+def test_accepted_result_must_repeat_in_the_next_fresh_run():
+    """A Module name repeats in every fresh kernel and can be accepted; a random number cannot."""
+    with recording_session("repeat") as ctx:
+        for code in ("Module[{x}, x]", "RandomInteger[10^6]"):
+            assert payload(server.evaluate(code))["success"], code
+        assert payload(server.notebooks(action="save"))["success"]
+        fin = payload(server.notebooks(action="finalize"))
+        digests = {d["seq"]: d["fresh_digest"] for d in fin["reproduction"]["differs"]}
+        assert fin["success"] is False and sorted(digests) == [1, 2], fin
+
+        partial = payload(server.notebooks(action="finalize", accept_differences=[
+            {"seq": 1, "fresh_digest": digests[1], "reason": "Module numbering"}]))
+        assert partial["success"] is False and "accept every difference" in partial["error"]
+
+        both = payload(server.notebooks(action="finalize", accept_differences=[
+            {"seq": s, "fresh_digest": digests[s], "reason": "accepted"} for s in (1, 2)]))
+        assert both["success"] is False and both["sealed"] is False, both
+        assert [x["seq"] for x in both["reproduction"]["accepted"]] == [1], both
+        changed = both["reproduction"]["differs"]
+        assert [x["seq"] for x in changed] == [2], both
+        assert changed[0]["accepted_fresh_digest"] == digests[2], both
+
+
 def test_expect_needs_a_recording():
     notebooks.reset_headless_notebooks()
     reply = payload(server.evaluate("1 + 1", expect="2"))

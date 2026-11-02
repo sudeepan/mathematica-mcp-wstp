@@ -1374,7 +1374,9 @@ class HeadlessNotebooks:
                     "recording_faulted": True, "recording_fault": fault}
 
     @_under_recording_lock
-    def finalize_recording(self, timeout: int = 600) -> dict[str, Any]:
+    def finalize_recording(self, timeout: int = 600,
+                           accept_differences: list[dict[str, Any]] | None = None
+                           ) -> dict[str, Any]:
         """Run the recorder's finalization: copy, fresh kernel, evaluate.
 
         Refuses when no recorder is active or unresolved records exist.
@@ -1383,7 +1385,8 @@ class HeadlessNotebooks:
             return {"success": False,
                     "error": "no recording session is active"}
         try:
-            return self._recorder.finalize(timeout=timeout)
+            return self._recorder.finalize(timeout=timeout,
+                                           accept_differences=accept_differences)
         except Exception:
             logger.warning("finalize_recording failed", exc_info=True)
             return {"success": False, "error": "finalization failed"}

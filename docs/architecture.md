@@ -180,7 +180,8 @@ notebooks(action="finalize")
     re-run the copy in a fresh kernel (NotebookEvaluate under the front end)
     fail on any message a cell did not give when recorded
     compare the copy's cells with the ledger
-    report each cell whose result differs from the recorded one
+    fail on a cell whose result differs from the recorded one, unless it was
+    recorded as volatile or the difference was accepted in writing
     fail on any checkpoint whose fresh result does not match its expectation
     seal the run in the ledger
 ```

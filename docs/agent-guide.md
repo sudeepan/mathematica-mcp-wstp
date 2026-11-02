@@ -438,12 +438,37 @@ The ledger also keeps a fingerprint and a short preview of each cell's result,
 taken from the `InputForm` text the reply shows. The fresh run captures each
 cell's result the same way, so typesetting differences between the two runs do
 not matter, and finalization reports the comparison under `reproduction`:
-`same`, `differs` (each changed cell with its recorded and fresh preview) or
-`incomplete` (a cell with no fresh result). A difference is reported, not
-enforced: a cell that leans on a definition made before recording, or that
-returns a timing, differs for different reasons, and only you can tell them
-apart. Mark a cell whose result legitimately changes from run to run with
-`evaluate(code, volatile=True)`; it is listed as volatile instead.
+`same`, `differs` (each changed cell with its recorded and fresh preview and
+both fingerprints) or `incomplete` (a cell with no fresh result). Either of
+the last two fails finalization: the run is not sealed and the finalized file
+is kept as a failed attempt. A cell that leans on a definition made before
+recording differs, and so does one that returns a timing or a random number.
+Mark a cell whose result legitimately changes from run to run with
+`evaluate(code, volatile=True)` when you record it; it is then listed as
+volatile and not compared.
+
+A difference noticed only at finalization can be accepted, in writing,
+instead of recording everything again. Finalize again with
+`accept_differences=[{"seq": 3, "fresh_digest": "...", "reason": "..."}]`,
+copying `seq` and `fresh_digest` from the failed reply. Name every cell that
+attempt found different, including those it lists under `accepted`: an
+acceptance covers one attempt only, and a partial list is refused. Each needs
+the fresh fingerprint that attempt reported, and the fresh run must then give
+that same result again, or the cell differs anew; a cell whose result changes
+on every run, such as an unseeded random number, can therefore never be
+accepted and has to be recorded again with `volatile=True`. A checkpoint cell
+can never be accepted, and while one differs no acceptance can seal the run.
+A run sealed this way reports `reproduction: "accepted"`, never `same`, and
+lists each accepted cell with its reason, in the reply, in the ledger and in
+`verify_record`. The second finalization re-runs the whole notebook, so it
+takes as long as the first.
+
+Both `accept_differences` and `volatile=True` are provisional in this form.
+They are planned to need the user's approval through the client, the program
+running the model, rather than only the model's own call; do not build on the
+current form. Until then the model can accept a difference or mark a cell
+volatile by itself, so check the accepted and volatile cells a sealed record
+lists before relying on it.
 
 A checkpoint is enforced. `evaluate(code, expect="True")` stores the
 expectation in the ledger before the cell runs, reports `checkpoint` in the
@@ -456,8 +481,16 @@ predicate that cannot decide should return something other than its pass value.
 
 The finalize reply reports each check separately under `status`: `structure`,
 `fresh_run`, `messages`, `reproduction` and `checkpoints`. The fresh run
-captures results through `$Post`; a notebook that sets `$Post` itself stops
-that capture for later cells, which then show as missing.
+captures results through `$Post`, including `Null` results; a notebook that
+sets `$Post` itself stops that capture for later cells, which then show as
+missing and fail finalization. A cell ending in `;` gives `Null` in both runs,
+so the comparison checks nothing there: `a = RandomInteger[10^6];` followed by
+`b = a + 1;` seals as `same`. Only a checkpoint, or a later cell that shows a
+value depending on it, catches a change in such a cell. Two cases differ by
+design between the runs and need `volatile=True`: a cell that uses `%` or
+`Out` (the recording session keeps no output history, the fresh run does), and
+a result containing symbols the kernel numbers itself, such as `x$1234` from
+`Module`.
 
 ### What the finalized notebook shows
 
@@ -585,8 +618,9 @@ For a from-scratch computation:
    matter an expectation: evaluate(code, expect="True")
 4. notebooks(action="save")
 5. notebooks(action="finalize") - while the recorder is still active;
-   re-evaluates in a fresh kernel, verifies against the ledger, reports
-   results that differ and fails on a checkpoint that does not pass
+   re-evaluates in a fresh kernel, verifies against the ledger, and fails
+   on a result that differs from the recorded one (unless volatile or
+   accepted) and on a checkpoint that does not pass
 6. notebooks(action="close") - releases the sealed recorder
 ```
 

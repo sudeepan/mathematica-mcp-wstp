@@ -157,7 +157,8 @@ def _refuse_while_recording(what: str) -> CallToolResult | None:
         "whitespace ignored) must equal expect, e.g. expect='True' or expect='{0, 0}', "
         "here and again in the fresh kernel at finalize, or finalization fails. "
         "volatile=True marks a cell whose result may legitimately differ in the "
-        "fresh run (a timing, a process id), so a difference there is not reported."
+        "fresh run (a timing, a process id), so a difference there does not fail "
+        "finalization."
     )
 )
 def evaluate(code: str, timeout: float = 60.0, style: str = "Input",
@@ -443,7 +444,12 @@ _RECORDING_START_FIELDS = ("run_id", "ledger", "kernel_not_fresh", "kernel_at_st
         "NotebookEvaluate so every cell gets native In[n]/Out[n] labels. "
         "timeout (seconds, default 600) bounds the fresh-kernel run; a recording "
         "whose cells took longer than that when recorded is refused up front, and "
-        "the reply reports the estimate. "
+        "the reply reports the estimate. A result that differs from the recorded one "
+        "fails finalization unless its cell was recorded with volatile=True; to "
+        "accept the differences the last attempt reported, finalize again with "
+        "accept_differences=[{seq, fresh_digest, reason}] naming every one of them, "
+        "taken from that reply; the fresh run must then give the same results again "
+        "(never for a checkpoint cell). "
         "verify_record(path): check a finalized notebook file against the ledger of "
         "its recording - recorded cells unchanged, whether the file changed since "
         "finalization, and the finalization statuses.\n"
@@ -469,6 +475,7 @@ def notebooks(
     record: bool = False,
     force: bool = False,
     timeout: float | None = None,
+    accept_differences: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     nb = get_headless_notebooks()
     if action == "open":
@@ -539,7 +546,10 @@ def notebooks(
                     return _fail(
                         f"notebook {notebook} is not the recording target; "
                         f"the active recording is on {nb.recording}")
-            return _reply(nb.finalize_recording(timeout=finalize_timeout))
+            return _reply(nb.finalize_recording(timeout=finalize_timeout,
+                                                accept_differences=accept_differences))
+        if accept_differences:
+            return _fail("accept_differences applies only to a recording")
         return _reply(nb.finalize(notebook=notebook, timeout=finalize_timeout))
     return _fail(f"unknown action: {action}")
 
